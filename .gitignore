@@ -1,0 +1,9 @@
+build/
+cmake-build-*/
+.env
+*.o
+*.a
+*.pb.cc
+*.pb.h
+generated/
+third_party/jwt-cpp/

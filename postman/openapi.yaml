@@ -1,0 +1,314 @@
+openapi: 3.0.3
+info:
+  title: cTrader Plus Observer API
+  description: |
+    C++/Drogon rewrite of the Finance Observer. Live prices from cTrader Open API.
+
+    **Local dev:** set `AUTH_DISABLED=1` in `.env` and restart the server — protected routes accept requests without a JWT (user id `dev-user`).
+
+    WebSocket: `ws://localhost:8000/ws/observe?interval=1m&pair=EURUSD&access_token=<jwt>` (token optional when auth disabled).
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8000
+    description: Local server (see PORT in .env)
+
+tags:
+  - name: Public
+  - name: Market
+  - name: User
+  - name: Historical
+  - name: Alerts
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: NextAuth HS256 JWT (sub claim). Not required when AUTH_DISABLED=1.
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        detail:
+          type: string
+        error:
+          type: string
+
+security:
+  - bearerAuth: []
+
+paths:
+  /:
+    get:
+      tags: [Public]
+      security: []
+      summary: Redirect to dashboard
+      responses:
+        '302':
+          description: Redirect to /dashboard
+
+  /health:
+    get:
+      tags: [Public]
+      security: []
+      summary: Health check
+      responses:
+        '200':
+          description: OK or degraded
+        '503':
+          description: Down
+
+  /ping:
+    get:
+      tags: [Public]
+      security: []
+      summary: Ping
+      responses:
+        '200':
+          description: pong
+
+  /dashboard:
+    get:
+      tags: [Public]
+      security: []
+      summary: HTML dashboard
+      responses:
+        '200':
+          description: HTML page
+
+  /snapshot:
+    get:
+      tags: [Market]
+      summary: Live grouped snapshot
+      responses:
+        '200':
+          description: currencies + commodities
+        '503':
+          description: Observer not ready
+
+  /stream-health:
+    get:
+      tags: [Market]
+      summary: Stream health metrics
+      responses:
+        '200':
+          description: OK
+
+  /client-config:
+    get:
+      tags: [Market]
+      summary: Client WebSocket URL config
+      responses:
+        '200':
+          description: OK
+
+  /me:
+    get:
+      tags: [User]
+      summary: User bootstrap
+      responses:
+        '200':
+          description: userId, onboarding state, wsUrl
+
+  /onboarding/complete:
+    post:
+      tags: [User]
+      summary: Mark onboarding complete
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: OK
+        '503':
+          description: Database unavailable
+
+  /historical:
+    get:
+      tags: [Historical]
+      summary: Archived tick history (PostgreSQL)
+      parameters:
+        - name: pair
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 500 }
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc] }
+        - name: start
+          in: query
+          schema: { type: string, format: date-time }
+        - name: end
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: count + items
+
+  /historical/ohlc:
+    get:
+      tags: [Historical]
+      summary: OHLC trend bars from cTrader
+      parameters:
+        - name: pair
+          in: query
+          required: true
+          schema: { type: string }
+        - name: interval
+          in: query
+          schema:
+            type: string
+            enum: [1m, 5m, 15m, 30m, 1h, 4h, 1d]
+            default: 5m
+        - name: limit
+          in: query
+          schema: { type: integer, default: 1000 }
+        - name: start
+          in: query
+          schema: { type: string, format: date-time }
+        - name: end
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: candles array
+        '400':
+          description: Invalid pair or interval
+        '502':
+          description: cTrader query failed
+
+  /historical/ohlc-with-forming:
+    get:
+      tags: [Historical]
+      summary: OHLC plus current forming candle
+      parameters:
+        - name: pair
+          in: query
+          required: true
+          schema: { type: string }
+        - name: interval
+          in: query
+          schema:
+            type: string
+            enum: [1m, 5m, 15m, 30m, 1h, 4h, 1d]
+        - name: limit
+          in: query
+          schema: { type: integer }
+        - name: start
+          in: query
+          schema: { type: string, format: date-time }
+        - name: end
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: candles with optional forming candle
+
+  /historical/stream-metrics:
+    get:
+      tags: [Historical]
+      summary: Stream metrics history
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 1000 }
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc] }
+        - name: start
+          in: query
+          schema: { type: string, format: date-time }
+        - name: end
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: count + items
+
+  /api/v1/alerts:
+    get:
+      tags: [Alerts]
+      summary: List alerts for current user
+      responses:
+        '200':
+          description: total, active, triggered, all
+    post:
+      tags: [Alerts]
+      summary: Create price or candle-close alert
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pair]
+              properties:
+                pair: { type: string, example: EURUSD }
+                target_price: { type: number, description: Price alert }
+                condition: { type: string, enum: [above, below, equal] }
+                interval: { type: string, description: Candle alert interval }
+                direction: { type: string, enum: [above, below] }
+                threshold: { type: number }
+                channel: { type: string, enum: [email, sms, call], default: email }
+                email: { type: string }
+                phone: { type: string }
+                custom_message: { type: string }
+      responses:
+        '200':
+          description: success + alert
+        '400':
+          description: Validation error
+
+  /api/v1/alerts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Alerts]
+      summary: Get alert by ID
+      responses:
+        '200':
+          description: alert object
+        '404':
+          description: Not found
+    put:
+      tags: [Alerts]
+      summary: Update alert
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target_price: { type: number }
+                condition: { type: string }
+                channel: { type: string }
+                email: { type: string }
+                phone: { type: string }
+                custom_message: { type: string }
+                status: { type: string }
+                interval: { type: string }
+                direction: { type: string }
+                threshold: { type: number }
+      responses:
+        '200':
+          description: success + alert
+        '404':
+          description: Not found
+    delete:
+      tags: [Alerts]
+      summary: Delete alert
+      responses:
+        '200':
+          description: deleted
+        '404':
+          description: Not found

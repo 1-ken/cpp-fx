@@ -1,0 +1,341 @@
+{
+  "info": {
+    "_postman_id": "ctraderplus-cpp-api",
+    "name": "cTrader Plus C++ API",
+    "description": "HTTP API for the cTrader Plus observer (C++/Drogon).\n\n**Local testing:** set `AUTH_DISABLED=1` in `.env`, restart the server, import the **cTrader Plus — Local** environment, then send requests (no Bearer token needed).\n\nWebSocket stream: use Postman WebSocket request to `{{wsUrl}}?interval={{interval}}&pair={{pair}}`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{accessToken}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8000" },
+    { "key": "wsUrl", "value": "ws://localhost:8000/ws/observe" },
+    { "key": "pair", "value": "EURUSD" },
+    { "key": "interval", "value": "1m" },
+    { "key": "alertId", "value": "" },
+    { "key": "testEmail", "value": "test@example.com" }
+  ],
+  "item": [
+    {
+      "name": "Public",
+      "description": "No authentication required.",
+      "auth": { "type": "noauth" },
+      "item": [
+        {
+          "name": "Root redirect",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/"
+          }
+        },
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/health"
+          }
+        },
+        {
+          "name": "Ping",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/ping"
+          }
+        },
+        {
+          "name": "Dashboard (HTML)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/dashboard"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Market data",
+      "item": [
+        {
+          "name": "Snapshot",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/snapshot",
+            "description": "Grouped live prices `{ currencies, commodities }`. Requires cTrader to be ready."
+          }
+        },
+        {
+          "name": "Stream health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/stream-health"
+          }
+        },
+        {
+          "name": "Client config",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/client-config"
+          }
+        }
+      ]
+    },
+    {
+      "name": "User",
+      "item": [
+        {
+          "name": "Me (bootstrap)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/me"
+          }
+        },
+        {
+          "name": "Onboarding complete",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "url": "{{baseUrl}}/onboarding/complete"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Historical",
+      "item": [
+        {
+          "name": "Historical ticks",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/historical?pair={{pair}}&limit=100&order=desc",
+              "host": ["{{baseUrl}}"],
+              "path": ["historical"],
+              "query": [
+                { "key": "pair", "value": "{{pair}}" },
+                { "key": "limit", "value": "100" },
+                { "key": "order", "value": "desc", "description": "asc or desc" },
+                { "key": "start", "value": "", "disabled": true, "description": "ISO8601" },
+                { "key": "end", "value": "", "disabled": true, "description": "ISO8601" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "OHLC (cTrader trend bars)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/historical/ohlc?pair={{pair}}&interval={{interval}}&limit=100",
+              "host": ["{{baseUrl}}"],
+              "path": ["historical", "ohlc"],
+              "query": [
+                { "key": "pair", "value": "{{pair}}" },
+                { "key": "interval", "value": "{{interval}}", "description": "1m|5m|15m|30m|1h|4h|1d" },
+                { "key": "limit", "value": "100" },
+                { "key": "start", "value": "", "disabled": true },
+                { "key": "end", "value": "", "disabled": true }
+              ]
+            }
+          }
+        },
+        {
+          "name": "OHLC with forming candle",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/historical/ohlc-with-forming?pair={{pair}}&interval={{interval}}&limit=100",
+              "host": ["{{baseUrl}}"],
+              "path": ["historical", "ohlc-with-forming"],
+              "query": [
+                { "key": "pair", "value": "{{pair}}" },
+                { "key": "interval", "value": "{{interval}}" },
+                { "key": "limit", "value": "100" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Stream metrics",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/historical/stream-metrics?limit=100&order=desc",
+              "host": ["{{baseUrl}}"],
+              "path": ["historical", "stream-metrics"],
+              "query": [
+                { "key": "limit", "value": "100" },
+                { "key": "order", "value": "desc" },
+                { "key": "start", "value": "", "disabled": true },
+                { "key": "end", "value": "", "disabled": true }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Alerts",
+      "item": [
+        {
+          "name": "Create price alert",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const j = pm.response.json();",
+                  "  if (j.alert && j.alert.id) pm.environment.set('alertId', j.alert.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"target_price\": 1.10,\n  \"condition\": \"above\",\n  \"channel\": \"email\",\n  \"email\": \"{{testEmail}}\",\n  \"custom_message\": \"Postman test alert\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts"
+          }
+        },
+        {
+          "name": "Create candle-close alert",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const j = pm.response.json();",
+                  "  if (j.alert && j.alert.id) pm.environment.set('alertId', j.alert.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"interval\": \"{{interval}}\",\n  \"direction\": \"above\",\n  \"threshold\": 1.10,\n  \"channel\": \"email\",\n  \"email\": \"{{testEmail}}\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts"
+          }
+        },
+        {
+          "name": "List alerts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/alerts"
+          }
+        },
+        {
+          "name": "Get alert by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/alerts/{{alertId}}",
+            "description": "Set `alertId` from Create response or List alerts."
+          }
+        },
+        {
+          "name": "Update alert",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"target_price\": 1.12,\n  \"condition\": \"below\",\n  \"custom_message\": \"Updated via Postman\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts/{{alertId}}"
+          }
+        },
+        {
+          "name": "Delete alert",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/alerts/{{alertId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "WebSocket",
+      "description": "In Postman: New → WebSocket Request. URL below. With AUTH_DISABLED=1, access_token is optional.",
+      "item": [
+        {
+          "name": "Observe stream (all pairs)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{wsUrl}}?interval={{interval}}",
+              "host": ["{{wsUrl}}"],
+              "query": [
+                { "key": "interval", "value": "{{interval}}" },
+                { "key": "access_token", "value": "{{accessToken}}", "disabled": true },
+                { "key": "pair", "value": "", "disabled": true }
+              ]
+            },
+            "description": "Use Postman's WebSocket client with this URL. Add `&pair=EURUSD` to filter one pair."
+          }
+        },
+        {
+          "name": "Observe stream (single pair)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{wsUrl}}?interval={{interval}}&pair={{pair}}",
+              "host": ["{{wsUrl}}"],
+              "query": [
+                { "key": "interval", "value": "{{interval}}" },
+                { "key": "pair", "value": "{{pair}}" },
+                { "key": "access_token", "value": "{{accessToken}}", "disabled": true }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

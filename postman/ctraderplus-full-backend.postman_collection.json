@@ -1,0 +1,357 @@
+{
+  "info": {
+    "_postman_id": "a1b2c3d4-ctraderplus-full",
+    "name": "cTrader Plus — Full Backend Test",
+    "description": "Self-contained Postman collection for the entire C++ backend.\n\n## Setup\n1. Set `AUTH_DISABLED=1` in `.env` and restart: `./build/ctraderplus_server`\n2. Postman → **Import** → select this file\n3. No separate environment needed (variables are built in)\n4. Run folder **\"Run All — Smoke Test\"** with Collection Runner, or hit requests one by one\n\n## WebSocket (manual)\nPostman → New → WebSocket → `ws://localhost:8000/ws/observe?interval=1m&pair=EURUSD`",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": { "type": "noauth" },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8000" },
+    { "key": "wsUrl", "value": "ws://localhost:8000/ws/observe" },
+    { "key": "pair", "value": "EURUSD" },
+    { "key": "interval", "value": "1m" },
+    { "key": "alertId", "value": "" },
+    { "key": "testEmail", "value": "test@example.com" },
+    { "key": "testPhone", "value": "+254700000000" }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Collection uses AUTH_DISABLED=1 — no Bearer token required"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "Run All — Smoke Test",
+      "description": "Run this folder with Collection Runner (top to bottom) to exercise the full HTTP API.",
+      "item": [
+        {
+          "name": "01 Health",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('status 200 or 503', () => pm.expect(pm.response.code).to.be.oneOf([200,503]));", "pm.test('has status field', () => pm.expect(pm.response.json()).to.have.property('status'));"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/health" }
+        },
+        {
+          "name": "02 Ping",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('pong', () => { pm.response.to.have.status(200); pm.expect(pm.response.json().pong).to.eql(true); });"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/ping" }
+        },
+        {
+          "name": "03 Me",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('user bootstrap', () => { pm.response.to.have.status(200); const j=pm.response.json(); pm.expect(j).to.have.property('userId'); pm.collectionVariables.set('userId', j.userId); });"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/me" }
+        },
+        {
+          "name": "04 Client config",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('client config', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/client-config" }
+        },
+        {
+          "name": "05 Snapshot",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('snapshot', () => pm.expect(pm.response.code).to.be.oneOf([200,503]));"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/snapshot" }
+        },
+        {
+          "name": "06 Stream health",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('stream health', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/stream-health" }
+        },
+        {
+          "name": "07 OHLC",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('ohlc', () => pm.expect(pm.response.code).to.be.oneOf([200,400,502,503]));"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/historical/ohlc?pair={{pair}}&interval={{interval}}&limit=50" }
+        },
+        {
+          "name": "08 OHLC with forming",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('ohlc forming', () => pm.expect(pm.response.code).to.be.oneOf([200,400,502,503]));"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/historical/ohlc-with-forming?pair={{pair}}&interval={{interval}}&limit=50" }
+        },
+        {
+          "name": "09 Historical ticks",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('historical', () => pm.expect(pm.response.code).to.be.oneOf([200,503]));"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/historical?pair={{pair}}&limit=50&order=desc" }
+        },
+        {
+          "name": "10 Stream metrics",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('metrics', () => pm.expect(pm.response.code).to.be.oneOf([200,503]));"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/historical/stream-metrics?limit=50&order=desc" }
+        },
+        {
+          "name": "11 Create price alert",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('create alert', () => { pm.response.to.have.status(200); const j=pm.response.json(); pm.expect(j.success).to.eql(true); if(j.alert&&j.alert.id) pm.collectionVariables.set('alertId', j.alert.id); });"], "type": "text/javascript" } }],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"target_price\": 9.99999,\n  \"condition\": \"above\",\n  \"channel\": \"email\",\n  \"email\": \"{{testEmail}}\",\n  \"custom_message\": \"Postman smoke test\"\n}" },
+            "url": "{{baseUrl}}/api/v1/alerts"
+          }
+        },
+        {
+          "name": "12 List alerts",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('list alerts', () => { pm.response.to.have.status(200); pm.expect(pm.response.json()).to.have.property('total'); });"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/alerts" }
+        },
+        {
+          "name": "13 Get alert",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('get alert', () => pm.expect(pm.response.code).to.be.oneOf([200,404]));"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/alerts/{{alertId}}" }
+        },
+        {
+          "name": "14 Update alert",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('update alert', () => pm.expect(pm.response.code).to.be.oneOf([200,404]));"], "type": "text/javascript" } }],
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"target_price\": 9.99998,\n  \"condition\": \"below\",\n  \"custom_message\": \"Updated in smoke test\"\n}" },
+            "url": "{{baseUrl}}/api/v1/alerts/{{alertId}}"
+          }
+        },
+        {
+          "name": "15 Onboarding complete",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('onboarding', () => pm.expect(pm.response.code).to.be.oneOf([200,503]));"], "type": "text/javascript" } }],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{}" },
+            "url": "{{baseUrl}}/onboarding/complete"
+          }
+        },
+        {
+          "name": "16 Delete alert",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('delete alert', () => pm.expect(pm.response.code).to.be.oneOf([200,404]));"], "type": "text/javascript" } }],
+          "request": { "method": "DELETE", "url": "{{baseUrl}}/api/v1/alerts/{{alertId}}" }
+        },
+        {
+          "name": "17 Dashboard HTML",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('dashboard html', () => { pm.response.to.have.status(200); pm.expect(pm.response.headers.get('Content-Type')).to.include('html'); });"], "type": "text/javascript" } }],
+          "request": { "method": "GET", "url": "{{baseUrl}}/dashboard" }
+        }
+      ]
+    },
+    {
+      "name": "Public",
+      "auth": { "type": "noauth" },
+      "item": [
+        { "name": "GET /", "request": { "method": "GET", "url": "{{baseUrl}}/" } },
+        { "name": "GET /health", "request": { "method": "GET", "url": "{{baseUrl}}/health" } },
+        { "name": "GET /ping", "request": { "method": "GET", "url": "{{baseUrl}}/ping" } },
+        { "name": "GET /dashboard", "request": { "method": "GET", "url": "{{baseUrl}}/dashboard" } }
+      ]
+    },
+    {
+      "name": "Market Data",
+      "item": [
+        { "name": "GET /snapshot", "request": { "method": "GET", "url": "{{baseUrl}}/snapshot", "description": "Live grouped prices. Needs cTrader ready." } },
+        { "name": "GET /stream-health", "request": { "method": "GET", "url": "{{baseUrl}}/stream-health" } },
+        { "name": "GET /client-config", "request": { "method": "GET", "url": "{{baseUrl}}/client-config" } }
+      ]
+    },
+    {
+      "name": "User",
+      "item": [
+        { "name": "GET /me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+        {
+          "name": "POST /onboarding/complete",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{}" },
+            "url": "{{baseUrl}}/onboarding/complete"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Historical",
+      "item": [
+        {
+          "name": "GET /historical",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/historical?pair={{pair}}&limit=100&order=desc",
+              "host": ["{{baseUrl}}"],
+              "path": ["historical"],
+              "query": [
+                { "key": "pair", "value": "{{pair}}" },
+                { "key": "limit", "value": "100" },
+                { "key": "order", "value": "desc" },
+                { "key": "start", "value": "2026-01-01T00:00:00Z", "disabled": true },
+                { "key": "end", "value": "2026-12-31T23:59:59Z", "disabled": true }
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /historical/ohlc",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/historical/ohlc?pair={{pair}}&interval={{interval}}&limit=100",
+              "host": ["{{baseUrl}}"],
+              "path": ["historical", "ohlc"],
+              "query": [
+                { "key": "pair", "value": "{{pair}}" },
+                { "key": "interval", "value": "{{interval}}", "description": "1m|5m|15m|30m|1h|4h|1d" },
+                { "key": "limit", "value": "100" },
+                { "key": "start", "value": "", "disabled": true },
+                { "key": "end", "value": "", "disabled": true }
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /historical/ohlc-with-forming",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/historical/ohlc-with-forming?pair={{pair}}&interval={{interval}}&limit=100",
+              "host": ["{{baseUrl}}"],
+              "path": ["historical", "ohlc-with-forming"],
+              "query": [
+                { "key": "pair", "value": "{{pair}}" },
+                { "key": "interval", "value": "{{interval}}" },
+                { "key": "limit", "value": "100" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /historical/stream-metrics",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/historical/stream-metrics?limit=100&order=desc",
+              "host": ["{{baseUrl}}"],
+              "path": ["historical", "stream-metrics"],
+              "query": [
+                { "key": "limit", "value": "100" },
+                { "key": "order", "value": "desc" },
+                { "key": "start", "value": "", "disabled": true },
+                { "key": "end", "value": "", "disabled": true }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Alerts",
+      "item": [
+        {
+          "name": "POST /api/v1/alerts — price alert",
+          "event": [{
+            "listen": "test",
+            "script": {
+              "exec": [
+                "if (pm.response.code === 200) {",
+                "  const j = pm.response.json();",
+                "  if (j.alert && j.alert.id) pm.collectionVariables.set('alertId', j.alert.id);",
+                "}"
+              ],
+              "type": "text/javascript"
+            }
+          }],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"target_price\": 1.10,\n  \"condition\": \"above\",\n  \"channel\": \"email\",\n  \"email\": \"{{testEmail}}\",\n  \"custom_message\": \"Price alert from Postman\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts"
+          }
+        },
+        {
+          "name": "POST /api/v1/alerts — candle-close alert",
+          "event": [{
+            "listen": "test",
+            "script": {
+              "exec": [
+                "if (pm.response.code === 200) {",
+                "  const j = pm.response.json();",
+                "  if (j.alert && j.alert.id) pm.collectionVariables.set('alertId', j.alert.id);",
+                "}"
+              ],
+              "type": "text/javascript"
+            }
+          }],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"interval\": \"{{interval}}\",\n  \"direction\": \"above\",\n  \"threshold\": 1.10,\n  \"channel\": \"email\",\n  \"email\": \"{{testEmail}}\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts"
+          }
+        },
+        {
+          "name": "POST /api/v1/alerts — SMS alert",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"target_price\": 1.05,\n  \"condition\": \"below\",\n  \"channel\": \"sms\",\n  \"phone\": \"{{testPhone}}\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts"
+          }
+        },
+        { "name": "GET /api/v1/alerts", "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/alerts" } },
+        { "name": "GET /api/v1/alerts/{id}", "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/alerts/{{alertId}}" } },
+        {
+          "name": "PUT /api/v1/alerts/{id}",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"target_price\": 1.12,\n  \"condition\": \"below\",\n  \"status\": \"active\",\n  \"custom_message\": \"Updated via Postman\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts/{{alertId}}"
+          }
+        },
+        { "name": "DELETE /api/v1/alerts/{id}", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/v1/alerts/{{alertId}}" } }
+      ]
+    },
+    {
+      "name": "WebSocket (manual)",
+      "description": "HTTP requests here are placeholders. In Postman: **New → WebSocket Request** and paste the URL.",
+      "item": [
+        {
+          "name": "WS /ws/observe — all pairs",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{wsUrl}}?interval={{interval}}",
+              "host": ["{{wsUrl}}"],
+              "query": [{ "key": "interval", "value": "{{interval}}" }]
+            },
+            "description": "WebSocket URL: ws://localhost:8000/ws/observe?interval=1m"
+          }
+        },
+        {
+          "name": "WS /ws/observe — single pair",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{wsUrl}}?interval={{interval}}&pair={{pair}}",
+              "host": ["{{wsUrl}}"],
+              "query": [
+                { "key": "interval", "value": "{{interval}}" },
+                { "key": "pair", "value": "{{pair}}" }
+              ]
+            },
+            "description": "WebSocket URL: ws://localhost:8000/ws/observe?interval=1m&pair=EURUSD"
+          }
+        }
+      ]
+    }
+  ]
+}
