@@ -17,12 +17,12 @@ aptPkgs = [
 
 [phases.install]
 dependsOn = ["setup"]
-cacheDirectories = ["/tmp/drogon/build"]
+cacheDirectories = ["/tmp/drogon-build"]
 cmds = [
   "git clone --depth 1 --recurse-submodules https://github.com/drogonframework/drogon /tmp/drogon",
-  "cmake -S /tmp/drogon -B /tmp/drogon/build -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_CTL=OFF -DBUILD_MYSQL=OFF -DBUILD_SQLITE=OFF -DBUILD_POSTGRESQL=ON -DBUILD_REDIS=ON",
-  "cmake --build /tmp/drogon/build -j$(nproc)",
-  "cmake --install /tmp/drogon/build",
+  "cmake -S /tmp/drogon -B /tmp/drogon-build -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_CTL=OFF -DBUILD_MYSQL=OFF -DBUILD_SQLITE=OFF -DBUILD_POSTGRESQL=ON -DBUILD_REDIS=ON",
+  "cmake --build /tmp/drogon-build -j$(nproc)",
+  "cmake --install /tmp/drogon-build",
   "git clone --depth 1 https://github.com/Thalhammer/jwt-cpp third_party/jwt-cpp",
 ]
 
