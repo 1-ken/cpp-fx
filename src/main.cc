@@ -36,8 +36,6 @@ void dispatchNotification(services::Notifier &notifier, services::RedisService *
                                                   : a.targetPrice.value_or(0);
     std::string cond = a.alertType == "candle_close" ? a.direction.value_or("")
                                                      : a.condition.value_or("");
-    std::string msg = services::Notifier::formatAlertMessage(
-        a.pair, target, t.currentPrice, cond, a.customMessage, a.alertType, t.timeframe);
 
     auto onDone = [redis, dlqKey, a](bool ok) {
         if (!ok && redis && redis->connected()) {
@@ -49,10 +47,22 @@ void dispatchNotification(services::Notifier &notifier, services::RedisService *
     };
 
     if (a.channel == "sms") {
-        notifier.sendSms(a.phone, msg, onDone);
+        std::string text = !a.customMessage.empty()
+                               ? a.customMessage
+                               : services::Notifier::formatAlertMessage(
+                                     a.pair, target, t.currentPrice, cond, "", a.alertType,
+                                     t.timeframe);
+        notifier.sendSms(a.phone, text, onDone);
     } else if (a.channel == "call") {
-        notifier.sendCall(a.phone, msg, onDone);
+        std::string text = !a.customMessage.empty()
+                               ? a.customMessage
+                               : services::Notifier::formatAlertMessage(
+                                     a.pair, target, t.currentPrice, cond, "", a.alertType,
+                                     t.timeframe);
+        notifier.sendCall(a.phone, text, onDone);
     } else {
+        std::string msg = services::Notifier::formatAlertMessage(
+            a.pair, target, t.currentPrice, cond, a.customMessage, a.alertType, t.timeframe);
         notifier.sendEmail(a.email, "Price Alert: " + a.pair, msg, onDone);
     }
 }

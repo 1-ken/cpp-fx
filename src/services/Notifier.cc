@@ -13,14 +13,30 @@ using namespace drogon;
 namespace ctraderplus::services {
 
 namespace {
-std::string urlEncode(const std::string &s) { return drogon::utils::urlEncode(s); }
+
+std::string escapeXml(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            default: out += c;
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 Notifier::Notifier(const core::Config &cfg) : cfg_(cfg) {}
 
 bool Notifier::emailEnabled() const { return !cfg_.sendgridApiKey.empty(); }
 bool Notifier::smsEnabled() const {
-    return !cfg_.africasTalkingUsername.empty() && !cfg_.africasTalkingApiKey.empty();
+    return !cfg_.smsGateUsername.empty() && !cfg_.smsGatePassword.empty();
 }
 bool Notifier::callEnabled() const {
     return !cfg_.twilioAccountSid.empty() && !cfg_.twilioAuthToken.empty() &&
@@ -87,22 +103,26 @@ void Notifier::sendSms(const std::string &toPhone, const std::string &text, Done
         cb(true);
         return;
     }
-    auto client = HttpClient::newHttpClient("https://api.africastalking.com");
-    auto req = HttpRequest::newHttpRequest();
+    auto client = HttpClient::newHttpClient("https://api.sms-gate.app");
+    Json::Value payload;
+    payload["message"] = text;
+    Json::Value phones(Json::arrayValue);
+    phones.append(toPhone);
+    payload["phoneNumbers"] = phones;
+
+    auto req = HttpRequest::newHttpJsonRequest(payload);
     req->setMethod(Post);
-    req->setPath("/version1/messaging");
-    req->addHeader("apiKey", cfg_.africasTalkingApiKey);
-    req->addHeader("Accept", "application/json");
-    req->setContentTypeCode(CT_APPLICATION_X_FORM);
-    std::ostringstream form;
-    form << "username=" << urlEncode(cfg_.africasTalkingUsername)
-         << "&to=" << urlEncode(toPhone) << "&message=" << urlEncode(text);
-    if (!cfg_.africasTalkingSenderId.empty())
-        form << "&from=" << urlEncode(cfg_.africasTalkingSenderId);
-    req->setBody(form.str());
+    req->setPath("/3rdparty/v1/message");
+    std::string auth = drogon::utils::base64Encode(
+        reinterpret_cast<const unsigned char *>(
+            (cfg_.smsGateUsername + ":" + cfg_.smsGatePassword).c_str()),
+        cfg_.smsGateUsername.size() + cfg_.smsGatePassword.size() + 1);
+    req->addHeader("Authorization", "Basic " + auth);
+
     client->sendRequest(req, [cb](ReqResult r, const HttpResponsePtr &resp) {
-        bool ok = (r == ReqResult::Ok && resp && resp->getStatusCode() < k300MultipleChoices);
-        if (!ok) LOG_WARN << "Africa's Talking SMS failed";
+        bool ok = (r == ReqResult::Ok && resp &&
+                   resp->getStatusCode() >= k200OK && resp->getStatusCode() < k300MultipleChoices);
+        if (!ok) LOG_WARN << "SMS Gate send failed";
         cb(ok);
     });
 }
@@ -122,10 +142,11 @@ void Notifier::sendCall(const std::string &toPhone, const std::string &message, 
         cfg_.twilioAccountSid.size() + cfg_.twilioAuthToken.size() + 1);
     req->addHeader("Authorization", "Basic " + auth);
     req->setContentTypeCode(CT_APPLICATION_X_FORM);
-    std::string twiml = "<Response><Say>" + message + "</Say></Response>";
+    std::string twiml = "<Response><Say>" + escapeXml(message) + "</Say></Response>";
     std::ostringstream form;
-    form << "To=" << urlEncode(toPhone) << "&From=" << urlEncode(cfg_.twilioFromNumber)
-         << "&Twiml=" << urlEncode(twiml);
+    form << "To=" << drogon::utils::urlEncode(toPhone)
+         << "&From=" << drogon::utils::urlEncode(cfg_.twilioFromNumber)
+         << "&Twiml=" << drogon::utils::urlEncode(twiml);
     req->setBody(form.str());
     client->sendRequest(req, [cb](ReqResult r, const HttpResponsePtr &resp) {
         bool ok = (r == ReqResult::Ok && resp && resp->getStatusCode() < k300MultipleChoices);

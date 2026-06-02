@@ -92,6 +92,26 @@
           }
         },
         {
+          "name": "11a Create SMS alert",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('create sms alert', () => pm.expect(pm.response.code).to.be.oneOf([200,400]));"], "type": "text/javascript" } }],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"target_price\": 9.99997,\n  \"condition\": \"below\",\n  \"channel\": \"sms\",\n  \"phone\": \"{{testPhone}}\",\n  \"custom_message\": \"Smoke test SMS alert triggered\"\n}" },
+            "url": "{{baseUrl}}/api/v1/alerts"
+          }
+        },
+        {
+          "name": "11b Create call alert",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('create call alert', () => pm.expect(pm.response.code).to.be.oneOf([200,400]));"], "type": "text/javascript" } }],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"target_price\": 9.99998,\n  \"condition\": \"above\",\n  \"channel\": \"call\",\n  \"phone\": \"{{testPhone}}\",\n  \"custom_message\": \"Smoke test call alert triggered\"\n}" },
+            "url": "{{baseUrl}}/api/v1/alerts"
+          }
+        },
+        {
           "name": "12 List alerts",
           "event": [{ "listen": "test", "script": { "exec": ["pm.test('list alerts', () => { pm.response.to.have.status(200); pm.expect(pm.response.json()).to.have.property('total'); });"], "type": "text/javascript" } }],
           "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/alerts" }
@@ -140,7 +160,9 @@
         { "name": "GET /", "request": { "method": "GET", "url": "{{baseUrl}}/" } },
         { "name": "GET /health", "request": { "method": "GET", "url": "{{baseUrl}}/health" } },
         { "name": "GET /ping", "request": { "method": "GET", "url": "{{baseUrl}}/ping" } },
-        { "name": "GET /dashboard", "request": { "method": "GET", "url": "{{baseUrl}}/dashboard" } }
+        { "name": "GET /dashboard", "request": { "method": "GET", "url": "{{baseUrl}}/dashboard" } },
+        { "name": "GET /docs (Swagger UI)", "request": { "method": "GET", "url": "{{baseUrl}}/docs" } },
+        { "name": "GET /openapi.yaml", "request": { "method": "GET", "url": "{{baseUrl}}/openapi.yaml" } }
       ]
     },
     {
@@ -298,7 +320,33 @@
             "header": [{ "key": "Content-Type", "value": "application/json" }],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"target_price\": 1.05,\n  \"condition\": \"below\",\n  \"channel\": \"sms\",\n  \"phone\": \"{{testPhone}}\"\n}"
+              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"target_price\": 1.05,\n  \"condition\": \"below\",\n  \"channel\": \"sms\",\n  \"phone\": \"{{testPhone}}\",\n  \"custom_message\": \"EUR USD dropped below your target\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts",
+            "description": "SMS sent via SMS Gate (SMS_GATE_USERNAME/PASSWORD in .env)."
+          }
+        },
+        {
+          "name": "POST /api/v1/alerts — call alert",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"target_price\": 1.10,\n  \"condition\": \"above\",\n  \"channel\": \"call\",\n  \"phone\": \"{{testPhone}}\",\n  \"custom_message\": \"EUR USD hit your target price\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts",
+            "description": "Voice call via Twilio (TWILIO_* in .env)."
+          }
+        },
+        {
+          "name": "POST /api/v1/alerts — candle-close call alert",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"interval\": \"{{interval}}\",\n  \"direction\": \"above\",\n  \"threshold\": 1.10,\n  \"channel\": \"call\",\n  \"phone\": \"{{testPhone}}\",\n  \"custom_message\": \"30m candle closed above your threshold\"\n}"
             },
             "url": "{{baseUrl}}/api/v1/alerts"
           }

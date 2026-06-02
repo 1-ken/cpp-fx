@@ -191,9 +191,8 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
     // ---- Notifications ----
     c.sendgridApiKey = envStr("SENDGRID_API_KEY");
     c.sendgridFromEmail = envStr("SENDGRID_FROM_EMAIL", c.sendgridFromEmail);
-    c.africasTalkingUsername = envStr("AFRICASTALKING_USERNAME");
-    c.africasTalkingApiKey = envStr("AFRICASTALKING_API_KEY");
-    c.africasTalkingSenderId = envStr("AFRICASTALKING_SENDER_ID");
+    c.smsGateUsername = envStr("SMS_GATE_USERNAME");
+    c.smsGatePassword = envStr("SMS_GATE_PASSWORD");
     c.twilioAccountSid = envStr("TWILIO_ACCOUNT_SID");
     c.twilioAuthToken = envStr("TWILIO_AUTH_TOKEN");
     c.twilioFromNumber = envStr("TWILIO_FROM_NUMBER");

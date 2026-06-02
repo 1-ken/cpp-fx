@@ -6,7 +6,11 @@ info:
 
     **Local dev:** set `AUTH_DISABLED=1` in `.env` and restart the server — protected routes accept requests without a JWT (user id `dev-user`).
 
+    **Interactive docs:** [Swagger UI](/docs) · [OpenAPI YAML](/openapi.yaml)
+
     WebSocket: `ws://localhost:8000/ws/observe?interval=1m&pair=EURUSD&access_token=<jwt>` (token optional when auth disabled).
+
+    **Alert notifications:** `email` → SendGrid · `sms` → [SMS Gate](https://api.sms-gate.app) · `call` → Twilio voice
   version: 1.0.0
 
 servers:
@@ -36,6 +40,36 @@ components:
           type: string
         error:
           type: string
+
+    AlertChannel:
+      type: string
+      enum: [email, sms, call]
+      description: |
+        Notification channel. Backend providers:
+        - email → SendGrid (SENDGRID_API_KEY)
+        - sms → SMS Gate (SMS_GATE_USERNAME, SMS_GATE_PASSWORD)
+        - call → Twilio voice (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER)
+        custom_message is required for sms and call channels.
+
+    CreateAlertRequest:
+      type: object
+      required: [pair]
+      properties:
+        pair: { type: string, example: EURUSD }
+        target_price: { type: number, description: Price alert target }
+        condition: { type: string, enum: [above, below, equal] }
+        interval: { type: string, enum: [1m, 5m, 15m, 30m, 1h, 4h, 1d], description: Candle-close alert }
+        direction: { type: string, enum: [above, below] }
+        threshold: { type: number }
+        channel: { $ref: '#/components/schemas/AlertChannel' }
+        email: { type: string, description: Required when channel=email }
+        phone: { type: string, description: Required when channel=sms or call }
+        custom_message:
+          type: string
+          description: |
+            Required when channel=sms or call. This exact text is sent via SMS Gate
+            (sms) or spoken on Twilio voice calls (call). Optional for email (appended
+            to the formatted alert body).
 
 security:
   - bearerAuth: []
@@ -78,6 +112,28 @@ paths:
       responses:
         '200':
           description: HTML page
+
+  /docs:
+    get:
+      tags: [Public]
+      security: []
+      summary: Swagger UI (interactive API docs)
+      responses:
+        '200':
+          description: HTML page loading Swagger UI from /openapi.yaml
+
+  /openapi.yaml:
+    get:
+      tags: [Public]
+      security: []
+      summary: OpenAPI 3 specification (YAML)
+      responses:
+        '200':
+          description: OpenAPI document
+          content:
+            application/yaml:
+              schema:
+                type: string
 
   /snapshot:
     get:
@@ -247,19 +303,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [pair]
-              properties:
-                pair: { type: string, example: EURUSD }
-                target_price: { type: number, description: Price alert }
-                condition: { type: string, enum: [above, below, equal] }
-                interval: { type: string, description: Candle alert interval }
-                direction: { type: string, enum: [above, below] }
-                threshold: { type: number }
-                channel: { type: string, enum: [email, sms, call], default: email }
-                email: { type: string }
-                phone: { type: string }
-                custom_message: { type: string }
+              $ref: '#/components/schemas/CreateAlertRequest'
       responses:
         '200':
           description: success + alert

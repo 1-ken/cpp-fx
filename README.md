@@ -104,6 +104,27 @@ batch sizes).
 # Dashboard: http://localhost:8000/dashboard
 ```
 
+## Deploy (Nixpacks / Railway)
+
+Set the service **root directory** to `ctraderplus-cpp/`. Nixpacks picks up
+[`nixpacks.toml`](nixpacks.toml), which builds Drogon (Postgres + Redis), compiles
+the server, and starts `./build/ctraderplus_server`. The platform injects `PORT`;
+the app binds `0.0.0.0:$PORT`.
+
+Attach managed **PostgreSQL** and **Redis**, then set environment variables (do
+not commit `.env`):
+
+- **Required:** `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`,
+  `CTRADER_ACCESS_TOKEN`, `CTRADER_ACCOUNT_ID`, `DATABASE_URL`, `REDIS_URL`,
+  `NEXTAUTH_SECRET`
+- **Optional:** `CTRADER_HOST`, `CTRADER_REFRESH_TOKEN`, `WS_URL`,
+  `API_BASE_URL`, notification provider vars (see `.env.example`)
+
+First deploy may take ~10–15 minutes while Drogon compiles; later redeploys are
+faster thanks to build caching.
+
+After deploy, verify `GET /health` and `GET /ping` return 200.
+
 ## Architecture
 
 ```

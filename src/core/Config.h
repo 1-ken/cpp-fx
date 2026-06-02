@@ -81,9 +81,8 @@ struct Config {
     // Notification providers
     std::string sendgridApiKey;
     std::string sendgridFromEmail = "alerts@example.com";
-    std::string africasTalkingUsername;
-    std::string africasTalkingApiKey;
-    std::string africasTalkingSenderId;
+    std::string smsGateUsername;
+    std::string smsGatePassword;
     std::string twilioAccountSid;
     std::string twilioAuthToken;
     std::string twilioFromNumber;

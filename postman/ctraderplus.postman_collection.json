@@ -21,7 +21,8 @@
     { "key": "pair", "value": "EURUSD" },
     { "key": "interval", "value": "1m" },
     { "key": "alertId", "value": "" },
-    { "key": "testEmail", "value": "test@example.com" }
+    { "key": "testEmail", "value": "test@example.com" },
+    { "key": "testPhone", "value": "+254737778111" }
   ],
   "item": [
     {
@@ -59,6 +60,22 @@
             "method": "GET",
             "header": [],
             "url": "{{baseUrl}}/dashboard"
+          }
+        },
+        {
+          "name": "API docs (Swagger UI)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/docs"
+          }
+        },
+        {
+          "name": "OpenAPI spec (YAML)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/openapi.yaml"
           }
         }
       ]
@@ -253,6 +270,50 @@
             "body": {
               "mode": "raw",
               "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"interval\": \"{{interval}}\",\n  \"direction\": \"above\",\n  \"threshold\": 1.10,\n  \"channel\": \"email\",\n  \"email\": \"{{testEmail}}\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts"
+          }
+        },
+        {
+          "name": "Create SMS alert",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"target_price\": 1.05,\n  \"condition\": \"below\",\n  \"channel\": \"sms\",\n  \"phone\": \"{{testPhone}}\",\n  \"custom_message\": \"EUR USD dropped below your target\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts",
+            "description": "SMS via SMS Gate (SMS_GATE_USERNAME/PASSWORD in .env)."
+          }
+        },
+        {
+          "name": "Create call alert",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"target_price\": 1.10,\n  \"condition\": \"above\",\n  \"channel\": \"call\",\n  \"phone\": \"{{testPhone}}\",\n  \"custom_message\": \"EUR USD hit your target price\"\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/alerts",
+            "description": "Voice call via Twilio (TWILIO_* in .env)."
+          }
+        },
+        {
+          "name": "Create candle-close call alert",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pair\": \"{{pair}}\",\n  \"interval\": \"{{interval}}\",\n  \"direction\": \"above\",\n  \"threshold\": 1.10,\n  \"channel\": \"call\",\n  \"phone\": \"{{testPhone}}\",\n  \"custom_message\": \"30m candle closed above your threshold\"\n}"
             },
             "url": "{{baseUrl}}/api/v1/alerts"
           }

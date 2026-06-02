@@ -15,6 +15,7 @@
 
 #include "alerts/AlertManager.h"
 #include "controllers/Dashboard.h"
+#include "controllers/OpenApiDoc.h"
 #include "core/AppContext.h"
 #include "core/Auth.h"
 #include "core/Config.h"
@@ -60,6 +61,17 @@ bool authOrReject(const HttpRequestPtr &req,
 }
 
 int clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+std::string trimStr(const std::string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+bool requiresCustomMessage(const std::string &channel, const std::string &customMessage) {
+    return (channel == "sms" || channel == "call") && trimStr(customMessage).empty();
+}
 
 std::optional<std::time_t> parseQueryTime(const std::string &s) {
     if (s.empty()) return std::nullopt;
@@ -118,6 +130,22 @@ void dashboard(const HttpRequestPtr &, std::function<void(const HttpResponsePtr 
     resp->setStatusCode(k200OK);
     resp->setContentTypeCode(CT_TEXT_HTML);
     resp->setBody(kDashboardHtml);
+    cb(resp);
+}
+
+void openApiSpec(const HttpRequestPtr &, std::function<void(const HttpResponsePtr &)> &&cb) {
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeString("application/yaml");
+    resp->setBody(openApiYaml());
+    cb(resp);
+}
+
+void apiDocs(const HttpRequestPtr &, std::function<void(const HttpResponsePtr &)> &&cb) {
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeCode(CT_TEXT_HTML);
+    resp->setBody(kSwaggerUiHtml);
     cb(resp);
 }
 
@@ -461,7 +489,7 @@ void createAlert(const HttpRequestPtr &req,
     std::string channel = b.get("channel", "email").asString();
     std::string email = b.get("email", "").asString();
     std::string phone = b.get("phone", "").asString();
-    std::string customMessage = b.get("custom_message", "").asString();
+    std::string customMessage = trimStr(b.get("custom_message", "").asString());
     bool isCandle = b.isMember("interval") && b["interval"].isString() &&
                     !b["interval"].asString().empty();
 
@@ -483,6 +511,10 @@ void createAlert(const HttpRequestPtr &req,
         }
         if ((channel == "sms" || channel == "call") && phone.empty()) {
             cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
+            return;
+        }
+        if (requiresCustomMessage(channel, customMessage)) {
+            cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
             return;
         }
         if (direction != "above" && direction != "below") {
@@ -518,6 +550,10 @@ void createAlert(const HttpRequestPtr &req,
     }
     if ((channel == "sms" || channel == "call") && phone.empty()) {
         cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
+        return;
+    }
+    if (requiresCustomMessage(channel, customMessage)) {
+        cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
         return;
     }
     auto a = app.alerts->createPriceAlert(pair, target, condition, uid, email, channel,
@@ -588,6 +624,16 @@ void updateAlert(const HttpRequestPtr &req, std::function<void(const HttpRespons
     }
     auto body = req->getJsonObject();
     Json::Value updates = body ? *body : Json::Value(Json::objectValue);
+    std::string channel = existing->channel;
+    if (updates.isMember("channel") && updates["channel"].isString())
+        channel = updates["channel"].asString();
+    std::string customMessage = existing->customMessage;
+    if (updates.isMember("custom_message") && updates["custom_message"].isString())
+        customMessage = trimStr(updates["custom_message"].asString());
+    if (requiresCustomMessage(channel, customMessage)) {
+        cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
+        return;
+    }
     try {
         auto updated = app.alerts->updateAlert(alertId, updates, uid);
         if (!updated) {
@@ -617,6 +663,8 @@ void registerRoutes() {
     fw.registerHandler("/health", &health, {Get});
     fw.registerHandler("/ping", &ping, {Get});
     fw.registerHandler("/dashboard", &dashboard, {Get});
+    fw.registerHandler("/openapi.yaml", &openApiSpec, {Get});
+    fw.registerHandler("/docs", &apiDocs, {Get});
     fw.registerHandler("/snapshot", &snapshot, {Get});
     fw.registerHandler("/client-config", &clientConfig, {Get});
     fw.registerHandler("/stream-health", &streamHealth, {Get});

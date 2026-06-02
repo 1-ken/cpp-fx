@@ -1,0 +1,37 @@
+[phases.setup]
+nixPkgs = [
+  "...",
+  "cmake",
+  "gcc",
+  "gnumake",
+  "pkg-config",
+  "git",
+  "protobuf",
+  "openssl",
+  "jsoncpp",
+  "libpq",
+  "hiredis",
+  "zlib",
+  "libossp_uuid",
+]
+
+[phases.install]
+dependsOn = ["setup"]
+cacheDirectories = ["/tmp/drogon/build"]
+cmds = [
+  "git clone --depth 1 --recurse-submodules https://github.com/drogonframework/drogon /tmp/drogon",
+  "cmake -S /tmp/drogon -B /tmp/drogon/build -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_CTL=OFF -DBUILD_MYSQL=OFF -DBUILD_SQLITE=OFF -DBUILD_POSTGRESQL=ON -DBUILD_REDIS=ON",
+  "cmake --build /tmp/drogon/build -j$(nproc)",
+  "cmake --install /tmp/drogon/build",
+  "git clone --depth 1 https://github.com/Thalhammer/jwt-cpp third_party/jwt-cpp",
+]
+
+[phases.build]
+dependsOn = ["install"]
+cmds = [
+  "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF",
+  "cmake --build build -j$(nproc)",
+]
+
+[start]
+cmd = "LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH} ./build/ctraderplus_server"

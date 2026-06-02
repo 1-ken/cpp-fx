@@ -7,7 +7,7 @@
 
 namespace ctraderplus::services {
 
-// Outbound notification channels. Email -> SendGrid, SMS -> Africa's Talking,
+// Outbound notification channels. Email -> SendGrid, SMS -> SMS Gate,
 // Call -> Twilio. Each send is async; the callback reports success/failure so
 // the dispatcher can retry. Channels with missing credentials are no-ops that
 // report success (so they are not retried), mirroring the Python behavior.
