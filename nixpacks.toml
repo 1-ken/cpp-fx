@@ -1,18 +1,18 @@
 [phases.setup]
-nixPkgs = [
-  "...",
+nixPkgs = []
+aptPkgs = [
+  "build-essential",
   "cmake",
-  "gcc",
-  "gnumake",
   "pkg-config",
   "git",
-  "protobuf",
-  "openssl",
-  "jsoncpp",
-  "libpq",
-  "hiredis",
-  "zlib",
-  "libossp_uuid",
+  "protobuf-compiler",
+  "libprotobuf-dev",
+  "libssl-dev",
+  "libjsoncpp-dev",
+  "libpq-dev",
+  "libhiredis-dev",
+  "uuid-dev",
+  "zlib1g-dev",
 ]
 
 [phases.install]
