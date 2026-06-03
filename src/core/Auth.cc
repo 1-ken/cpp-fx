@@ -19,10 +19,8 @@ AuthResult decodeAccessToken(const std::string &token) {
 
     try {
         auto decoded = jwt::decode(token);
-        auto verifier = jwt::verify()
-                            .allow_algorithm(jwt::algorithm::hs256{cfg.nextAuthSecret})
-                            .with_claim("sub", jwt::claim())  // require presence below
-                            ;
+        auto verifier =
+            jwt::verify().allow_algorithm(jwt::algorithm::hs256{cfg.nextAuthSecret});
         verifier.verify(decoded);
 
         if (!decoded.has_payload_claim("sub") || !decoded.has_expires_at()) {
