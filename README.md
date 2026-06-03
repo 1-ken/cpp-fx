@@ -126,12 +126,15 @@ image layers). Do not commit `.env`.
 | Variable | Format | Example |
 |----------|--------|---------|
 | `DATABASE_URL` | `postgresql://user:pass@host:5432/db` (libpq; **not** `postgresql+asyncpg://`) | `postgresql://myuser:secret@fxalerts-commodities-xyqnzu:5432/commodities` |
-| `REDIS_URL` | `redis://[user:password@]host:port[/db]` | `redis://default:secret@fxalerts-redis-bfgt7d:6379` |
+| `REDIS_URL` | `redis://[user:password@]host:port[/db]` — use the **managed Redis hostname**, not an IP | `redis://default:secret@fxalerts-redis-bfgt7d:6379` |
 
-On startup the server runs idempotent Postgres migrations (adds `alerts.data`
-JSONB and backfills from legacy Python flat columns). Logs should show
-`Redis client created for <host>:6379/...` — not `0.0.0.0:6379` or localhost
-unless Redis runs in the same container.
+The server resolves Redis hostnames via DNS at startup (same as cTrader). Keep
+`fxalerts-redis-bfgt7d` (or your service name) in `REDIS_URL`; do not replace it
+with a numeric IP. Logs should look like:
+`Redis client created for fxalerts-redis-bfgt7d (10.x.x.x:6379/0) acl_user=default`.
+
+On startup the server also runs idempotent Postgres migrations (adds `alerts.data`
+JSONB and backfills from legacy Python flat columns).
 
 First deploy may take ~10–15 minutes while Drogon compiles; later redeploys are
 faster thanks to build caching.

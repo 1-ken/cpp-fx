@@ -1,14 +1,12 @@
 #include "ctrader/CTraderClient.h"
 
-#include <netdb.h>
-#include <arpa/inet.h>
-
 #include <algorithm>
 #include <cstring>
 
 #include <trantor/utils/Logger.h>
 
 #include "ctrader/ProtoUtil.h"
+#include "util/HostResolve.h"
 
 #include "OpenApiCommonMessages.pb.h"
 #include "OpenApiMessages.pb.h"
@@ -34,20 +32,6 @@ TrendbarData convertTrendbar(const ProtoOATrendbar &tb) {
     return d;
 }
 
-std::string resolveHost(const std::string &host) {
-    struct addrinfo hints {};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo *res = nullptr;
-    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) {
-        return "";
-    }
-    char ip[INET_ADDRSTRLEN] = {0};
-    auto *addr = reinterpret_cast<struct sockaddr_in *>(res->ai_addr);
-    inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
-    freeaddrinfo(res);
-    return std::string(ip);
-}
 }  // namespace
 
 CTraderClient::CTraderClient(const core::CTraderConfig &cfg) : cfg_(cfg) {
@@ -82,7 +66,7 @@ void CTraderClient::connect() {
     state_ = State::Connecting;
     ready_.store(false);
 
-    std::string ip = resolveHost(cfg_.resolvedHost());
+    std::string ip = util::resolveHostToIpv4(cfg_.resolvedHost());
     if (ip.empty()) {
         LOG_ERROR << "cTrader: failed to resolve host " << cfg_.resolvedHost();
         scheduleReconnect();

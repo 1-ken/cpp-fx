@@ -4,6 +4,8 @@
 
 #include <trantor/utils/Logger.h>
 
+#include "util/HostResolve.h"
+
 namespace ctraderplus::services {
 
 namespace {
@@ -15,19 +17,18 @@ std::string trim(const std::string &s) {
     return s.substr(a, b - a + 1);
 }
 
-// Redact password for logs: redis://user:***@host:port/db
 std::string redactRedisUrl(const std::string &url) {
     static const std::regex authRe(R"(redis://([^:@/]+):([^@]+)@)");
     return std::regex_replace(url, authRe, "redis://$1:***@");
 }
 
-// Parse redis://[user:password@]host[:port][/db] (ACL user+password or password-only).
-bool parseUrl(const std::string &url, std::string &host, int &port, int &db,
-              std::string &password) {
+// Parse redis://[user:password@]host[:port][/db]
+bool parseUrl(const std::string &url, std::string &username, std::string &host, int &port,
+              int &db, std::string &password) {
     const std::string t = trim(url);
     if (t.empty()) return false;
 
-    std::string scheme = "redis://";
+    const std::string scheme = "redis://";
     if (t.rfind(scheme, 0) != 0) return false;
 
     std::string rest = t.substr(scheme.size());
@@ -37,6 +38,7 @@ bool parseUrl(const std::string &url, std::string &host, int &port, int &db,
         rest = rest.substr(at + 1);
         auto colon = auth.find(':');
         if (colon != std::string::npos) {
+            username = auth.substr(0, colon);
             password = auth.substr(colon + 1);
         } else {
             password = auth;
@@ -73,7 +75,7 @@ bool parseUrl(const std::string &url, std::string &host, int &port, int &db,
 }  // namespace
 
 RedisService::RedisService(const core::Config &cfg) : cfg_(cfg) {
-    urlParsedOk_ = parseUrl(cfg.redisUrl, host_, port_, db_, password_);
+    urlParsedOk_ = parseUrl(cfg.redisUrl, username_, host_, port_, db_, password_);
     if (!urlParsedOk_) {
         LOG_ERROR << "Invalid or missing REDIS_URL (expected redis://[user:password@]host[:port][/db]): "
                   << (cfg.redisUrl.empty() ? "(empty)" : redactRedisUrl(cfg.redisUrl));
@@ -85,14 +87,26 @@ bool RedisService::connect() {
         LOG_WARN << "Redis connect skipped: REDIS_URL was not parsed";
         return false;
     }
+
+    std::string connectIp =
+        util::isIpv4Literal(host_) ? host_ : util::resolveHostToIpv4(host_);
+    if (connectIp.empty()) {
+        LOG_ERROR << "Failed to resolve Redis host: " << host_;
+        return false;
+    }
+
     try {
         client_ = drogon::nosql::RedisClient::newRedisClient(
-            trantor::InetAddress(host_, static_cast<uint16_t>(port_)),
-            /*connections=*/2, password_, static_cast<unsigned int>(db_));
-        LOG_INFO << "Redis client created for " << host_ << ":" << port_ << "/" << db_;
+            trantor::InetAddress(connectIp, static_cast<uint16_t>(port_)),
+            /*connections=*/2, password_, static_cast<unsigned int>(db_), username_);
+        std::string log = "Redis client created for " + host_ + " (" + connectIp + ":" +
+                          std::to_string(port_) + "/" + std::to_string(db_) + ")";
+        if (!username_.empty()) log += " acl_user=" + username_;
+        LOG_INFO << log;
         return client_ != nullptr;
     } catch (const std::exception &e) {
-        LOG_WARN << "Redis unavailable (" << host_ << ":" << port_ << "): " << e.what();
+        LOG_WARN << "Redis unavailable (" << host_ << " -> " << connectIp << ":" << port_
+                 << "): " << e.what();
         client_ = nullptr;
         return false;
     }
@@ -174,7 +188,6 @@ void RedisService::readJsonQueue(const std::string &key, int batch,
 void RedisService::requeueJsonBatch(const std::string &key,
                                     const std::vector<std::string> &items) {
     if (!client_ || items.empty()) return;
-    // LPUSH in reverse to preserve original order.
     for (auto it = items.rbegin(); it != items.rend(); ++it) {
         client_->execCommandAsync(
             [](const drogon::nosql::RedisResult &) {},
