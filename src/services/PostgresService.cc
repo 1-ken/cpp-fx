@@ -37,6 +37,55 @@ Json::Value parseJson(const std::string &s) {
     reader->parse(s.c_str(), s.c_str() + s.size(), &root, &errs);
     return root;
 }
+
+bool columnExists(const drogon::orm::DbClientPtr &client, const std::string &table,
+                  const std::string &column) {
+    auto r = client->execSqlSync(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2 LIMIT 1",
+        table, column);
+    return r.size() > 0;
+}
+
+void migrateAlertsSchema(const drogon::orm::DbClientPtr &client) {
+    client->execSqlSync("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS data JSONB");
+
+    if (!columnExists(client, "alerts", "channel")) return;
+
+    client->execSqlSync(
+        "UPDATE alerts SET data = jsonb_build_object("
+        "'id', id,"
+        "'user_id', COALESCE(user_id, 'legacy-unassigned'),"
+        "'pair', pair,"
+        "'status', status,"
+        "'alert_type', COALESCE(alert_type, 'price'),"
+        "'created_at', to_char(created_at AT TIME ZONE 'UTC', "
+        "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),"
+        "'channel', COALESCE(channel, 'email'),"
+        "'email', COALESCE(email, ''),"
+        "'phone', COALESCE(phone, ''),"
+        "'custom_message', COALESCE(custom_message, ''),"
+        "'triggered_at', CASE WHEN triggered_at IS NULL THEN NULL ELSE to_char("
+        "triggered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END,"
+        "'last_checked_price', last_checked_price,"
+        "'close_price', close_price,"
+        "'target_price', target_price,"
+        "'condition', condition,"
+        "'interval', \"interval\","
+        "'direction', direction,"
+        "'threshold', threshold,"
+        "'last_evaluated_candle_time', CASE WHEN last_evaluated_candle_time IS NULL "
+        "THEN NULL ELSE to_char(last_evaluated_candle_time AT TIME ZONE 'UTC', "
+        "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END"
+        ") WHERE data IS NULL");
+
+    auto r = client->execSqlSync(
+        "SELECT COUNT(*)::bigint AS n FROM alerts WHERE data IS NOT NULL");
+    if (r.size() > 0) {
+        LOG_INFO << "Migrated legacy alerts rows to JSONB data column (total with data: "
+                 << r[0]["n"].as<long long>() << ")";
+    }
+}
 }  // namespace
 
 PostgresService::PostgresService(const core::Config &cfg) : cfg_(cfg) {}
@@ -88,6 +137,7 @@ void PostgresService::initSchema() {
         "user_id VARCHAR(128) PRIMARY KEY,"
         "first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
         "onboarding_completed_at TIMESTAMPTZ)");
+    migrateAlertsSchema(client_);
     LOG_INFO << "PostgreSQL schema ensured";
 }
 

@@ -40,6 +40,7 @@ class RedisService {
     int port_ = 6379;
     int db_ = 0;
     std::string password_;
+    bool urlParsedOk_ = false;
     drogon::nosql::RedisClientPtr client_;
 };
 

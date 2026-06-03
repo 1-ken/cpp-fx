@@ -111,14 +111,27 @@ Set the service **root directory** to `ctraderplus-cpp/`. Nixpacks picks up
 the server, and starts `./build/ctraderplus_server`. The platform injects `PORT`;
 the app binds `0.0.0.0:$PORT`.
 
-Attach managed **PostgreSQL** and **Redis**, then set environment variables (do
-not commit `.env`):
+Attach managed **PostgreSQL** and **Redis**, then set **runtime** environment
+variables in Dokploy (not build-time Docker ARGs — avoids baking secrets into
+image layers). Do not commit `.env`.
 
 - **Required:** `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`,
   `CTRADER_ACCESS_TOKEN`, `CTRADER_ACCOUNT_ID`, `DATABASE_URL`, `REDIS_URL`,
   `NEXTAUTH_SECRET`
 - **Optional:** `CTRADER_HOST`, `CTRADER_REFRESH_TOKEN`, `WS_URL`,
   `API_BASE_URL`, notification provider vars (see `.env.example`)
+
+**Dokploy / production URLs**
+
+| Variable | Format | Example |
+|----------|--------|---------|
+| `DATABASE_URL` | `postgresql://user:pass@host:5432/db` (libpq; **not** `postgresql+asyncpg://`) | `postgresql://myuser:secret@fxalerts-commodities-xyqnzu:5432/commodities` |
+| `REDIS_URL` | `redis://[user:password@]host:port[/db]` | `redis://default:secret@fxalerts-redis-bfgt7d:6379` |
+
+On startup the server runs idempotent Postgres migrations (adds `alerts.data`
+JSONB and backfills from legacy Python flat columns). Logs should show
+`Redis client created for <host>:6379/...` — not `0.0.0.0:6379` or localhost
+unless Redis runs in the same container.
 
 First deploy may take ~10–15 minutes while Drogon compiles; later redeploys are
 faster thanks to build caching.

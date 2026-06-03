@@ -7,29 +7,84 @@
 namespace ctraderplus::services {
 
 namespace {
-// Parse redis://[:password@]host:port/db
-void parseUrl(const std::string &url, std::string &host, int &port, int &db,
-              std::string &password) {
-    std::smatch m;
-    static const std::regex re(
-        R"(redis://(?:([^@:]*):?([^@]*)@)?([^:/]+)(?::(\d+))?(?:/(\d+))?)");
-    if (std::regex_match(url, m, re)) {
-        if (m[2].matched && m[2].length() > 0)
-            password = m[2].str();
-        else if (m[1].matched && m[1].length() > 0)
-            password = m[1].str();
-        if (m[3].matched) host = m[3].str();
-        if (m[4].matched && m[4].length() > 0) port = std::stoi(m[4].str());
-        if (m[5].matched && m[5].length() > 0) db = std::stoi(m[5].str());
-    }
+
+std::string trim(const std::string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
 }
+
+// Redact password for logs: redis://user:***@host:port/db
+std::string redactRedisUrl(const std::string &url) {
+    static const std::regex authRe(R"(redis://([^:@/]+):([^@]+)@)");
+    return std::regex_replace(url, authRe, "redis://$1:***@");
+}
+
+// Parse redis://[user:password@]host[:port][/db] (ACL user+password or password-only).
+bool parseUrl(const std::string &url, std::string &host, int &port, int &db,
+              std::string &password) {
+    const std::string t = trim(url);
+    if (t.empty()) return false;
+
+    std::string scheme = "redis://";
+    if (t.rfind(scheme, 0) != 0) return false;
+
+    std::string rest = t.substr(scheme.size());
+    auto at = rest.find('@');
+    if (at != std::string::npos) {
+        std::string auth = rest.substr(0, at);
+        rest = rest.substr(at + 1);
+        auto colon = auth.find(':');
+        if (colon != std::string::npos) {
+            password = auth.substr(colon + 1);
+        } else {
+            password = auth;
+        }
+    }
+
+    auto slash = rest.find('/');
+    std::string hostPort = slash == std::string::npos ? rest : rest.substr(0, slash);
+    if (slash != std::string::npos && slash + 1 < rest.size()) {
+        try {
+            db = std::stoi(rest.substr(slash + 1));
+        } catch (...) {
+            return false;
+        }
+    }
+
+    auto colon = hostPort.find(':');
+    if (colon != std::string::npos) {
+        host = hostPort.substr(0, colon);
+        try {
+            port = std::stoi(hostPort.substr(colon + 1));
+        } catch (...) {
+            return false;
+        }
+    } else {
+        host = hostPort;
+    }
+
+    if (host.empty() || host == "0.0.0.0") return false;
+    if (port <= 0 || port > 65535) return false;
+    return true;
+}
+
 }  // namespace
 
 RedisService::RedisService(const core::Config &cfg) : cfg_(cfg) {
-    parseUrl(cfg.redisUrl, host_, port_, db_, password_);
+    urlParsedOk_ = parseUrl(cfg.redisUrl, host_, port_, db_, password_);
+    if (!urlParsedOk_) {
+        LOG_ERROR << "Invalid or missing REDIS_URL (expected redis://[user:password@]host[:port][/db]): "
+                  << (cfg.redisUrl.empty() ? "(empty)" : redactRedisUrl(cfg.redisUrl));
+    }
 }
 
 bool RedisService::connect() {
+    if (!urlParsedOk_) {
+        LOG_WARN << "Redis connect skipped: REDIS_URL was not parsed";
+        return false;
+    }
     try {
         client_ = drogon::nosql::RedisClient::newRedisClient(
             trantor::InetAddress(host_, static_cast<uint16_t>(port_)),
@@ -37,7 +92,7 @@ bool RedisService::connect() {
         LOG_INFO << "Redis client created for " << host_ << ":" << port_ << "/" << db_;
         return client_ != nullptr;
     } catch (const std::exception &e) {
-        LOG_WARN << "Redis unavailable: " << e.what();
+        LOG_WARN << "Redis unavailable (" << host_ << ":" << port_ << "): " << e.what();
         client_ = nullptr;
         return false;
     }

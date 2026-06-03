@@ -164,6 +164,12 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
 
     // ---- Postgres ----
     c.postgresDsn = envStr("DATABASE_URL", jstr(root, "postgresDsn", c.postgresDsn));
+    {
+        const std::string prefix = "postgresql+asyncpg://";
+        if (c.postgresDsn.rfind(prefix, 0) == 0) {
+            c.postgresDsn = "postgresql://" + c.postgresDsn.substr(prefix.size());
+        }
+    }
 
     // ---- Archive / retention ----
     c.archiveIntervalSeconds = jnum(root, "archiveIntervalSeconds", c.archiveIntervalSeconds);
