@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <optional>
 #include <string>
 
@@ -21,5 +22,12 @@ AuthResult getCurrentUserId(const std::string &authorizationHeader);
 
 // Validate a WebSocket `access_token` query parameter. Honors AUTH_DISABLED.
 AuthResult verifyWsAccessToken(const std::optional<std::string> &token);
+
+// Sign an HS256 JWT (NextAuth-compatible). extraClaims merged into payload.
+std::string signToken(const std::string &sub, int ttlSeconds,
+                      const std::map<std::string, std::string> &extraClaims = {});
+
+// Admin bearer token: requires role=admin claim.
+AuthResult requireAdmin(const std::string &authorizationHeader);
 
 }  // namespace ctraderplus::core

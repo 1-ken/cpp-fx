@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -38,6 +39,9 @@ struct AppContext {
     services::PostgresService *postgres = nullptr;  // may be null (degraded)
     services::RedisService *redis = nullptr;        // may be null (degraded)
     services::Notifier *notifier = nullptr;
+
+    // Set true after versioned schema migrations succeed on startup.
+    std::atomic<bool> dbMigrationsReady{false};
 
     // Runs a (possibly blocking) DB task off the HTTP event loops.
     std::function<void(std::function<void()>)> dbExec;

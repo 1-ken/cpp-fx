@@ -1,12 +1,15 @@
 #include "services/PostgresService.h"
 
 #include <memory>
+#include <optional>
 #include <sstream>
 
 #include <trantor/utils/Logger.h>
 
+#include "services/Migrations.h"
 #include "util/PairNormalizer.h"
 #include "util/TimeUtil.h"
+#include "util/Uuid.h"
 
 using namespace drogon::orm;
 
@@ -38,107 +41,64 @@ Json::Value parseJson(const std::string &s) {
     return root;
 }
 
-bool columnExists(const drogon::orm::DbClientPtr &client, const std::string &table,
-                  const std::string &column) {
-    auto r = client->execSqlSync(
-        "SELECT 1 FROM information_schema.columns "
-        "WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2 LIMIT 1",
-        table, column);
-    return r.size() > 0;
+std::string redactPostgresDsn(const std::string &dsn) {
+    const auto scheme = dsn.find("://");
+    const auto at = dsn.find('@');
+    if (scheme == std::string::npos || at == std::string::npos || at <= scheme + 3)
+        return dsn;
+    const auto colon = dsn.find(':', scheme + 3);
+    if (colon == std::string::npos || colon >= at) return dsn;
+    return dsn.substr(0, colon + 1) + "***" + dsn.substr(at);
 }
 
-void migrateAlertsSchema(const drogon::orm::DbClientPtr &client) {
-    client->execSqlSync("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS data JSONB");
-
-    if (!columnExists(client, "alerts", "channel")) return;
-
-    client->execSqlSync(
-        "UPDATE alerts SET data = jsonb_build_object("
-        "'id', id,"
-        "'user_id', COALESCE(user_id, 'legacy-unassigned'),"
-        "'pair', pair,"
-        "'status', status,"
-        "'alert_type', COALESCE(alert_type, 'price'),"
-        "'created_at', to_char(created_at AT TIME ZONE 'UTC', "
-        "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),"
-        "'channel', COALESCE(channel, 'email'),"
-        "'email', COALESCE(email, ''),"
-        "'phone', COALESCE(phone, ''),"
-        "'custom_message', COALESCE(custom_message, ''),"
-        "'triggered_at', CASE WHEN triggered_at IS NULL THEN NULL ELSE to_char("
-        "triggered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END,"
-        "'last_checked_price', last_checked_price,"
-        "'close_price', close_price,"
-        "'target_price', target_price,"
-        "'condition', condition,"
-        "'interval', \"interval\","
-        "'direction', direction,"
-        "'threshold', threshold,"
-        "'last_evaluated_candle_time', CASE WHEN last_evaluated_candle_time IS NULL "
-        "THEN NULL ELSE to_char(last_evaluated_candle_time AT TIME ZONE 'UTC', "
-        "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END"
-        ") WHERE data IS NULL");
-
-    auto r = client->execSqlSync(
-        "SELECT COUNT(*)::bigint AS n FROM alerts WHERE data IS NOT NULL");
-    if (r.size() > 0) {
-        LOG_INFO << "Migrated legacy alerts rows to JSONB data column (total with data: "
-                 << r[0]["n"].as<long long>() << ")";
-    }
+std::string dsnWithConnectTimeout(const std::string &dsn, int seconds) {
+    if (dsn.find("connect_timeout=") != std::string::npos) return dsn;
+    const char sep = (dsn.find('?') != std::string::npos) ? '&' : '?';
+    return dsn + sep + "connect_timeout=" + std::to_string(seconds);
 }
+
 }  // namespace
 
 PostgresService::PostgresService(const core::Config &cfg) : cfg_(cfg) {}
 
 bool PostgresService::connect() {
+    if (cfg_.postgresDsn.empty()) {
+        LOG_WARN << "DATABASE_URL not set; PostgreSQL disabled";
+        return false;
+    }
+    constexpr double kProbeTimeoutSec = 10.0;
+    constexpr int kConnectTimeoutSec = 5;
+    const std::string dsn = dsnWithConnectTimeout(cfg_.postgresDsn, kConnectTimeoutSec);
+    LOG_INFO << "Connecting to PostgreSQL (" << redactPostgresDsn(dsn) << ")...";
     try {
-        client_ = DbClient::newPgClient(cfg_.postgresDsn, /*connNum=*/2);
-        LOG_INFO << "PostgreSQL client created";
-        return client_ != nullptr;
+        client_ = DbClient::newPgClient(dsn, /*connNum=*/4);
+        if (!client_) {
+            LOG_WARN << "PostgreSQL client creation returned null";
+            return false;
+        }
+        // Apply a query timeout only for the startup probe so a bad DSN/down DB
+        // fails fast instead of blocking forever on a buffered query. The timeout
+        // path leaves a connection busy if it fires, which would slowly exhaust
+        // the pool, so it is disabled again for steady-state queries below.
+        client_->setTimeout(kProbeTimeoutSec);
+        client_->execSqlSync("SELECT 1");
+        client_->setTimeout(0.0);
+        LOG_INFO << "PostgreSQL connected";
+        return true;
     } catch (const std::exception &e) {
-        LOG_WARN << "PostgreSQL unavailable: " << e.what();
+        LOG_WARN << "PostgreSQL connection test failed: " << e.what();
         client_ = nullptr;
         return false;
     }
 }
 
+int PostgresService::runMigrations() {
+    if (!client_) throw std::runtime_error("PostgreSQL client is not available");
+    return services::runMigrations(client_);
+}
+
 void PostgresService::initSchema() {
-    if (!client_) return;
-    client_->execSqlSync(
-        "CREATE TABLE IF NOT EXISTS historical_prices ("
-        "id BIGSERIAL PRIMARY KEY,"
-        "pair VARCHAR(64) NOT NULL,"
-        "price DOUBLE PRECISION NOT NULL,"
-        "observed_at TIMESTAMPTZ NOT NULL)");
-    client_->execSqlSync(
-        "CREATE INDEX IF NOT EXISTS ix_hist_pair_time ON historical_prices(pair, observed_at)");
-    client_->execSqlSync(
-        "CREATE TABLE IF NOT EXISTS stream_metrics ("
-        "id BIGSERIAL PRIMARY KEY,"
-        "observed_at TIMESTAMPTZ NOT NULL,"
-        "ws_subscriber_count INT NOT NULL DEFAULT 0,"
-        "queue_subscriber_count INT NOT NULL DEFAULT 0,"
-        "snapshot_failure_count INT NOT NULL DEFAULT 0,"
-        "stream_status VARCHAR(32) NOT NULL DEFAULT 'healthy')");
-    client_->execSqlSync(
-        "CREATE INDEX IF NOT EXISTS ix_metrics_time ON stream_metrics(observed_at)");
-    client_->execSqlSync(
-        "CREATE TABLE IF NOT EXISTS alerts ("
-        "id VARCHAR(64) PRIMARY KEY,"
-        "user_id VARCHAR(128) NOT NULL DEFAULT 'legacy-unassigned',"
-        "pair VARCHAR(64) NOT NULL,"
-        "status VARCHAR(32) NOT NULL DEFAULT 'active',"
-        "alert_type VARCHAR(32) NOT NULL DEFAULT 'price',"
-        "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
-        "data JSONB NOT NULL)");
-    client_->execSqlSync("CREATE INDEX IF NOT EXISTS ix_alerts_user_id ON alerts(user_id)");
-    client_->execSqlSync(
-        "CREATE TABLE IF NOT EXISTS user_states ("
-        "user_id VARCHAR(128) PRIMARY KEY,"
-        "first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
-        "onboarding_completed_at TIMESTAMPTZ)");
-    migrateAlertsSchema(client_);
-    LOG_INFO << "PostgreSQL schema ensured";
+    (void)runMigrations();
 }
 
 int PostgresService::insertSnapshots(const std::vector<std::string> &snapshotJsons) {
@@ -333,16 +293,27 @@ void PostgresService::upsertAlert(const Json::Value &alert) {
     auto epoch = util::parseIso8601(createdAt);
     double epochSec = epoch ? static_cast<double>(*epoch)
                             : static_cast<double>(std::time(nullptr));
+    // The legacy alerts table has NOT NULL columns (channel/email/phone/custom_message)
+    // with no defaults, so they must be supplied on every insert.
+    std::string channel = alert.get("channel", "email").asString();
+    std::string email = alert.get("email", "").asString();
+    std::string phone = alert.get("phone", "").asString();
+    std::string customMessage = alert.get("custom_message", "").asString();
+    if (channel.empty()) channel = "email";
     Json::StreamWriterBuilder wb;
     wb["indentation"] = "";
     std::string data = Json::writeString(wb, alert);
     try {
         client_->execSqlSync(
-            "INSERT INTO alerts(id, user_id, pair, status, alert_type, created_at, data) "
-            "VALUES($1,$2,$3,$4,$5,to_timestamp($6),$7::jsonb) "
+            "INSERT INTO alerts(id, user_id, pair, status, alert_type, created_at, "
+            "channel, email, phone, custom_message, data) "
+            "VALUES($1,$2,$3,$4,$5,to_timestamp($6),$7,$8,$9,$10,$11::jsonb) "
             "ON CONFLICT (id) DO UPDATE SET user_id=EXCLUDED.user_id, pair=EXCLUDED.pair, "
-            "status=EXCLUDED.status, alert_type=EXCLUDED.alert_type, data=EXCLUDED.data",
-            id, userId, pair, status, alertType, epochSec, data);
+            "status=EXCLUDED.status, alert_type=EXCLUDED.alert_type, "
+            "channel=EXCLUDED.channel, email=EXCLUDED.email, phone=EXCLUDED.phone, "
+            "custom_message=EXCLUDED.custom_message, data=EXCLUDED.data",
+            id, userId, pair, status, alertType, epochSec, channel, email, phone,
+            customMessage, data);
     } catch (const std::exception &e) {
         LOG_ERROR << "upsertAlert failed: " << e.what();
     }
@@ -433,6 +404,380 @@ UserStateRow PostgresService::completeUserOnboarding(const std::string &userId) 
         throw;
     }
     return row;
+}
+
+UserRow PostgresService::createUser(const std::string &userId, const std::string &username,
+                                    const std::string &passwordHash) {
+    if (!client_) throw std::runtime_error("Database unavailable");
+    client_->execSqlSync(
+        "INSERT INTO users(user_id, username, password_hash, auth_provider, created_at) "
+        "VALUES($1, $2, $3, 'credentials', NOW())",
+        userId, username, passwordHash);
+    auto opt = findUserByUsername(username);
+    if (!opt) throw std::runtime_error("Failed to create user");
+    return *opt;
+}
+
+std::optional<UserRow> PostgresService::findUserByUsername(const std::string &username) {
+    if (!client_) return std::nullopt;
+    try {
+        auto r = client_->execSqlSync(
+            "SELECT user_id, username, COALESCE(password_hash,'') AS password_hash, "
+            "COALESCE(email,'') AS email, COALESCE(display_name,'') AS display_name, "
+            "COALESCE(avatar_url,'') AS avatar_url, auth_provider, "
+            "EXTRACT(EPOCH FROM created_at)::bigint AS created_at "
+            "FROM users WHERE username=$1",
+            username);
+        if (r.size() == 0) return std::nullopt;
+        const auto &row = r[0];
+        UserRow u;
+        u.userId = row["user_id"].as<std::string>();
+        u.username = row["username"].as<std::string>();
+        u.passwordHash = row["password_hash"].as<std::string>();
+        u.email = row["email"].as<std::string>();
+        u.displayName = row["display_name"].as<std::string>();
+        u.avatarUrl = row["avatar_url"].as<std::string>();
+        u.authProvider = row["auth_provider"].as<std::string>();
+        u.createdAt = static_cast<std::time_t>(row["created_at"].as<long long>());
+        u.disabled = false;
+        return u;
+    } catch (const std::exception &e) {
+        LOG_ERROR << "findUserByUsername failed: " << e.what();
+        return std::nullopt;
+    }
+}
+
+void PostgresService::upsertGoogleUser(const std::string &userId,
+                                       const std::string &googleSub,
+                                       const std::string &email,
+                                       const std::string &displayName,
+                                       const std::string &avatarUrl) {
+    if (!client_) return;
+    std::string uname = "google:" + googleSub;
+    if (uname.size() > 128) uname = uname.substr(0, 128);
+    client_->execSqlSync(
+        "INSERT INTO users(user_id, username, email, display_name, avatar_url, google_sub, "
+        "auth_provider, created_at) "
+        "VALUES($1, $2, $3, $4, $5, $6, 'google', NOW()) "
+        "ON CONFLICT (user_id) DO UPDATE SET "
+        "email=EXCLUDED.email, display_name=EXCLUDED.display_name, "
+        "avatar_url=EXCLUDED.avatar_url, google_sub=EXCLUDED.google_sub, auth_provider='google'",
+        userId, uname, email, displayName, avatarUrl, googleSub);
+}
+
+std::vector<std::string> PostgresService::listFavorites(const std::string &userId) {
+    std::vector<std::string> out;
+    if (!client_) return out;
+    try {
+        auto r = client_->execSqlSync(
+            "SELECT pair FROM user_favorites WHERE user_id=$1 ORDER BY created_at ASC", userId);
+        for (const auto &row : r) out.push_back(row["pair"].as<std::string>());
+    } catch (const std::exception &e) {
+        LOG_ERROR << "listFavorites failed: " << e.what();
+    }
+    return out;
+}
+
+void PostgresService::addFavorite(const std::string &userId, const std::string &pair) {
+    if (!client_) throw std::runtime_error("Database unavailable");
+    client_->execSqlSync(
+        "INSERT INTO user_favorites(user_id, pair, created_at) VALUES($1, $2, NOW()) "
+        "ON CONFLICT (user_id, pair) DO NOTHING",
+        userId, pair);
+}
+
+bool PostgresService::removeFavorite(const std::string &userId, const std::string &pair) {
+    if (!client_) return false;
+    try {
+        auto r = client_->execSqlSync("DELETE FROM user_favorites WHERE user_id=$1 AND pair=$2",
+                                      userId, pair);
+        return r.affectedRows() > 0;
+    } catch (const std::exception &e) {
+        LOG_ERROR << "removeFavorite failed: " << e.what();
+        return false;
+    }
+}
+
+void PostgresService::logActivity(const std::string &userId, const std::string &eventType,
+                                  const std::string &ipAddress,
+                                  const std::string &userAgent,
+                                  const Json::Value &metadata) {
+    if (!client_) return;
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    std::string meta = Json::writeString(wb, metadata.isObject() ? metadata : Json::Value());
+    try {
+        std::string id = util::generateUuid();
+        if (id.empty()) id = std::to_string(std::time(nullptr));
+        client_->execSqlSync(
+            "INSERT INTO user_activity_log(id, user_id, event_type, ip_address, user_agent, "
+            "metadata, created_at) "
+            "VALUES($1, $2, $3, $4, $5, $6::jsonb, NOW())",
+            id, userId, eventType, ipAddress, userAgent, meta);
+    } catch (const std::exception &e) {
+        LOG_DEBUG << "logActivity failed: " << e.what();
+    }
+}
+
+Json::Value PostgresService::adminOverview() {
+    Json::Value v(Json::objectValue);
+    if (!client_) return v;
+
+    auto countQuery = [&](const std::string &sql) -> int64_t {
+        try {
+            auto r = client_->execSqlSync(sql);
+            if (r.size() > 0) return r[0]["n"].as<long long>();
+        } catch (...) {
+        }
+        return 0;
+    };
+
+    v["users_count"] = static_cast<Json::Int64>(countQuery("SELECT COUNT(*)::bigint AS n FROM users"));
+    v["active_alerts"] = static_cast<Json::Int64>(
+        countQuery("SELECT COUNT(*)::bigint AS n FROM alerts WHERE status='active'"));
+    v["triggered_alerts"] = static_cast<Json::Int64>(
+        countQuery("SELECT COUNT(*)::bigint AS n FROM alerts WHERE status='triggered'"));
+    v["favorites_count"] =
+        static_cast<Json::Int64>(countQuery("SELECT COUNT(*)::bigint AS n FROM user_favorites"));
+    v["new_users_7d"] = static_cast<Json::Int64>(countQuery(
+        "SELECT COUNT(*)::bigint AS n FROM users WHERE created_at >= NOW() - INTERVAL '7 days'"));
+    v["recent_activity_7d"] = static_cast<Json::Int64>(countQuery(
+        "SELECT COUNT(*)::bigint AS n FROM user_activity_log WHERE created_at >= NOW() - INTERVAL '7 days'"));
+
+    Json::Value byChannel(Json::objectValue);
+    Json::Value byStatus(Json::objectValue);
+    try {
+        auto r1 = client_->execSqlSync(
+            "SELECT COALESCE(data->>'channel','email') AS ch, COUNT(*)::bigint AS n "
+            "FROM alerts GROUP BY ch");
+        for (const auto &row : r1)
+            byChannel[row["ch"].as<std::string>()] =
+                static_cast<Json::Int64>(row["n"].as<long long>());
+        auto r2 = client_->execSqlSync(
+            "SELECT status AS st, COUNT(*)::bigint AS n FROM alerts GROUP BY status");
+        for (const auto &row : r2)
+            byStatus[row["st"].as<std::string>()] =
+                static_cast<Json::Int64>(row["n"].as<long long>());
+    } catch (...) {
+    }
+    v["alerts_by_channel"] = byChannel;
+    v["alerts_by_status"] = byStatus;
+    return v;
+}
+
+Json::Value PostgresService::adminListUsers() {
+    Json::Value items(Json::arrayValue);
+    if (!client_) return items;
+    try {
+        auto r = client_->execSqlSync(
+            "SELECT u.user_id, COALESCE(u.username,'') AS username, u.email, u.auth_provider, "
+            "to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, "
+            "(SELECT COUNT(*)::int FROM alerts a WHERE a.user_id=u.user_id) AS alert_count "
+            "FROM users u ORDER BY u.created_at DESC LIMIT 500");
+        for (const auto &row : r) {
+            Json::Value u;
+            u["user_id"] = row["user_id"].as<std::string>();
+            u["username"] = row["username"].as<std::string>();
+            if (row["email"].isNull())
+                u["email"] = Json::Value::null;
+            else
+                u["email"] = row["email"].as<std::string>();
+            u["auth_provider"] = row["auth_provider"].as<std::string>();
+            u["created_at"] = row["created_at"].as<std::string>();
+            u["alert_count"] = row["alert_count"].as<int>();
+            items.append(u);
+        }
+    } catch (const std::exception &e) {
+        LOG_ERROR << "adminListUsers failed: " << e.what();
+    }
+    return items;
+}
+
+Json::Value PostgresService::adminListAlerts(const std::string &statusFilter, int limit) {
+    Json::Value items(Json::arrayValue);
+    if (!client_) return items;
+    limit = std::max(1, std::min(limit, 500));
+    try {
+        std::string sql =
+            "SELECT a.id, a.user_id, a.pair, a.status, a.alert_type, "
+            "to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, "
+            "a.data::text AS data, COALESCE(u.username,'') AS username, u.email "
+            "FROM alerts a LEFT JOIN users u ON u.user_id=a.user_id ";
+        if (!statusFilter.empty() && statusFilter != "all") {
+            sql += "WHERE a.status=$1 ";
+            sql += "ORDER BY a.created_at DESC LIMIT " + std::to_string(limit);
+            auto r = client_->execSqlSync(sql, statusFilter);
+            for (const auto &row : r) {
+                Json::Value alert = parseJson(row["data"].as<std::string>());
+                Json::Value item;
+                item["id"] = alert.get("id", row["id"].as<std::string>()).asString();
+                item["user_id"] = row["user_id"].as<std::string>();
+                item["username"] = row["username"].as<std::string>();
+                if (row["email"].isNull())
+                    item["email"] = Json::Value::null;
+                else
+                    item["email"] = row["email"].as<std::string>();
+                item["created_by"] =
+                    row["username"].as<std::string>().empty()
+                        ? row["user_id"].as<std::string>()
+                        : row["username"].as<std::string>();
+                item["pair"] = alert.get("pair", row["pair"].as<std::string>()).asString();
+                item["channel"] = alert.get("channel", "email").asString();
+                item["status"] = alert.get("status", row["status"].as<std::string>()).asString();
+                item["alert_type"] = alert.get("alert_type", "price").asString();
+                item["target_price"] =
+                    alert.isMember("target_price") && alert["target_price"].isNumeric()
+                        ? alert["target_price"]
+                        : Json::Value::null;
+                item["threshold"] =
+                    alert.isMember("threshold") && alert["threshold"].isNumeric()
+                        ? alert["threshold"]
+                        : Json::Value::null;
+                item["condition"] =
+                    alert.isMember("condition") && alert["condition"].isString()
+                        ? alert["condition"]
+                        : Json::Value::null;
+                item["created_at"] = row["created_at"].as<std::string>();
+                if (alert.isMember("triggered_at") && !alert["triggered_at"].isNull())
+                    item["triggered_at"] = alert["triggered_at"];
+                else
+                    item["triggered_at"] = Json::Value::null;
+                items.append(item);
+            }
+        } else {
+            sql += "ORDER BY a.created_at DESC LIMIT " + std::to_string(limit);
+            auto r = client_->execSqlSync(sql);
+            for (const auto &row : r) {
+                Json::Value alert = parseJson(row["data"].as<std::string>());
+                Json::Value item;
+                item["id"] = alert.get("id", row["id"].as<std::string>()).asString();
+                item["user_id"] = row["user_id"].as<std::string>();
+                item["username"] = row["username"].as<std::string>();
+                if (row["email"].isNull())
+                    item["email"] = Json::Value::null;
+                else
+                    item["email"] = row["email"].as<std::string>();
+                item["created_by"] =
+                    row["username"].as<std::string>().empty()
+                        ? row["user_id"].as<std::string>()
+                        : row["username"].as<std::string>();
+                item["pair"] = alert.get("pair", row["pair"].as<std::string>()).asString();
+                item["channel"] = alert.get("channel", "email").asString();
+                item["status"] = alert.get("status", row["status"].as<std::string>()).asString();
+                item["alert_type"] = alert.get("alert_type", "price").asString();
+                item["target_price"] =
+                    alert.isMember("target_price") && alert["target_price"].isNumeric()
+                        ? alert["target_price"]
+                        : Json::Value::null;
+                item["threshold"] =
+                    alert.isMember("threshold") && alert["threshold"].isNumeric()
+                        ? alert["threshold"]
+                        : Json::Value::null;
+                item["condition"] =
+                    alert.isMember("condition") && alert["condition"].isString()
+                        ? alert["condition"]
+                        : Json::Value::null;
+                item["created_at"] = row["created_at"].as<std::string>();
+                if (alert.isMember("triggered_at") && !alert["triggered_at"].isNull())
+                    item["triggered_at"] = alert["triggered_at"];
+                else
+                    item["triggered_at"] = Json::Value::null;
+                items.append(item);
+            }
+        }
+    } catch (const std::exception &e) {
+        LOG_ERROR << "adminListAlerts failed: " << e.what();
+    }
+    return items;
+}
+
+Json::Value PostgresService::adminListActivity(const std::string &eventTypeFilter, int limit) {
+    Json::Value items(Json::arrayValue);
+    if (!client_) return items;
+    limit = std::max(1, std::min(limit, 500));
+    try {
+        if (!eventTypeFilter.empty()) {
+            auto r = client_->execSqlSync(
+                "SELECT al.id::text, al.user_id, al.event_type, al.ip_address, al.user_agent, "
+                "al.metadata::text AS metadata, "
+                "to_char(al.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, "
+                "COALESCE(u.username,'') AS username, u.email "
+                "FROM user_activity_log al LEFT JOIN users u ON u.user_id=al.user_id "
+                "WHERE al.event_type=$1 ORDER BY al.created_at DESC LIMIT " +
+                    std::to_string(limit),
+                eventTypeFilter);
+            for (const auto &row : r) {
+                Json::Value item;
+                item["id"] = row["id"].as<std::string>();
+                if (row["user_id"].isNull())
+                    item["user_id"] = Json::Value::null;
+                else
+                    item["user_id"] = row["user_id"].as<std::string>();
+                item["username"] = row["username"].as<std::string>();
+                if (row["email"].isNull())
+                    item["email"] = Json::Value::null;
+                else
+                    item["email"] = row["email"].as<std::string>();
+                item["created_by"] =
+                    row["username"].as<std::string>().empty()
+                        ? (row["user_id"].isNull() ? "" : row["user_id"].as<std::string>())
+                        : row["username"].as<std::string>();
+                item["event_type"] = row["event_type"].as<std::string>();
+                if (row["ip_address"].isNull())
+                    item["ip_address"] = Json::Value::null;
+                else
+                    item["ip_address"] = row["ip_address"].as<std::string>();
+                if (row["user_agent"].isNull())
+                    item["user_agent"] = Json::Value::null;
+                else
+                    item["user_agent"] = row["user_agent"].as<std::string>();
+                item["metadata"] = parseJson(row["metadata"].as<std::string>());
+                item["created_at"] = row["created_at"].as<std::string>();
+                items.append(item);
+            }
+        } else {
+            auto r = client_->execSqlSync(
+                "SELECT al.id::text, al.user_id, al.event_type, al.ip_address, al.user_agent, "
+                "al.metadata::text AS metadata, "
+                "to_char(al.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, "
+                "COALESCE(u.username,'') AS username, u.email "
+                "FROM user_activity_log al LEFT JOIN users u ON u.user_id=al.user_id "
+                "ORDER BY al.created_at DESC LIMIT " +
+                std::to_string(limit));
+            for (const auto &row : r) {
+                Json::Value item;
+                item["id"] = row["id"].as<std::string>();
+                if (row["user_id"].isNull())
+                    item["user_id"] = Json::Value::null;
+                else
+                    item["user_id"] = row["user_id"].as<std::string>();
+                item["username"] = row["username"].as<std::string>();
+                if (row["email"].isNull())
+                    item["email"] = Json::Value::null;
+                else
+                    item["email"] = row["email"].as<std::string>();
+                item["created_by"] =
+                    row["username"].as<std::string>().empty()
+                        ? (row["user_id"].isNull() ? "" : row["user_id"].as<std::string>())
+                        : row["username"].as<std::string>();
+                item["event_type"] = row["event_type"].as<std::string>();
+                if (row["ip_address"].isNull())
+                    item["ip_address"] = Json::Value::null;
+                else
+                    item["ip_address"] = row["ip_address"].as<std::string>();
+                if (row["user_agent"].isNull())
+                    item["user_agent"] = Json::Value::null;
+                else
+                    item["user_agent"] = row["user_agent"].as<std::string>();
+                item["metadata"] = parseJson(row["metadata"].as<std::string>());
+                item["created_at"] = row["created_at"].as<std::string>();
+                items.append(item);
+            }
+        }
+    } catch (const std::exception &e) {
+        LOG_ERROR << "adminListActivity failed: " << e.what();
+    }
+    return items;
 }
 
 }  // namespace ctraderplus::services

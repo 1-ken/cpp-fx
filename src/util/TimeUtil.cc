@@ -82,4 +82,25 @@ int intervalToTrendbarPeriod(const std::string &interval) {
     return 0;
 }
 
+std::string trendbarPeriodToInterval(int period) {
+    switch (period) {
+        case 1:
+            return "1m";
+        case 5:
+            return "5m";
+        case 7:
+            return "15m";
+        case 8:
+            return "30m";
+        case 9:
+            return "1h";
+        case 10:
+            return "4h";
+        case 12:
+            return "1d";
+        default:
+            return "";
+    }
+}
+
 }  // namespace ctraderplus::util

@@ -1,5 +1,11 @@
 #include "controllers/Routes.h"
 
+#include "controllers/ActivityLog.h"
+#include "controllers/AdminRoutes.h"
+#include "controllers/AuthRoutes.h"
+#include "controllers/Cors.h"
+#include "controllers/FavoritesRoutes.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -16,9 +22,11 @@
 #include "alerts/AlertManager.h"
 #include "controllers/Dashboard.h"
 #include "controllers/OpenApiDoc.h"
+#include "core/ApiLog.h"
 #include "core/AppContext.h"
 #include "core/Auth.h"
 #include "core/Config.h"
+#include "core/DbReady.h"
 #include "ctrader/CTraderClient.h"
 #include "ctrader/SymbolRegistry.h"
 #include "market/MarketHub.h"
@@ -203,6 +211,11 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
     auto &app = AppContext::instance();
     std::string uid;
     if (!authOrReject(req, cb, uid)) return;
+    if (!core::isDbReadyForAuth()) {
+        core::logApiOutcome("user", "me", false, 503, "database_not_ready", uid);
+        cb(errResp("detail", "Database not ready", 503));
+        return;
+    }
 
     auto buildBootstrap = [&app, uid](bool firstTime,
                                       std::optional<std::time_t> completedAt) {
@@ -222,16 +235,20 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
         cb(jsonResp(buildBootstrap(true, std::nullopt)));
         return;
     }
-    auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
-    app.dbExec([&app, uid, buildBootstrap, callback]() {
-        try {
-            auto st = app.postgres->getOrCreateUserState(uid);
-            bool firstTime = !st.onboardingCompletedAt.has_value();
-            (*callback)(jsonResp(buildBootstrap(firstTime, st.onboardingCompletedAt)));
-        } catch (const std::exception &) {
-            (*callback)(jsonResp(buildBootstrap(true, std::nullopt)));
-        }
-    });
+    if (!core::withPostgres([&](services::PostgresService &pg) {
+            try {
+                auto st = pg.getOrCreateUserState(uid);
+                bool firstTime = !st.onboardingCompletedAt.has_value();
+                core::logApiOutcome("user", "me", true, 200,
+                                    firstTime ? "first_time" : "returning", uid);
+                cb(jsonResp(buildBootstrap(firstTime, st.onboardingCompletedAt)));
+            } catch (const std::exception &e) {
+                core::logApiOutcome("user", "me", false, 500, e.what(), uid);
+                cb(jsonResp(buildBootstrap(true, std::nullopt)));
+            }
+        })) {
+        cb(errResp("detail", "Database not ready", 503));
+    }
 }
 
 void onboardingComplete(const HttpRequestPtr &req,
@@ -239,28 +256,33 @@ void onboardingComplete(const HttpRequestPtr &req,
     auto &app = AppContext::instance();
     std::string uid;
     if (!authOrReject(req, cb, uid)) return;
-    if (!app.postgres || !app.postgres->available()) {
-        cb(errResp("detail", "Database unavailable", 503));
+    if (!core::isDbReadyForAuth()) {
+        core::logApiOutcome("user", "onboarding_complete", false, 503, "database_not_ready",
+                            uid);
+        cb(errResp("detail", "Database not ready", 503));
         return;
     }
-    auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
-    app.dbExec([&app, uid, callback]() {
-        try {
-            auto st = app.postgres->completeUserOnboarding(uid);
-            if (!st.onboardingCompletedAt) {
-                (*callback)(errResp("detail", "Database unavailable", 503));
-                return;
+    if (!core::withPostgres([&](services::PostgresService &pg) {
+            try {
+                auto st = pg.completeUserOnboarding(uid);
+                if (!st.onboardingCompletedAt) {
+                    cb(errResp("detail", "Database unavailable", 503));
+                    return;
+                }
+                Json::Value v;
+                v["success"] = true;
+                v["userId"] = st.userId;
+                v["onboardingCompletedAt"] = util::toIso8601(*st.onboardingCompletedAt);
+                v["isFirstTimeUser"] = false;
+                core::logApiOutcome("user", "onboarding_complete", true, 200, "ok", uid);
+                cb(jsonResp(v));
+            } catch (const std::exception &e) {
+                core::logApiOutcome("user", "onboarding_complete", false, 503, e.what(), uid);
+                cb(errResp("detail", "Database unavailable", 503));
             }
-            Json::Value v;
-            v["success"] = true;
-            v["userId"] = st.userId;
-            v["onboardingCompletedAt"] = util::toIso8601(*st.onboardingCompletedAt);
-            v["isFirstTimeUser"] = false;
-            (*callback)(jsonResp(v));
-        } catch (const std::exception &) {
-            (*callback)(errResp("detail", "Database unavailable", 503));
-        }
-    });
+        })) {
+        cb(errResp("detail", "Database not ready", 503));
+    }
 }
 
 void historical(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> &&cb) {
@@ -524,6 +546,11 @@ void createAlert(const HttpRequestPtr &req,
         try {
             auto a = app.alerts->createCandleAlert(pair, interval, direction, threshold,
                                                    uid, email, channel, phone, customMessage);
+            Json::Value meta;
+            meta["pair"] = pair;
+            meta["alert_id"] = a.id;
+            meta["type"] = "candle_close";
+            logActivityAsync(uid, "alert_create", clientIp(req), clientUserAgent(req), meta);
             Json::Value v;
             v["success"] = true;
             v["alert"] = a.toJson();
@@ -558,6 +585,11 @@ void createAlert(const HttpRequestPtr &req,
     }
     auto a = app.alerts->createPriceAlert(pair, target, condition, uid, email, channel,
                                           phone, customMessage);
+    Json::Value meta;
+    meta["pair"] = pair;
+    meta["alert_id"] = a.id;
+    meta["type"] = "price";
+    logActivityAsync(uid, "alert_create", clientIp(req), clientUserAgent(req), meta);
     Json::Value v;
     v["success"] = true;
     v["alert"] = a.toJson();
@@ -603,6 +635,9 @@ void deleteAlert(const HttpRequestPtr &req, std::function<void(const HttpRespons
     std::string uid;
     if (!authOrReject(req, cb, uid)) return;
     if (app.alerts->deleteAlert(alertId, uid)) {
+        Json::Value meta;
+        meta["alert_id"] = alertId;
+        logActivityAsync(uid, "alert_delete", clientIp(req), clientUserAgent(req), meta);
         Json::Value v;
         v["success"] = true;
         v["message"] = "Alert deleted";
@@ -640,6 +675,10 @@ void updateAlert(const HttpRequestPtr &req, std::function<void(const HttpRespons
             cb(errResp("detail", "Alert not found", 404));
             return;
         }
+        Json::Value meta;
+        meta["alert_id"] = alertId;
+        meta["pair"] = updated->pair;
+        logActivityAsync(uid, "alert_update", clientIp(req), clientUserAgent(req), meta);
         Json::Value v;
         v["success"] = true;
         v["alert"] = updated->toJson();
@@ -691,6 +730,11 @@ void registerRoutes() {
     fw.registerHandler("/api/v1/alerts/{1}", &getAlert, {Get});
     fw.registerHandler("/api/v1/alerts/{1}", &deleteAlert, {Delete});
     fw.registerHandler("/api/v1/alerts/{1}", &updateAlert, {Put});
+
+    registerCors();
+    registerAuthRoutes();
+    registerFavoritesRoutes();
+    registerAdminRoutes();
 }
 
 }  // namespace ctraderplus::controllers

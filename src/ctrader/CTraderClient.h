@@ -55,6 +55,7 @@ class CTraderClient {
 
     // Subscribe / unsubscribe to a live trend bar series for a symbol.
     void subscribeLiveTrendbar(int64_t symbolId, int period);
+    void unsubscribeLiveTrendbar(int64_t symbolId, int period);
 
   private:
     enum class State { Disconnected, Connecting, AppAuth, AccountAuth, LoadingSymbols, Ready };

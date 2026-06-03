@@ -185,6 +185,52 @@ void RedisService::readJsonQueue(const std::string &key, int batch,
         onErr, "LPOP %s %d", key.c_str(), batch);
 }
 
+void RedisService::setStringEx(const std::string &key, const std::string &value,
+                               int ttlSeconds, std::function<void(bool)> cb) {
+    if (!client_) {
+        cb(false);
+        return;
+    }
+    client_->execCommandAsync(
+        [cb](const drogon::nosql::RedisResult &) { cb(true); },
+        [cb](const std::exception &e) {
+            LOG_DEBUG << "Redis setStringEx error: " << e.what();
+            cb(false);
+        },
+        "SET %s %s EX %d", key.c_str(), value.c_str(), ttlSeconds);
+}
+
+void RedisService::getString(const std::string &key,
+                             std::function<void(std::optional<std::string>)> cb) {
+    if (!client_) {
+        cb(std::nullopt);
+        return;
+    }
+    client_->execCommandAsync(
+        [cb](const drogon::nosql::RedisResult &r) {
+            if (r.type() == drogon::nosql::RedisResultType::kString) {
+                cb(r.asString());
+            } else {
+                cb(std::nullopt);
+            }
+        },
+        [cb](const std::exception &e) {
+            LOG_DEBUG << "Redis getString error: " << e.what();
+            cb(std::nullopt);
+        },
+        "GET %s", key.c_str());
+}
+
+void RedisService::deleteKey(const std::string &key, std::function<void()> cb) {
+    if (!client_) {
+        cb();
+        return;
+    }
+    client_->execCommandAsync(
+        [cb](const drogon::nosql::RedisResult &) { cb(); },
+        [cb](const std::exception &) { cb(); }, "DEL %s", key.c_str());
+}
+
 void RedisService::requeueJsonBatch(const std::string &key,
                                     const std::vector<std::string> &items) {
     if (!client_ || items.empty()) return;

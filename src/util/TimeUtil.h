@@ -24,4 +24,7 @@ int intervalToSeconds(const std::string &interval);
 // Interval string -> cTrader ProtoOATrendbarPeriod enum value (0 if invalid).
 int intervalToTrendbarPeriod(const std::string &interval);
 
+// ProtoOATrendbarPeriod enum value -> interval string (empty if unknown).
+std::string trendbarPeriodToInterval(int period);
+
 }  // namespace ctraderplus::util

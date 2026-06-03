@@ -194,6 +194,19 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
     c.nextAuthSecret = envStr("NEXTAUTH_SECRET");
     c.authDisabled = envBool("AUTH_DISABLED", false);
 
+    // ---- Admin / CORS ----
+    c.adminPhone = envStr("ADMIN_PHONE");
+    {
+        std::string ttl = envStr("OTP_TTL_SECONDS");
+        if (!ttl.empty()) {
+            try {
+                c.otpTtlSeconds = std::stoi(ttl);
+            } catch (...) {
+            }
+        }
+    }
+    c.corsAllowOrigin = envStr("CORS_ALLOW_ORIGIN", c.corsAllowOrigin);
+
     // ---- Notifications ----
     c.sendgridApiKey = envStr("SENDGRID_API_KEY");
     c.sendgridFromEmail = envStr("SENDGRID_FROM_EMAIL", c.sendgridFromEmail);

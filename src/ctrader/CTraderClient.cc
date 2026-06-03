@@ -75,7 +75,7 @@ void CTraderClient::connect() {
 
     trantor::InetAddress addr(ip, static_cast<uint16_t>(cfg_.port));
     client_ = std::make_shared<trantor::TcpClient>(loop_, addr, "ctrader");
-    client_->enableSSL(false, true, cfg_.resolvedHost());
+    client_->enableSSL(trantor::TLSPolicy::defaultClientPolicy(cfg_.resolvedHost()));
     client_->setConnectionCallback(
         [this](const trantor::TcpConnectionPtr &c) { onConnection(c); });
     client_->setMessageCallback(
@@ -290,6 +290,18 @@ void CTraderClient::subscribeLiveTrendbar(int64_t symbolId, int period) {
     loop_->queueInLoop([this, symbolId, period]() {
         if (!ready_.load()) return;
         ProtoOASubscribeLiveTrendbarReq req;
+        req.set_ctidtraderaccountid(cfg_.accountId);
+        req.set_period(static_cast<ProtoOATrendbarPeriod>(period));
+        req.set_symbolid(symbolId);
+        sendFramed(frame(req));
+    });
+}
+
+void CTraderClient::unsubscribeLiveTrendbar(int64_t symbolId, int period) {
+    if (!loop_) return;
+    loop_->queueInLoop([this, symbolId, period]() {
+        if (!ready_.load()) return;
+        ProtoOAUnsubscribeLiveTrendbarReq req;
         req.set_ctidtraderaccountid(cfg_.accountId);
         req.set_period(static_cast<ProtoOATrendbarPeriod>(period));
         req.set_symbolid(symbolId);

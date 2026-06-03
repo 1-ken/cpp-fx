@@ -78,6 +78,11 @@ struct Config {
     std::string nextAuthSecret;
     bool authDisabled = false;
 
+    // Admin / CORS
+    std::string adminPhone;
+    int otpTtlSeconds = 300;
+    std::string corsAllowOrigin = "http://localhost:3000";
+
     // Notification providers
     std::string sendgridApiKey;
     std::string sendgridFromEmail = "alerts@example.com";

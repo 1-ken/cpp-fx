@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,13 @@ class RedisService {
     void readJsonQueue(const std::string &key, int batch,
                        std::function<void(std::vector<std::string>)> cb);
     void requeueJsonBatch(const std::string &key, const std::vector<std::string> &items);
+
+    // OTP / short-lived string keys
+    void setStringEx(const std::string &key, const std::string &value, int ttlSeconds,
+                     std::function<void(bool)> cb);
+    void getString(const std::string &key,
+                   std::function<void(std::optional<std::string>)> cb);
+    void deleteKey(const std::string &key, std::function<void()> cb);
 
   private:
     const core::Config &cfg_;

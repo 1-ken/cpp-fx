@@ -1,7 +1,8 @@
 #include <algorithm>
+#include <chrono>
 #include <ctime>
+#include <future>
 #include <memory>
-#include <set>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -11,6 +12,7 @@
 #include <trantor/utils/Logger.h>
 
 #include "alerts/AlertManager.h"
+#include "alerts/CandleAlertMonitor.h"
 #include "controllers/Routes.h"
 #include "controllers/WsObserveController.h"
 #include "core/AppContext.h"
@@ -79,6 +81,7 @@ int main() {
     static ctrader::CTraderClient ctrader(cfg.ctrader);
     static market::MarketHub hub(cfg, registry);
     static alerts::AlertManager alertManager;
+    static alerts::CandleAlertMonitor candleMonitor;
     static services::Notifier notifier(cfg);
     static services::PostgresService postgres(cfg);
     static services::RedisService redis(cfg);
@@ -93,7 +96,9 @@ int main() {
 
     // ---- Connect Redis + Postgres (best effort) --------------------------
     bool redisOk = redis.connect();
+    if (!redisOk) LOG_WARN << "Redis unavailable; cache and pub/sub disabled";
     bool pgOk = postgres.connect();
+    if (!pgOk) LOG_WARN << "PostgreSQL unavailable; fix DATABASE_URL in .env";
 
     services::RedisService *redisPtr = redisOk ? &redis : nullptr;
     services::PostgresService *pgPtr = pgOk ? &postgres : nullptr;
@@ -116,10 +121,20 @@ int main() {
     });
 
     // ---- Wire cTrader callbacks -----------------------------------------
+    candleMonitor.configure(
+        &cfg, &ctrader, &registry, &alertManager,
+        [&](const alerts::TriggeredAlert &t) {
+            dispatchNotification(notifier, redisPtr, dlqKey, t);
+        });
+
     ctrader.setSymbolsCallback([](std::vector<ctrader::SymbolInfo> symbols) {
         registry.update(symbols);
     });
-    ctrader.setSpotCallback([](const ctrader::SpotUpdate &u) { hub.onSpot(u); });
+    ctrader.setStateCallback([&](bool ready) { candleMonitor.onConnectionReady(ready); });
+    ctrader.setSpotCallback([&](const ctrader::SpotUpdate &u) {
+        hub.onSpot(u);
+        candleMonitor.onSpot(u);
+    });
 
     // ---- Populate AppContext --------------------------------------------
     auto &app = core::AppContext::instance();
@@ -133,6 +148,40 @@ int main() {
     app.notifier = &notifier;
     app.dbExec = dbExec;
     app.startTime = std::chrono::steady_clock::now();
+
+    // ---- Database migrations (blocking, before HTTP) ---------------------
+    if (pgPtr) {
+        LOG_INFO << "Running database migrations...";
+        std::promise<int> migrationPromise;
+        auto migrationFuture = migrationPromise.get_future();
+        workerLoop->queueInLoop([&]() {
+            try {
+                int version = postgres.runMigrations();
+                migrationPromise.set_value(version);
+            } catch (...) {
+                try {
+                    migrationPromise.set_exception(std::current_exception());
+                } catch (...) {
+                }
+            }
+        });
+        try {
+            if (migrationFuture.wait_for(std::chrono::seconds(30)) !=
+                std::future_status::ready) {
+                LOG_ERROR << "Database migrations timed out after 30s";
+                return 1;
+            }
+            int version = migrationFuture.get();
+            app.dbMigrationsReady.store(true);
+            LOG_INFO << "Database migrations complete (version=" << version << ")";
+            workerLoop->queueInLoop([&]() { alertManager.loadAlerts(); });
+        } catch (const std::exception &e) {
+            LOG_ERROR << "Database migrations failed: " << e.what();
+            return 1;
+        }
+    } else {
+        LOG_WARN << "PostgreSQL unavailable; auth and user features disabled";
+    }
 
     // ---- HTTP routes -----------------------------------------------------
     controllers::registerRoutes();
@@ -169,8 +218,9 @@ int main() {
 
     // Alert persistence flush: Redis event queue -> PostgreSQL.
     if (redisPtr && pgPtr) {
+        constexpr int kAlertFlushBatchSize = 15;
         workerLoop->runEvery(0.25, [&]() {
-            redis.readJsonQueue(cfg.redisAlertQueueKey, 100,
+            redis.readJsonQueue(cfg.redisAlertQueueKey, kAlertFlushBatchSize,
                                 [&](std::vector<std::string> batch) {
                                     if (batch.empty()) return;
                                     workerLoop->queueInLoop([&, batch]() {
@@ -194,66 +244,14 @@ int main() {
         });
     }
 
-    // Candle-close alert monitor: poll cTrader trendbars for active candle alerts.
+    // Candle-close: live trendbar push (onSpot) + subscription sync + poll fallback.
     {
-        double interval = std::max(2.0, cfg.candleCheckIntervalSeconds * 4.0);
-        workerLoop->runEvery(interval, [&]() {
-            if (!ctrader.isReady() || !util::isForexMarketOpen()) return;
-            auto active = alertManager.getActiveAlerts();
-            std::set<std::pair<int64_t, int>> seen;
-            for (const auto &a : active) {
-                if (a.alertType != "candle_close" || !a.interval) continue;
-                auto symId = registry.idForCanonical(a.pair);
-                if (!symId) continue;
-                int period = util::intervalToTrendbarPeriod(*a.interval);
-                int ivSec = util::intervalToSeconds(*a.interval);
-                if (period == 0 || ivSec == 0) continue;
-                auto key = std::make_pair(*symId, period);
-                if (seen.count(key)) continue;
-                seen.insert(key);
-                std::string canon = a.pair;
-                std::string ivStr = *a.interval;
-                int64_t nowMs = static_cast<int64_t>(std::time(nullptr)) * 1000;
-                ctrader.getTrendbars(
-                    *symId, period, 0, nowMs, 3,
-                    [&, canon, ivStr, ivSec](ctrader::TrendbarsResult res) {
-                        if (!res.ok || res.bars.empty()) return;
-                        std::time_t now = std::time(nullptr);
-                        const ctrader::TrendbarData *closed = nullptr;
-                        for (auto it = res.bars.rbegin(); it != res.bars.rend(); ++it) {
-                            std::time_t end = it->utcTimestampMinutes * 60 + ivSec;
-                            if (end <= now) {
-                                closed = &(*it);
-                                break;
-                            }
-                        }
-                        if (!closed) return;
-                        Json::Value candle;
-                        candle["pair"] = canon;
-                        candle["interval"] = ivStr;
-                        candle["timestamp"] =
-                            util::toIso8601(closed->utcTimestampMinutes * 60);
-                        candle["close"] = closed->close;
-                        std::vector<Json::Value> candles{candle};
-                        auto triggered = alertManager.checkCandleAlerts(candles);
-                        for (const auto &t : triggered)
-                            dispatchNotification(notifier, redisPtr, cfg.notificationDlqKey,
-                                                 t);
-                    });
-            }
-        });
-    }
-
-    // Schema init runs on the worker loop (execSqlSync needs a running event
-    // loop, but must not block Drogon's HTTP loop).
-    if (pgPtr) {
-        workerLoop->queueInLoop([&]() {
-            try {
-                postgres.initSchema();
-                alertManager.loadAlerts();
-            } catch (const std::exception &e) {
-                LOG_WARN << "Postgres schema init failed: " << e.what();
-            }
+        double pollInterval =
+            std::max(0.05, cfg.candleCheckIntervalSeconds);
+        workerLoop->runEvery(pollInterval, [&]() { candleMonitor.pollFallback(); });
+        workerLoop->runEvery(5.0, [&]() {
+            if (ctrader.isReady() && util::isForexMarketOpen())
+                candleMonitor.syncSubscriptions();
         });
     }
 

@@ -45,6 +45,8 @@ static void testIntervals() {
     CHECK(util::intervalToTrendbarPeriod("15m") == 7);
     CHECK(util::intervalToTrendbarPeriod("1h") == 9);
     CHECK(util::intervalToTrendbarPeriod("1d") == 12);
+    CHECK(util::trendbarPeriodToInterval(7) == "15m");
+    CHECK(util::trendbarPeriodToInterval(99).empty());
 }
 
 static void testMarketHours() {
