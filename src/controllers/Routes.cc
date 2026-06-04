@@ -81,6 +81,16 @@ bool requiresCustomMessage(const std::string &channel, const std::string &custom
     return (channel == "sms" || channel == "call") && trimStr(customMessage).empty();
 }
 
+bool channelValid(const std::string &c) {
+    return c == "email" || c == "sms" || c == "call" || c == "sound";
+}
+
+bool channelRequiresEmail(const std::string &channel) { return channel == "email"; }
+
+bool channelRequiresPhone(const std::string &channel) {
+    return channel == "sms" || channel == "call";
+}
+
 std::optional<std::time_t> parseQueryTime(const std::string &s) {
     if (s.empty()) return std::nullopt;
     return util::parseIso8601(s);
@@ -379,9 +389,20 @@ void historicalOhlc(const HttpRequestPtr &req,
                              ? 1000 : std::atoi(req->getParameter("limit").c_str()), 1, 5000);
     auto startOpt = parseQueryTime(req->getParameter("start"));
     auto endOpt = parseQueryTime(req->getParameter("end"));
-    int64_t fromMs = startOpt ? static_cast<int64_t>(*startOpt) * 1000 : 0;
     int64_t toMs = endOpt ? static_cast<int64_t>(*endOpt) * 1000
                           : static_cast<int64_t>(std::time(nullptr)) * 1000;
+    int64_t fromMs = 0;
+    if (startOpt) {
+        fromMs = static_cast<int64_t>(*startOpt) * 1000;
+    } else {
+        int64_t toSec = toMs / 1000;
+        int64_t lookbackSec = static_cast<int64_t>(limit) * static_cast<int64_t>(ivSec);
+        int64_t fromSec = toSec - lookbackSec;
+        if (fromSec < 0) {
+            fromSec = 0;
+        }
+        fromMs = fromSec * 1000;
+    }
 
     auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
     std::string pairOut = pair;
@@ -409,33 +430,73 @@ void historicalOhlc(const HttpRequestPtr &req,
                 return;
             }
 
-            int closedCount = (int)candles.size();
+            std::time_t now = std::time(nullptr);
+            long long bucket = (static_cast<long long>(now) / ivSec) * ivSec;
+
+            Json::Value closedOnly(Json::arrayValue);
+            const ctrader::TrendbarData *lastBar = nullptr;
+            const long long bucketMinute = bucket / 60;
+            for (const auto &b : res.bars) {
+                if (b.utcTimestampMinutes >= bucketMinute) {
+                    lastBar = &b;
+                    continue;
+                }
+                closedOnly.append(closedCandleJson(b, ivSec, false));
+            }
+            // Safeguard: if bucket filter removed every bar, keep history as closed
+            // and use only the final trendbar to seed the forming candle.
+            if (closedOnly.empty() && !res.bars.empty()) {
+                for (size_t i = 0; i + 1 < res.bars.size(); ++i) {
+                    closedOnly.append(closedCandleJson(res.bars[i], ivSec, false));
+                }
+                lastBar = &res.bars.back();
+            }
+            int closedCount = static_cast<int>(closedOnly.size());
+
             bool hasForming = false;
-            double price = 0;
-            if (app.hub && app.hub->latestPrice(canon, price)) {
-                std::time_t now = std::time(nullptr);
-                long long bucket = (static_cast<long long>(now) / ivSec) * ivSec;
+            Json::Value formingCandle(Json::nullValue);
+            double livePrice = 0;
+            if (app.hub && app.hub->latestPrice(canon, livePrice)) {
                 std::time_t bucketEnd = static_cast<std::time_t>(bucket + ivSec);
                 double timeIn = static_cast<double>(now - bucket);
+                double open = livePrice;
+                double high = livePrice;
+                double low = livePrice;
+                double close = livePrice;
+                if (lastBar) {
+                    open = lastBar->open;
+                    high = std::max({lastBar->high, livePrice});
+                    low = std::min({lastBar->low, livePrice});
+                    close = livePrice;
+                } else if (!res.bars.empty()) {
+                    const auto &prev = res.bars.back();
+                    open = prev.close;
+                    high = std::max({prev.high, livePrice});
+                    low = std::min({prev.low, livePrice});
+                    close = livePrice;
+                }
+                std::time_t formingTs = static_cast<std::time_t>(bucketMinute * 60);
                 Json::Value fc;
-                fc["timestamp"] = util::toIso8601(static_cast<std::time_t>(bucket));
-                fc["open"] = price;
-                fc["high"] = price;
-                fc["low"] = price;
-                fc["close"] = price;
+                fc["timestamp"] = util::toIso8601(formingTs);
+                fc["open"] = open;
+                fc["high"] = high;
+                fc["low"] = low;
+                fc["close"] = close;
                 fc["volume"] = 1;
                 fc["is_forming"] = true;
-                fc["expected_open"] = util::toIso8601(static_cast<std::time_t>(bucket));
+                fc["expected_open"] = util::toIso8601(formingTs);
                 fc["expected_close"] = util::toIso8601(bucketEnd);
-                fc["progress_percent"] = (timeIn / ivSec) * 100.0;
+                fc["progress_percent"] = (timeIn / static_cast<double>(ivSec)) * 100.0;
                 fc["time_remaining_seconds"] = static_cast<double>(ivSec) - timeIn;
-                candles.append(fc);
+                formingCandle = fc;
                 hasForming = true;
             }
             out["closed_candles_count"] = closedCount;
+            out["count"] = closedCount;
             out["has_forming_candle"] = hasForming;
+            out["forming_candle"] = formingCandle;
             out["last_update"] = app.hub ? app.hub->lastSnapshotTs() : util::nowIso8601();
-            out["candles"] = candles;
+            out["candles"] = closedOnly;
             (*callback)(jsonResp(out));
         });
 }
@@ -481,23 +542,20 @@ void createAlert(const HttpRequestPtr &req,
     bool isCandle = b.isMember("interval") && b["interval"].isString() &&
                     !b["interval"].asString().empty();
 
-    auto channelValid = [](const std::string &c) {
-        return c == "email" || c == "sms" || c == "call";
-    };
-
     if (isCandle) {
         std::string interval = b["interval"].asString();
         std::string direction = b.get("direction", "").asString();
         double threshold = b.get("threshold", 0.0).asDouble();
         if (!channelValid(channel)) {
-            cb(errResp("detail", "Channel must be 'email', 'sms', or 'call'", 400));
+            cb(errResp("detail",
+                       "Channel must be 'email', 'sms', 'call', or 'sound'", 400));
             return;
         }
-        if (channel == "email" && email.empty()) {
+        if (channelRequiresEmail(channel) && email.empty()) {
             cb(errResp("detail", "Email is required for email alerts", 400));
             return;
         }
-        if ((channel == "sms" || channel == "call") && phone.empty()) {
+        if (channelRequiresPhone(channel) && phone.empty()) {
             cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
             return;
         }
@@ -534,14 +592,15 @@ void createAlert(const HttpRequestPtr &req,
         return;
     }
     if (!channelValid(channel)) {
-        cb(errResp("detail", "Channel must be 'email', 'sms', or 'call'", 400));
+        cb(errResp("detail",
+                   "Channel must be 'email', 'sms', 'call', or 'sound'", 400));
         return;
     }
-    if (channel == "email" && email.empty()) {
+    if (channelRequiresEmail(channel) && email.empty()) {
         cb(errResp("detail", "Email is required for email alerts", 400));
         return;
     }
-    if ((channel == "sms" || channel == "call") && phone.empty()) {
+    if (channelRequiresPhone(channel) && phone.empty()) {
         cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
         return;
     }

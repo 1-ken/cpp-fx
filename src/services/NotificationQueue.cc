@@ -19,6 +19,10 @@ void dispatchOne(Notifier &notifier, RedisService *redis, const std::string &dlq
     std::string cond = a.alertType == "candle_close" ? a.direction.value_or("")
                                                      : a.condition.value_or("");
 
+    if (a.channel == "sound") {
+        onDone(true);
+        return;
+    }
     if (a.channel == "sms") {
         std::string text = !a.customMessage.empty()
                                ? a.customMessage

@@ -16,7 +16,7 @@ struct Alert {
     std::string status = "active";  // active, triggered, disabled
     std::string createdAt;
     std::string alertType = "price";  // price | candle_close
-    std::string channel = "email";    // email | sms | call
+    std::string channel = "email";    // email | sms | call | sound (in-app)
     std::string email;
     std::string phone;
     std::string customMessage;
