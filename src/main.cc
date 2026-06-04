@@ -69,6 +69,7 @@ int main() {
     notificationQueue.startDlqRetryLoop();
 
     auto refreshSubscriptions = [&]() {
+        if (cfg.ctrader.subscribeAllSymbols) return;
         if (!ctrader.isReady()) return;
         auto ids = subscriptionPlanner.computeSymbolIds();
         ctrader.refreshSpotSubscriptions(std::move(ids));
@@ -81,15 +82,15 @@ int main() {
         controllers::WsObserveController::broadcastToAll(std::move(grouped));
     });
     hub.setAlertSink([&](std::shared_ptr<std::vector<market::FlatPair>> pairs) {
-        auto triggered = alertManager.checkPriceAlerts(*pairs);
-        for (const auto &t : triggered) notificationQueue.enqueue(t);
+        alertManager.checkPriceAlerts(*pairs);
     });
 
-    candleMonitor.configure(
-        &cfg, &ctrader, &registry, &alertManager,
-        [&](const alerts::TriggeredAlert &t) { notificationQueue.enqueue(t); });
+    candleMonitor.configure(&cfg, &ctrader, &registry, &alertManager, {});
 
     alertManager.setSubscriptionChangeCallback(refreshSubscriptions);
+    alertManager.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
+        notificationQueue.enqueue(t);
+    });
 
     ctrader.setSymbolsCallback([&](std::vector<ctrader::SymbolInfo> symbols) {
         registry.update(symbols);

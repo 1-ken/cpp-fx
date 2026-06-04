@@ -6,41 +6,72 @@
 
 #include "services/Notifier.h"
 #include "services/RedisService.h"
+#include "util/TimeUtil.h"
 
 namespace ctraderplus::services {
 
 namespace {
 
-void dispatchOne(Notifier &notifier, RedisService *redis, const std::string &dlqKey,
-                 const alerts::TriggeredAlert &t, std::function<void(bool)> onDone) {
+void dispatchOne(Notifier &notifier, const alerts::TriggeredAlert &t,
+                 std::function<void(bool)> onDone) {
     const alerts::Alert &a = t.alert;
     double target = a.alertType == "candle_close" ? a.threshold.value_or(0)
                                                   : a.targetPrice.value_or(0);
     std::string cond = a.alertType == "candle_close" ? a.direction.value_or("")
                                                      : a.condition.value_or("");
+    std::string triggeredAt =
+        a.triggeredAt.value_or(util::nowIso8601());
 
     if (a.channel == "sound") {
+        LOG_INFO << "[alerts] in-app sound alert triggered pair=" << a.pair << " id=" << a.id;
         onDone(true);
         return;
     }
+
+    LOG_INFO << "[alerts] dispatch notification channel=" << a.channel << " pair=" << a.pair
+             << " id=" << a.id;
+
+    std::string smsBody = Notifier::formatAlertSms(
+        a.pair, target, t.currentPrice, cond, a.customMessage, a.alertType, t.timeframe,
+        triggeredAt);
+    std::string emailBody = Notifier::formatAlertEmailBody(
+        a.pair, target, t.currentPrice, cond, a.customMessage, a.alertType, t.timeframe,
+        triggeredAt);
+    std::string subject = Notifier::formatAlertSubject(a.pair, a.alertType);
+
+    if (a.channel.empty()) {
+        LOG_ERROR << "[alerts] notification skipped: empty channel id=" << a.id;
+        onDone(false);
+        return;
+    }
+
     if (a.channel == "sms") {
-        std::string text = !a.customMessage.empty()
-                               ? a.customMessage
-                               : Notifier::formatAlertMessage(
-                                     a.pair, target, t.currentPrice, cond, "", a.alertType,
-                                     t.timeframe);
-        notifier.sendSms(a.phone, text, onDone);
+        notifier.sendSms(a.phone, smsBody, [a, onDone](bool ok) {
+            if (ok) {
+                LOG_INFO << "[alerts] SMS sent pair=" << a.pair << " phone=" << a.phone;
+            } else {
+                LOG_WARN << "[alerts] SMS failed pair=" << a.pair << " phone=" << a.phone;
+            }
+            onDone(ok);
+        });
     } else if (a.channel == "call") {
-        std::string text = !a.customMessage.empty()
-                               ? a.customMessage
-                               : Notifier::formatAlertMessage(
-                                     a.pair, target, t.currentPrice, cond, "", a.alertType,
-                                     t.timeframe);
-        notifier.sendCall(a.phone, text, onDone);
+        notifier.sendCall(a.phone, a.customMessage, [a, onDone](bool ok) {
+            if (ok) {
+                LOG_INFO << "[alerts] call placed pair=" << a.pair << " phone=" << a.phone;
+            } else {
+                LOG_WARN << "[alerts] call failed pair=" << a.pair << " phone=" << a.phone;
+            }
+            onDone(ok);
+        });
     } else {
-        std::string msg = Notifier::formatAlertMessage(
-            a.pair, target, t.currentPrice, cond, a.customMessage, a.alertType, t.timeframe);
-        notifier.sendEmail(a.email, "Price Alert: " + a.pair, msg, onDone);
+        notifier.sendEmail(a.email, subject, emailBody, [a, onDone](bool ok) {
+            if (ok) {
+                LOG_INFO << "[alerts] email sent pair=" << a.pair << " email=" << a.email;
+            } else {
+                LOG_WARN << "[alerts] email failed pair=" << a.pair << " email=" << a.email;
+            }
+            onDone(ok);
+        });
     }
 }
 
@@ -83,11 +114,13 @@ void NotificationQueue::pump() {
 }
 
 void NotificationQueue::processJob(Job job) {
-    auto onDone = [this, job = std::move(job)](bool ok) mutable {
+    alerts::TriggeredAlert triggered = std::move(job.triggered);
+    auto onDone = [this, job = std::move(job), triggered](bool ok) mutable {
         if (ok) return;
         ++job.attempts;
         if (job.attempts < cfg_->notificationMaxRetries) {
             double delay = cfg_->notificationRetryDelaySeconds;
+            job.triggered = triggered;
             loop_->runAfter(delay, [this, j = std::move(job)]() mutable {
                 {
                     std::lock_guard<std::mutex> lk(mu_);
@@ -97,9 +130,9 @@ void NotificationQueue::processJob(Job job) {
             });
             return;
         }
-        pushDlq(job.triggered.alert);
+        pushDlq(triggered.alert);
     };
-    dispatchOne(*notifier_, redis_, cfg_->notificationDlqKey, job.triggered, onDone);
+    dispatchOne(*notifier_, triggered, onDone);
 }
 
 void NotificationQueue::pushDlq(const alerts::Alert &a) {

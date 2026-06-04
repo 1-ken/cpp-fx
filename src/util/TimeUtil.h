@@ -18,6 +18,10 @@ std::string toIso8601(std::time_t seconds, long micros = 0);
 // Returns nullopt on failure. Fractional seconds are ignored.
 std::optional<std::time_t> parseIso8601(const std::string &value);
 
+// Format a UTC ISO-8601 timestamp for display in Kenya (EAT, UTC+3, no DST).
+// Returns empty string when input is missing or invalid.
+std::string formatKenyaDateTime(const std::string &iso8601Utc);
+
 // Interval ("1m","5m","15m","30m","1h","4h","1d") -> seconds. 0 if invalid.
 int intervalToSeconds(const std::string &interval);
 

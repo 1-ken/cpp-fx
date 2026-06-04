@@ -104,12 +104,26 @@ batch sizes).
 # Dashboard: http://localhost:8000/dashboard
 ```
 
-## Deploy (Nixpacks / Railway)
+## Deploy (Nixpacks / Dokploy)
 
 Set the service **root directory** to `ctraderplus-cpp/`. Nixpacks picks up
-[`nixpacks.toml`](nixpacks.toml), which builds Drogon (Postgres + Redis), compiles
-the server, and starts `./build/ctraderplus_server`. The platform injects `PORT`;
-the app binds `0.0.0.0:$PORT`.
+[`nixpacks.toml`](nixpacks.toml), which runs a **step-wise build** (Drogon fetch →
+configure → compile → install → app lib → link) so each heavy step gets full CPU/RAM.
+[`scripts/build-vps.sh`](scripts/build-vps.sh) sets `BUILD_JOBS` from available memory.
+Production runtime tuning comes from [`config.production.json`](config.production.json)
+(copied into the image at build time). The platform injects `PORT`; the app binds
+`0.0.0.0:$PORT`.
+
+### Standard B profile (4GB VPS: API + Postgres + Redis)
+
+| Setting | Production value |
+|---------|------------------|
+| Symbols | All broker symbols (`subscribeAllSymbols: true`, `maxSubscribedSymbols: 0`) |
+| HTTP threads | `2` |
+| Notification workers | `2` |
+| Stream interval | `2s` |
+| Redis | Alert buffer, admin OTP, notification DLQ (`REDIS_PUBSUB_ENABLED=false`) |
+| Postgres pool | `postgresConnNum: 2` |
 
 Attach managed **PostgreSQL** and **Redis**, then set **runtime** environment
 variables in Dokploy (not build-time Docker ARGs — avoids baking secrets into
@@ -117,9 +131,13 @@ image layers). Do not commit `.env`.
 
 - **Required:** `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`,
   `CTRADER_ACCESS_TOKEN`, `CTRADER_ACCOUNT_ID`, `DATABASE_URL`, `REDIS_URL`,
-  `NEXTAUTH_SECRET`
+  `NEXTAUTH_SECRET`, `AUTH_DISABLED=0`
 - **Optional:** `CTRADER_HOST`, `CTRADER_REFRESH_TOKEN`, `WS_URL`,
-  `API_BASE_URL`, notification provider vars (see `.env.example`)
+  `API_BASE_URL`, `ADMIN_PHONE`, `CORS_ALLOW_ORIGIN`, notification provider vars
+  (see [`.env.example`](.env.example))
+
+**Alert notifications (SMS / email / call)** include pair, trigger type (`price` /
+`candle_close`), custom message, and trigger time in **Kenya time (EAT)**.
 
 **Dokploy / production URLs**
 
@@ -136,10 +154,27 @@ with a numeric IP. Logs should look like:
 On startup the server also runs idempotent Postgres migrations (adds `alerts.data`
 JSONB and backfills from legacy Python flat columns).
 
-First deploy may take ~10–15 minutes while Drogon compiles; later redeploys are
-faster thanks to build caching.
+**Build on a small VPS:** add 2GB swap before the first deploy. First build ~12–17
+minutes step-wise; cached redeploys skip Drogon when already installed. Locally:
 
-After deploy, verify `GET /health` and `GET /ping` return 200.
+```bash
+. ./scripts/build-vps.sh
+cmake --build /tmp/drogon-build -j"$BUILD_JOBS"   # after Drogon configure
+cmake --build build -j"$BUILD_JOBS" --target ctraderplus_lib
+cmake --build build -j1 --target ctraderplus_server
+```
+
+**Post-deploy checks**
+
+- `curl -sS http://localhost:8000/health` → 200
+- Login latency under 1s
+- `ss -tlnp | grep 8000` → one `ctraderplus_server`
+- Logs show `threads=2` and full symbol subscription (~1600+ spots)
+- Test SMS alert contains `PAIR`, `TYPE`, `MESSAGE`, and time ending in `EAT`
+- `redis-cli LLEN fx:alerts:notifications:dlq` → 0 on success
+
+**Resource limits (co-located 4GB VPS):** Postgres `shared_buffers=128MB`, Redis
+`maxmemory 128mb`, API container `MemoryMax=1280M` optional.
 
 ## Architecture
 

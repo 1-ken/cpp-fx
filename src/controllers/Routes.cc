@@ -13,6 +13,7 @@
 #include <ctime>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 
 #include <drogon/HttpAppFramework.h>
@@ -570,6 +571,9 @@ void createAlert(const HttpRequestPtr &req,
         try {
             auto a = app.alerts->createCandleAlert(pair, interval, direction, threshold,
                                                    uid, email, channel, phone, customMessage);
+            std::ostringstream detail;
+            detail << "pair=" << pair << " channel=" << channel << " interval=" << interval;
+            core::logApiOutcome("alerts", "create", true, 200, detail.str(), uid);
             Json::Value meta;
             meta["pair"] = pair;
             meta["alert_id"] = a.id;
@@ -610,6 +614,16 @@ void createAlert(const HttpRequestPtr &req,
     }
     auto a = app.alerts->createPriceAlert(pair, target, condition, uid, email, channel,
                                           phone, customMessage);
+    double livePrice = 0;
+    if (app.hub && app.hub->latestPrice(a.pair, livePrice)) {
+        app.alerts->tryTriggerPriceAlert(a.id, livePrice);
+        if (auto updated = app.alerts->getAlert(a.id)) a = *updated;
+    }
+    std::ostringstream detail;
+    detail << "pair=" << pair << " channel=" << channel << " target=" << target
+           << " condition=" << condition;
+    if (a.status == "triggered") detail << " triggered=1";
+    core::logApiOutcome("alerts", "create", true, 200, detail.str(), uid);
     Json::Value meta;
     meta["pair"] = pair;
     meta["alert_id"] = a.id;
@@ -633,6 +647,10 @@ void listAlerts(const HttpRequestPtr &req,
         allArr.append(a.toJson());
         if (a.status == "triggered") triggered.append(a.toJson());
     }
+    core::logApiOutcome("alerts", "list", true, 200,
+                        "active=" + std::to_string(active.size()) + " triggered=" +
+                            std::to_string(triggered.size()),
+                        uid);
     Json::Value v;
     v["total"] = (int)all.size();
     v["active"] = active;

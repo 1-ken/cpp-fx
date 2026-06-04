@@ -164,6 +164,7 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
 
     // ---- Postgres ----
     c.postgresDsn = envStr("DATABASE_URL", jstr(root, "postgresDsn", c.postgresDsn));
+    c.postgresConnNum = jint(root, "postgresConnNum", c.postgresConnNum);
     {
         const std::string prefix = "postgresql+asyncpg://";
         if (c.postgresDsn.rfind(prefix, 0) == 0) {
@@ -183,6 +184,8 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
     c.notificationMaxRetries = jint(root, "notificationMaxRetries", c.notificationMaxRetries);
     c.notificationRetryDelaySeconds =
         jnum(root, "notificationRetryDelaySeconds", c.notificationRetryDelaySeconds);
+    c.notificationTimezone =
+        jstr(root, "notificationTimezone", c.notificationTimezone);
     c.retentionDays = jint(root, "retentionDays", c.retentionDays);
 
     if (root.isMember("majors") && root["majors"].isArray()) {

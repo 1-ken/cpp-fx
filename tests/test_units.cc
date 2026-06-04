@@ -3,6 +3,7 @@
 #include <iostream>
 #include <string>
 
+#include "services/Notifier.h"
 #include "util/ForexMarketHours.h"
 #include "util/PairNormalizer.h"
 #include "util/TimeUtil.h"
@@ -72,11 +73,33 @@ static void testTimeRoundTrip() {
     CHECK(iso.rfind("2026-01-15T10:30:00", 0) == 0);
 }
 
+static void testKenyaDateTime() {
+    std::string kenya = util::formatKenyaDateTime("2025-06-03T11:30:05+00:00");
+    CHECK(kenya.find("3 Jun 2025") != std::string::npos);
+    CHECK(kenya.find("14:30:05 EAT") != std::string::npos);
+    CHECK(util::formatKenyaDateTime("").empty());
+}
+
+static void testAlertNotificationFormat() {
+    std::string sms = services::Notifier::formatAlertSms(
+        "EURUSD", 1.0850, 1.0851, "above", "Entry zone reached", "price", "",
+        "2025-06-03T11:30:05+00:00");
+    CHECK(sms.find("PAIR: EURUSD") != std::string::npos);
+    CHECK(sms.find("TYPE: price") != std::string::npos);
+    CHECK(sms.find("MESSAGE: Entry zone reached") != std::string::npos);
+    CHECK(sms.find("14:30:05 EAT") != std::string::npos);
+
+    std::string subject = services::Notifier::formatAlertSubject("EURUSD", "price");
+    CHECK(subject == "PRICE ALERT: EURUSD");
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
     testMarketHours();
     testTimeRoundTrip();
+    testKenyaDateTime();
+    testAlertNotificationFormat();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

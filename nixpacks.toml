@@ -15,22 +15,59 @@ aptPkgs = [
   "zlib1g-dev",
 ]
 
-[phases.install]
+[phases.drogon_fetch]
 dependsOn = ["setup"]
-cacheDirectories = ["/tmp/drogon-build"]
+cacheDirectories = ["/tmp/drogon"]
 cmds = [
-  "git clone --depth 1 --recurse-submodules https://github.com/drogonframework/drogon /tmp/drogon",
-  "cmake -S /tmp/drogon -B /tmp/drogon-build -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_CTL=OFF -DBUILD_MYSQL=OFF -DBUILD_SQLITE=OFF -DBUILD_POSTGRESQL=ON -DBUILD_REDIS=ON",
-  "cmake --build /tmp/drogon-build -j$(nproc)",
-  "cmake --install /tmp/drogon-build",
-  "git clone --depth 1 https://github.com/Thalhammer/jwt-cpp third_party/jwt-cpp",
+  "test -d /tmp/drogon/.git || git clone --depth 1 --recurse-submodules https://github.com/drogonframework/drogon /tmp/drogon",
 ]
 
-[phases.build]
-dependsOn = ["install"]
+[phases.drogon_config]
+dependsOn = ["drogon_fetch"]
+cacheDirectories = ["/tmp/drogon-build"]
 cmds = [
+  "if [ ! -f /usr/local/lib/libdrogon.a ] && [ ! -f /usr/local/lib/libdrogon.so ]; then cmake -S /tmp/drogon -B /tmp/drogon-build -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_CTL=OFF -DBUILD_MYSQL=OFF -DBUILD_SQLITE=OFF -DBUILD_POSTGRESQL=ON -DBUILD_REDIS=ON -DBUILD_TESTING=OFF; fi",
+]
+
+[phases.drogon_build]
+dependsOn = ["drogon_config"]
+cacheDirectories = ["/tmp/drogon-build"]
+cmds = [
+  "if [ ! -f /usr/local/lib/libdrogon.a ] && [ ! -f /usr/local/lib/libdrogon.so ]; then . ./scripts/build-vps.sh && cmake --build /tmp/drogon-build -j\"$BUILD_JOBS\"; else echo 'Drogon already installed — skip compile'; fi",
+]
+
+[phases.drogon_install]
+dependsOn = ["drogon_build"]
+cmds = [
+  "if [ ! -f /usr/local/lib/libdrogon.a ] && [ ! -f /usr/local/lib/libdrogon.so ]; then cmake --install /tmp/drogon-build; fi",
+]
+
+[phases.deps]
+dependsOn = ["drogon_install"]
+cmds = [
+  "test -d third_party/jwt-cpp || git clone --depth 1 https://github.com/Thalhammer/jwt-cpp third_party/jwt-cpp",
+]
+
+[phases.app_config]
+dependsOn = ["deps"]
+cacheDirectories = ["build"]
+cmds = [
+  "cp config.production.json config.json",
   "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF",
-  "cmake --build build -j$(nproc)",
+]
+
+[phases.app_compile]
+dependsOn = ["app_config"]
+cacheDirectories = ["build"]
+cmds = [
+  ". ./scripts/build-vps.sh && cmake --build build -j\"$BUILD_JOBS\" --target ctraderplus_lib",
+]
+
+[phases.app_link]
+dependsOn = ["app_compile"]
+cacheDirectories = ["build"]
+cmds = [
+  "cmake --build build -j1 --target ctraderplus_server",
 ]
 
 [start]

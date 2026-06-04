@@ -26,12 +26,22 @@ class Notifier {
     void sendSms(const std::string &toPhone, const std::string &text, DoneCb cb);
     void sendCall(const std::string &toPhone, const std::string &message, DoneCb cb);
 
-    // Build a human-readable alert message body.
-    static std::string formatAlertMessage(const std::string &pair, double targetPrice,
-                                          double currentPrice, const std::string &condition,
-                                          const std::string &customMessage,
-                                          const std::string &alertType,
-                                          const std::string &timeframe);
+    // Build alert notification bodies. Always includes pair, alert type,
+    // custom message, and trigger time in Kenya (EAT).
+    static std::string formatAlertSubject(const std::string &pair,
+                                          const std::string &alertType);
+    static std::string formatAlertSms(const std::string &pair, double targetPrice,
+                                      double currentPrice, const std::string &condition,
+                                      const std::string &customMessage,
+                                      const std::string &alertType,
+                                      const std::string &timeframe,
+                                      const std::string &triggeredAtIso);
+    static std::string formatAlertEmailBody(const std::string &pair, double targetPrice,
+                                            double currentPrice, const std::string &condition,
+                                            const std::string &customMessage,
+                                            const std::string &alertType,
+                                            const std::string &timeframe,
+                                            const std::string &triggeredAtIso);
 
   private:
     const core::Config &cfg_;

@@ -38,6 +38,9 @@ class AlertManager {
     void setSubscriptionChangeCallback(std::function<void()> cb) {
         onSubscriptionChange_ = std::move(cb);
     }
+    void setTriggerHandler(std::function<void(const TriggeredAlert &)> cb) {
+        onTriggered_ = std::move(cb);
+    }
     void loadAlerts();
 
     uint64_t userAlertsRevision(const std::string &userId) const;
@@ -65,6 +68,9 @@ class AlertManager {
                                      const std::optional<std::string> &userId);
 
     std::vector<TriggeredAlert> checkPriceAlerts(const std::vector<market::FlatPair> &pairs);
+    // Evaluate one active price alert against a live quote (e.g. right after create).
+    std::optional<TriggeredAlert> tryTriggerPriceAlert(const std::string &alertId,
+                                                       double currentPrice);
     // candles: list of {pair, interval, timestamp(iso or epoch sec), close}
     std::vector<TriggeredAlert> checkCandleAlerts(const std::vector<Json::Value> &candles);
 
@@ -75,6 +81,7 @@ class AlertManager {
     void persistAlert(const Alert &a);
     void persistDelete(const std::string &id);
     void triggerAlert(Alert &a, double price);
+    static bool priceConditionMet(const Alert &a, double current);
     void bumpUserRevision(const std::string &userId);
     void notifySubscriptionChange();
     static std::string candleIndexKey(const std::string &pair, const std::string &interval);
@@ -89,6 +96,7 @@ class AlertManager {
     std::unordered_map<std::string, uint64_t> userAlertsRevision_;
 
     std::function<void()> onSubscriptionChange_;
+    std::function<void(const TriggeredAlert &)> onTriggered_;
 
     services::PostgresService *postgres_ = nullptr;
     services::RedisService *redis_ = nullptr;

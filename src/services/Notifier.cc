@@ -1,5 +1,7 @@
 #include "services/Notifier.h"
 
+#include <algorithm>
+#include <cctype>
 #include <sstream>
 
 #include <drogon/HttpClient.h>
@@ -7,6 +9,8 @@
 #include <drogon/utils/Utilities.h>
 #include <json/json.h>
 #include <trantor/utils/Logger.h>
+
+#include "util/TimeUtil.h"
 
 using namespace drogon;
 
@@ -30,6 +34,47 @@ std::string escapeXml(const std::string &s) {
     return out;
 }
 
+std::string upperTypeLabel(const std::string &alertType) {
+    std::string label = alertType.empty() ? "price" : alertType;
+    std::transform(label.begin(), label.end(), label.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return label;
+}
+
+struct AlertMessageFields {
+    std::string header;
+    std::string pair;
+    std::string type;
+    std::string conditionLine;
+    std::string triggeredKenya;
+    std::string customMessage;
+    std::string timeframeLine;
+};
+
+AlertMessageFields buildAlertFields(const std::string &pair, double targetPrice,
+                                    double currentPrice, const std::string &condition,
+                                    const std::string &customMessage,
+                                    const std::string &alertType,
+                                    const std::string &timeframe,
+                                    const std::string &triggeredAtIso) {
+    AlertMessageFields f;
+    f.type = alertType.empty() ? "price" : alertType;
+    f.header = upperTypeLabel(f.type) + " ALERT";
+    f.pair = pair;
+    std::ostringstream cond;
+    cond << condition << " " << targetPrice;
+    f.conditionLine = cond.str();
+    (void)currentPrice;
+    f.triggeredKenya =
+        util::formatKenyaDateTime(triggeredAtIso);
+    if (f.triggeredKenya.empty()) {
+        f.triggeredKenya = util::formatKenyaDateTime(util::nowIso8601());
+    }
+    f.customMessage = customMessage;
+    if (!timeframe.empty()) f.timeframeLine = timeframe;
+    return f;
+}
+
 }  // namespace
 
 Notifier::Notifier(const core::Config &cfg) : cfg_(cfg) {}
@@ -43,25 +88,58 @@ bool Notifier::callEnabled() const {
            !cfg_.twilioFromNumber.empty();
 }
 
-std::string Notifier::formatAlertMessage(const std::string &pair, double targetPrice,
-                                         double currentPrice, const std::string &condition,
-                                         const std::string &customMessage,
-                                         const std::string &alertType,
-                                         const std::string &timeframe) {
+std::string Notifier::formatAlertSubject(const std::string &pair,
+                                         const std::string &alertType) {
+    return upperTypeLabel(alertType) + " ALERT: " + pair;
+}
+
+std::string Notifier::formatAlertSms(const std::string &pair, double targetPrice,
+                                     double currentPrice, const std::string &condition,
+                                     const std::string &customMessage,
+                                     const std::string &alertType,
+                                     const std::string &timeframe,
+                                     const std::string &triggeredAtIso) {
+    AlertMessageFields f =
+        buildAlertFields(pair, targetPrice, currentPrice, condition, customMessage,
+                         alertType, timeframe, triggeredAtIso);
     std::ostringstream os;
-    os << "Price alert: " << pair;
-    if (alertType == "candle_close" && !timeframe.empty())
-        os << " [" << timeframe << " candle]";
-    os << " is " << condition << " " << targetPrice
-       << " (current: " << currentPrice << ").";
-    if (!customMessage.empty()) os << " " << customMessage;
+    os << f.header << " | PAIR: " << f.pair << " | TYPE: " << f.type
+       << " | CONDITION: " << f.conditionLine << " | TRIGGERED: " << f.triggeredKenya;
+    if (!f.timeframeLine.empty()) os << " | TIMEFRAME: " << f.timeframeLine;
+    if (!f.customMessage.empty()) os << " | MESSAGE: " << f.customMessage;
+    return os.str();
+}
+
+std::string Notifier::formatAlertEmailBody(const std::string &pair, double targetPrice,
+                                           double currentPrice, const std::string &condition,
+                                           const std::string &customMessage,
+                                           const std::string &alertType,
+                                           const std::string &timeframe,
+                                           const std::string &triggeredAtIso) {
+    AlertMessageFields f =
+        buildAlertFields(pair, targetPrice, currentPrice, condition, customMessage,
+                         alertType, timeframe, triggeredAtIso);
+    std::ostringstream os;
+    os << f.header << "\n\n"
+       << "PAIR: " << f.pair << "\n"
+       << "TYPE: " << f.type << "\n"
+       << "CONDITION: " << f.conditionLine << "\n"
+       << "TRIGGERED: " << f.triggeredKenya << "\n";
+    if (!f.timeframeLine.empty()) os << "TIMEFRAME: " << f.timeframeLine << "\n";
+    if (!f.customMessage.empty()) os << "MESSAGE: " << f.customMessage << "\n";
     return os.str();
 }
 
 void Notifier::sendEmail(const std::string &toEmail, const std::string &subject,
                          const std::string &body, DoneCb cb) {
-    if (!emailEnabled() || toEmail.empty()) {
-        cb(true);
+    if (!emailEnabled()) {
+        LOG_WARN << "SendGrid email skipped: not configured";
+        cb(false);
+        return;
+    }
+    if (toEmail.empty()) {
+        LOG_WARN << "SendGrid email skipped: empty recipient";
+        cb(false);
         return;
     }
     auto client = HttpClient::newHttpClient("https://api.sendgrid.com");
@@ -99,8 +177,14 @@ void Notifier::sendEmail(const std::string &toEmail, const std::string &subject,
 }
 
 void Notifier::sendSms(const std::string &toPhone, const std::string &text, DoneCb cb) {
-    if (!smsEnabled() || toPhone.empty()) {
-        cb(true);
+    if (!smsEnabled()) {
+        LOG_WARN << "SMS Gate send skipped: SMS_GATE credentials not configured";
+        cb(false);
+        return;
+    }
+    if (toPhone.empty()) {
+        LOG_WARN << "SMS Gate send skipped: empty phone number";
+        cb(false);
         return;
     }
     auto client = HttpClient::newHttpClient("https://api.sms-gate.app");
@@ -119,17 +203,28 @@ void Notifier::sendSms(const std::string &toPhone, const std::string &text, Done
         cfg_.smsGateUsername.size() + cfg_.smsGatePassword.size() + 1);
     req->addHeader("Authorization", "Basic " + auth);
 
-    client->sendRequest(req, [cb](ReqResult r, const HttpResponsePtr &resp) {
+    client->sendRequest(req, [cb, toPhone](ReqResult r, const HttpResponsePtr &resp) {
         bool ok = (r == ReqResult::Ok && resp &&
                    resp->getStatusCode() >= k200OK && resp->getStatusCode() < k300MultipleChoices);
-        if (!ok) LOG_WARN << "SMS Gate send failed";
+        if (!ok) {
+            int code = resp ? static_cast<int>(resp->getStatusCode()) : -1;
+            std::string body = resp ? std::string(resp->getBody()) : "";
+            LOG_WARN << "SMS Gate send failed phone=" << toPhone << " status=" << code
+                     << " body=" << body;
+        }
         cb(ok);
     });
 }
 
 void Notifier::sendCall(const std::string &toPhone, const std::string &message, DoneCb cb) {
-    if (!callEnabled() || toPhone.empty()) {
-        cb(true);
+    if (!callEnabled()) {
+        LOG_WARN << "Twilio call skipped: TWILIO credentials not configured";
+        cb(false);
+        return;
+    }
+    if (toPhone.empty()) {
+        LOG_WARN << "Twilio call skipped: empty phone number";
+        cb(false);
         return;
     }
     auto client = HttpClient::newHttpClient("https://api.twilio.com");
@@ -148,9 +243,14 @@ void Notifier::sendCall(const std::string &toPhone, const std::string &message, 
          << "&From=" << drogon::utils::urlEncode(cfg_.twilioFromNumber)
          << "&Twiml=" << drogon::utils::urlEncode(twiml);
     req->setBody(form.str());
-    client->sendRequest(req, [cb](ReqResult r, const HttpResponsePtr &resp) {
+    client->sendRequest(req, [cb, toPhone](ReqResult r, const HttpResponsePtr &resp) {
         bool ok = (r == ReqResult::Ok && resp && resp->getStatusCode() < k300MultipleChoices);
-        if (!ok) LOG_WARN << "Twilio call failed";
+        if (!ok) {
+            int code = resp ? static_cast<int>(resp->getStatusCode()) : -1;
+            std::string body = resp ? std::string(resp->getBody()) : "";
+            LOG_WARN << "Twilio call failed phone=" << toPhone << " status=" << code
+                     << " body=" << body;
+        }
         cb(ok);
     });
 }

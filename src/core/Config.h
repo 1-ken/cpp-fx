@@ -61,6 +61,10 @@ struct Config {
 
     // Postgres
     std::string postgresDsn = "postgresql://user:password@localhost:5432/observer";
+    int postgresConnNum = 4;
+
+    // Alert notification display timezone (Kenya / EAT = UTC+3, no DST).
+    std::string notificationTimezone = "Africa/Nairobi";
 
     // Legacy tick archive (disabled by default; OHLC uses broker trend bars)
     bool tickArchiveEnabled = false;

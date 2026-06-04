@@ -32,6 +32,24 @@ TrendbarData convertTrendbar(const ProtoOATrendbar &tb) {
     return d;
 }
 
+std::vector<int64_t> sortedUniqueIds(std::vector<int64_t> ids) {
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
+std::vector<int64_t> idsNotYetSubscribed(const std::vector<int64_t> &sortedTarget,
+                                         const std::vector<int64_t> &sortedSubscribed) {
+    std::vector<int64_t> delta;
+    delta.reserve(sortedTarget.size());
+    for (int64_t id : sortedTarget) {
+        if (!std::binary_search(sortedSubscribed.begin(), sortedSubscribed.end(), id)) {
+            delta.push_back(id);
+        }
+    }
+    return delta;
+}
+
 }  // namespace
 
 CTraderClient::CTraderClient(const core::CTraderConfig &cfg) : cfg_(cfg) {
@@ -174,9 +192,11 @@ void CTraderClient::handleFrame(const std::string &payload) {
                 ids.size() > static_cast<size_t>(cfg_.maxSubscribedSymbols)) {
                 ids.resize(static_cast<size_t>(cfg_.maxSubscribedSymbols));
             }
+            ids = sortedUniqueIds(std::move(ids));
             subscribeSpotsBatched(ids);
-            subscribedSpotIds_ = ids;
+            subscribedSpotIds_ = std::move(ids);
         } else if (!pendingSpotIds_.empty()) {
+            pendingSpotIds_ = sortedUniqueIds(std::move(pendingSpotIds_));
             subscribeSpotsBatched(pendingSpotIds_);
             subscribedSpotIds_ = pendingSpotIds_;
             pendingSpotIds_.clear();
@@ -229,7 +249,12 @@ void CTraderClient::handleFrame(const std::string &payload) {
     if (type == PROTO_OA_ERROR_RES) {
         ProtoOAErrorRes err;
         err.ParseFromString(inner);
-        LOG_WARN << "cTrader: error " << err.errorcode() << " - " << err.description();
+        const bool alreadySubscribed = err.errorcode() == "ALREADY_SUBSCRIBED";
+        if (alreadySubscribed) {
+            LOG_DEBUG << "cTrader: already subscribed (ignored)";
+        } else {
+            LOG_WARN << "cTrader: error " << err.errorcode() << " - " << err.description();
+        }
         // Fail any pending request that carried this clientMsgId.
         const std::string id = envelope.clientmsgid();
         auto it = pendingTrendbars_.find(id);
@@ -282,13 +307,21 @@ void CTraderClient::sendSymbolsListReq() {
 void CTraderClient::refreshSpotSubscriptions(std::vector<int64_t> symbolIds) {
     if (!loop_) return;
     loop_->queueInLoop([this, ids = std::move(symbolIds)]() mutable {
+        ids = sortedUniqueIds(std::move(ids));
         if (!ready_.load() || state_ != State::Ready) {
             pendingSpotIds_ = std::move(ids);
             return;
         }
+        if (cfg_.subscribeAllSymbols) return;
         if (ids == subscribedSpotIds_) return;
-        subscribeSpotsBatched(ids);
-        subscribedSpotIds_ = std::move(ids);
+
+        std::vector<int64_t> delta = idsNotYetSubscribed(ids, subscribedSpotIds_);
+        if (delta.empty()) {
+            subscribedSpotIds_ = std::move(ids);
+            return;
+        }
+        subscribeSpotsBatched(delta);
+        subscribedSpotIds_ = sortedUniqueIds(std::move(ids));
     });
 }
 

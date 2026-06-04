@@ -361,6 +361,46 @@ void AlertManager::triggerAlert(Alert &a, double price) {
     a.closePrice = price;
 }
 
+bool AlertManager::priceConditionMet(const Alert &a, double current) {
+    if (a.alertType != "price") return false;
+    std::string cond = a.condition.value_or("");
+    double target = a.targetPrice.value_or(0);
+    if (cond == "above") return current >= target;
+    if (cond == "below") return current <= target;
+    if (cond == "equal") return std::fabs(current - target) <= 0.0001;
+    return false;
+}
+
+std::optional<TriggeredAlert> AlertManager::tryTriggerPriceAlert(const std::string &alertId,
+                                                                  double currentPrice) {
+    std::optional<TriggeredAlert> result;
+    Alert persisted;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = alerts_.find(alertId);
+        if (it == alerts_.end()) return std::nullopt;
+        Alert &a = it->second;
+        if (a.status != "active" || a.alertType != "price") return std::nullopt;
+        a.lastCheckedPrice = currentPrice;
+        if (!priceConditionMet(a, currentPrice)) return std::nullopt;
+        triggerAlert(a, currentPrice);
+        TriggeredAlert t;
+        t.alert = a;
+        t.currentPrice = currentPrice;
+        t.alertTypeLabel = "price";
+        result = t;
+        persisted = a;
+        rebuildIndexes();
+        bumpUserRevision(a.userId);
+    }
+    persistAlert(persisted);
+    LOG_INFO << "Triggered price alert " << persisted.id << " " << persisted.pair
+             << " channel=" << persisted.channel << " price=" << currentPrice
+             << " target=" << persisted.targetPrice.value_or(0);
+    if (onTriggered_) onTriggered_(*result);
+    return result;
+}
+
 std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
     const std::vector<market::FlatPair> &pairs) {
     std::vector<TriggeredAlert> triggered;
@@ -383,24 +423,17 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                 Alert &a = it->second;
                 if (a.status != "active" || a.alertType != "price") continue;
                 a.lastCheckedPrice = current;
-                bool should = false;
-                std::string cond = a.condition.value_or("");
-                double target = a.targetPrice.value_or(0);
-                if (cond == "above" && current >= target)
-                    should = true;
-                else if (cond == "below" && current <= target)
-                    should = true;
-                else if (cond == "equal" && std::fabs(current - target) <= 0.0001)
-                    should = true;
-                if (should) {
-                    triggerAlert(a, current);
-                    TriggeredAlert t;
-                    t.alert = a;
-                    t.currentPrice = current;
-                    t.alertTypeLabel = "price";
-                    triggered.push_back(t);
-                    toPersist.push_back(a);
-                }
+                if (!priceConditionMet(a, current)) continue;
+                triggerAlert(a, current);
+                TriggeredAlert t;
+                t.alert = a;
+                t.currentPrice = current;
+                t.alertTypeLabel = "price";
+                triggered.push_back(t);
+                toPersist.push_back(a);
+                LOG_INFO << "Triggered price alert " << a.id << " " << a.pair
+                         << " channel=" << a.channel << " price=" << current
+                         << " target=" << a.targetPrice.value_or(0);
             }
         }
         if (!triggered.empty()) {
@@ -409,6 +442,9 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
         }
     }
     for (auto &a : toPersist) persistAlert(a);
+    for (const auto &t : triggered) {
+        if (onTriggered_) onTriggered_(t);
+    }
     return triggered;
 }
 
@@ -490,6 +526,8 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                 t.timeframe = iv;
                 triggered.push_back(t);
                 toPersist.push_back(a);
+                LOG_INFO << "Triggered candle alert " << a.id << " " << a.pair
+                         << " channel=" << a.channel << " close=" << close;
             }
             }
         }
@@ -499,6 +537,9 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
         }
     }
     for (auto &a : toPersist) persistAlert(a);
+    for (const auto &t : triggered) {
+        if (onTriggered_) onTriggered_(t);
+    }
     return triggered;
 }
 

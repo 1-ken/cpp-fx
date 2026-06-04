@@ -71,7 +71,7 @@ bool PostgresService::connect() {
     const std::string dsn = dsnWithConnectTimeout(cfg_.postgresDsn, kConnectTimeoutSec);
     LOG_INFO << "Connecting to PostgreSQL (" << redactPostgresDsn(dsn) << ")...";
     try {
-        client_ = DbClient::newPgClient(dsn, /*connNum=*/4);
+        client_ = DbClient::newPgClient(dsn, static_cast<size_t>(std::max(1, cfg_.postgresConnNum)));
         if (!client_) {
             LOG_WARN << "PostgreSQL client creation returned null";
             return false;

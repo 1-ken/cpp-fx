@@ -47,9 +47,11 @@ std::optional<std::time_t> parseIso8601(const std::string &value) {
     tmv.tm_year = year - 1900;
     tmv.tm_mon = mon - 1;
     tmv.tm_mday = day;
-    tmv.tm_hour = hour;
-    tmv.tm_min = min;
-    tmv.tm_sec = sec;
+    if (matched >= 6) {
+        tmv.tm_hour = hour;
+        tmv.tm_min = min;
+        tmv.tm_sec = sec;
+    }
 #if defined(_WIN32)
     std::time_t t = _mkgmtime(&tmv);
 #else
@@ -57,6 +59,40 @@ std::optional<std::time_t> parseIso8601(const std::string &value) {
 #endif
     if (t == static_cast<std::time_t>(-1)) return std::nullopt;
     return t;
+}
+
+namespace {
+
+const char *monthAbbrev(int month) {
+    static const char *kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    if (month < 1 || month > 12) return "???";
+    return kMonths[month - 1];
+}
+
+std::tm utcTm(std::time_t utcSeconds) {
+    std::tm tmv{};
+#if defined(_WIN32)
+    gmtime_s(&tmv, &utcSeconds);
+#else
+    gmtime_r(&utcSeconds, &tmv);
+#endif
+    return tmv;
+}
+
+}  // namespace
+
+std::string formatKenyaDateTime(const std::string &iso8601Utc) {
+    auto epoch = parseIso8601(iso8601Utc);
+    if (!epoch) return "";
+    // East Africa Time is fixed UTC+3 (no daylight saving).
+    constexpr std::time_t kEatOffsetSec = 3 * 3600;
+    std::tm eat = utcTm(*epoch + kEatOffsetSec);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%d %s %04d, %02d:%02d:%02d EAT", eat.tm_mday,
+                  monthAbbrev(eat.tm_mon + 1), eat.tm_year + 1900, eat.tm_hour,
+                  eat.tm_min, eat.tm_sec);
+    return std::string(buf);
 }
 
 int intervalToSeconds(const std::string &interval) {
