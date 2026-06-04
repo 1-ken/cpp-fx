@@ -12,8 +12,7 @@
 
 namespace ctraderplus::services {
 
-// Thin wrapper over Drogon's async Redis client providing the operations the
-// observer needs: snapshot cache/queue, alert event queue, and DLQ.
+// Thin wrapper over Drogon's async Redis client: alert event queue, OTP, DLQ.
 // All methods are best-effort; failures are logged and swallowed so the app
 // keeps running in a degraded mode (matching the Python implementation).
 class RedisService {
@@ -22,12 +21,6 @@ class RedisService {
 
     bool connect();
     bool connected() const { return client_ != nullptr; }
-
-    // Cache latest + push to archive queue + recent list + publish channel.
-    void publishSnapshot(const std::string &json);
-
-    // Pop up to `batch` items from the archive queue.
-    void readQueue(int batch, std::function<void(std::vector<std::string>)> cb);
 
     // Generic JSON queue helpers (used for alert events + DLQ).
     void pushJson(const std::string &key, const std::string &json);

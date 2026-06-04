@@ -17,6 +17,9 @@ struct WsConnContext {
     std::optional<std::string> pairCanon;
     bool hasStreamParams = false;
     bool counted = false;
+    uint64_t lastAlertsRevision = 0;
+    bool hasCachedAlerts = false;
+    Json::Value cachedAlerts;
 };
 
 // WebSocket endpoint /ws/observe. Mirrors the Python ws_observe handler:

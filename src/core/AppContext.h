@@ -16,6 +16,7 @@ class CTraderClient;
 }
 namespace ctraderplus::market {
 class MarketHub;
+class SymbolSubscriptionPlanner;
 }
 namespace ctraderplus::alerts {
 class AlertManager;
@@ -48,6 +49,9 @@ struct AppContext {
 
     // Fan a grouped snapshot out to connected WebSocket clients.
     std::function<void(std::shared_ptr<Json::Value>)> wsBroadcast;
+
+    market::SymbolSubscriptionPlanner *subscriptionPlanner = nullptr;
+    std::function<void()> refreshSubscriptions;
 
     std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
 

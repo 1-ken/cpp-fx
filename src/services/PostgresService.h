@@ -91,6 +91,7 @@ class PostgresService {
 
     // Favorites
     std::vector<std::string> listFavorites(const std::string &userId);
+    std::vector<std::string> listAllFavoritePairs() const;
     void addFavorite(const std::string &userId, const std::string &pair);
     bool removeFavorite(const std::string &userId, const std::string &pair);
 

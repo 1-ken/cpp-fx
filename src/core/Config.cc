@@ -171,11 +171,13 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
         }
     }
 
-    // ---- Archive / retention ----
+    // ---- Archive / retention / candle polling ----
+    c.tickArchiveEnabled = jbool(root, "tickArchiveEnabled", c.tickArchiveEnabled);
     c.archiveIntervalSeconds = jnum(root, "archiveIntervalSeconds", c.archiveIntervalSeconds);
     c.archiveBatchSize = jint(root, "archiveBatchSize", c.archiveBatchSize);
     c.candleCheckIntervalSeconds =
         jnum(root, "candleCheckIntervalSeconds", c.candleCheckIntervalSeconds);
+    c.pollFallbackEnabled = jbool(root, "pollFallbackEnabled", c.pollFallbackEnabled);
     c.notificationWorkerCount =
         jint(root, "notificationWorkerCount", c.notificationWorkerCount);
     c.notificationMaxRetries = jint(root, "notificationMaxRetries", c.notificationMaxRetries);

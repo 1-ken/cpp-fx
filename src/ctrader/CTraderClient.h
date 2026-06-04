@@ -57,6 +57,9 @@ class CTraderClient {
     void subscribeLiveTrendbar(int64_t symbolId, int period);
     void unsubscribeLiveTrendbar(int64_t symbolId, int period);
 
+    // Replace spot subscriptions (scoped mode). No-op until symbols are loaded.
+    void refreshSpotSubscriptions(std::vector<int64_t> symbolIds);
+
   private:
     enum class State { Disconnected, Connecting, AppAuth, AccountAuth, LoadingSymbols, Ready };
 
@@ -98,6 +101,9 @@ class CTraderClient {
     SymbolsCallback symbolsCb_;
     SpotCallback spotCb_;
     StateCallback stateCb_;
+
+    std::vector<int64_t> pendingSpotIds_;
+    std::vector<int64_t> subscribedSpotIds_;
 };
 
 }  // namespace ctraderplus::ctrader

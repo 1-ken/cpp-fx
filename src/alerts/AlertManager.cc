@@ -81,14 +81,41 @@ void AlertManager::loadAlerts() {
     LOG_INFO << "Loaded " << alerts_.size() << " alerts";
 }
 
+std::string AlertManager::candleIndexKey(const std::string &pair,
+                                         const std::string &interval) {
+    return pair + "|" + interval;
+}
+
+void AlertManager::bumpUserRevision(const std::string &userId) {
+    std::lock_guard<std::mutex> lk(revMu_);
+    ++userAlertsRevision_[userId];
+}
+
+void AlertManager::notifySubscriptionChange() {
+    if (onSubscriptionChange_) onSubscriptionChange_();
+}
+
+uint64_t AlertManager::userAlertsRevision(const std::string &userId) const {
+    std::lock_guard<std::mutex> lk(revMu_);
+    auto it = userAlertsRevision_.find(userId);
+    return it == userAlertsRevision_.end() ? 0 : it->second;
+}
+
 void AlertManager::rebuildIndexes() {
     activePriceIndex_.clear();
+    activeCandleIndex_.clear();
     for (const auto &kv : alerts_) {
         const Alert &a = kv.second;
-        if (a.status != "active" || a.alertType != "price") continue;
+        if (a.status != "active") continue;
         std::string key = util::canonicalPair(a.pair);
         if (key.empty()) continue;
-        activePriceIndex_[key].push_back(a.id);
+        if (a.alertType == "price") {
+            activePriceIndex_[key].push_back(a.id);
+        } else if (a.alertType == "candle_close" && a.interval) {
+            std::string iv = *a.interval;
+            std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+            activeCandleIndex_[candleIndexKey(key, iv)].push_back(a.id);
+        }
     }
 }
 
@@ -157,6 +184,8 @@ Alert AlertManager::createPriceAlert(const std::string &pair, double targetPrice
         rebuildIndexes();
     }
     persistAlert(a);
+    bumpUserRevision(a.userId);
+    notifySubscriptionChange();
     LOG_INFO << "Created price alert " << a.id << " " << a.pair << " @ " << targetPrice;
     return a;
 }
@@ -192,6 +221,8 @@ Alert AlertManager::createCandleAlert(const std::string &pair, const std::string
         rebuildIndexes();
     }
     persistAlert(a);
+    bumpUserRevision(a.userId);
+    notifySubscriptionChange();
     LOG_INFO << "Created candle alert " << a.id << " " << a.pair << " " << iv << " "
              << direction << " " << threshold;
     return a;
@@ -253,14 +284,18 @@ bool AlertManager::isAlertOwnedBy(const std::string &id, const std::string &user
 
 bool AlertManager::deleteAlert(const std::string &id,
                                const std::optional<std::string> &userId) {
+    std::string affectedUser;
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = alerts_.find(id);
         if (it == alerts_.end()) return false;
         if (userId && it->second.userId != *userId) return false;
+        affectedUser = it->second.userId;
         alerts_.erase(it);
         rebuildIndexes();
     }
+    bumpUserRevision(affectedUser);
+    notifySubscriptionChange();
     persistDelete(id);
     LOG_INFO << "Deleted alert " << id;
     return true;
@@ -312,6 +347,8 @@ std::optional<Alert> AlertManager::updateAlert(const std::string &id,
         updated = a;
         rebuildIndexes();
     }
+    bumpUserRevision(updated.userId);
+    notifySubscriptionChange();
     persistAlert(updated);
     LOG_INFO << "Updated alert " << id;
     return updated;
@@ -366,7 +403,10 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                 }
             }
         }
-        if (!triggered.empty()) rebuildIndexes();
+        if (!triggered.empty()) {
+            rebuildIndexes();
+            for (const auto &t : triggered) bumpUserRevision(t.alert.userId);
+        }
     }
     for (auto &a : toPersist) persistAlert(a);
     return triggered;
@@ -397,17 +437,22 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
     std::vector<Alert> toPersist;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        for (auto &kv : alerts_) {
-            Alert &a = kv.second;
+        for (const auto &entry : lookup) {
+            const Key &k = entry.first;
+            const Json::Value &candle = entry.second;
+            auto idxIt = activeCandleIndex_.find(candleIndexKey(k.pair, k.interval));
+            if (idxIt == activeCandleIndex_.end()) continue;
+            for (const auto &alertId : idxIt->second) {
+            auto it = alerts_.find(alertId);
+            if (it == alerts_.end()) continue;
+            Alert &a = it->second;
             if (a.status != "active" || a.alertType != "candle_close") continue;
             std::string iv = a.interval.value_or("");
             std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
-            Key k{util::canonicalPair(a.pair), iv};
-            const Json::Value *candle = find(k);
-            if (!candle) continue;
+            if (util::canonicalPair(a.pair) != k.pair || iv != k.interval) continue;
 
-            double close = (*candle).get("close", 0.0).asDouble();
-            Json::Value tsVal = (*candle)["timestamp"];
+            double close = candle.get("close", 0.0).asDouble();
+            Json::Value tsVal = candle["timestamp"];
             std::string candleTsStr =
                 tsVal.isString() ? tsVal.asString() : std::to_string(tsVal.asInt64());
 
@@ -446,8 +491,12 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                 triggered.push_back(t);
                 toPersist.push_back(a);
             }
+            }
         }
-        if (!triggered.empty()) rebuildIndexes();
+        if (!triggered.empty()) {
+            rebuildIndexes();
+            for (const auto &t : triggered) bumpUserRevision(t.alert.userId);
+        }
     }
     for (auto &a : toPersist) persistAlert(a);
     return triggered;

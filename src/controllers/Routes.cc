@@ -286,47 +286,13 @@ void onboardingComplete(const HttpRequestPtr &req,
 }
 
 void historical(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> &&cb) {
-    auto &app = AppContext::instance();
     std::string uid;
     if (!authOrReject(req, cb, uid)) return;
-    if (!app.postgres || !app.postgres->available()) {
-        cb(errResp("error", "Historical storage not available", 503));
-        return;
-    }
-    std::string pair = req->getParameter("pair");
-    int limit = clampInt(req->getParameter("limit").empty()
-                             ? 500 : std::atoi(req->getParameter("limit").c_str()), 1, 5000);
-    bool descending = req->getParameter("order") != "asc";
-
-    std::time_t retentionFloor =
-        std::time(nullptr) - static_cast<std::time_t>(app.config->retentionDays) * 86400;
-    auto startOpt = parseQueryTime(req->getParameter("start"));
-    auto endOpt = parseQueryTime(req->getParameter("end"));
-    std::time_t start = (!startOpt || *startOpt < retentionFloor) ? retentionFloor : *startOpt;
-    if (endOpt && *endOpt < start) {
-        Json::Value v;
-        v["count"] = 0;
-        v["items"] = Json::Value(Json::arrayValue);
-        cb(jsonResp(v));
-        return;
-    }
-
-    auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
-    app.dbExec([&app, pair, start, endOpt, limit, descending, callback]() {
-        auto rows = app.postgres->queryHistory(pair, start, endOpt, limit, descending);
-        Json::Value items(Json::arrayValue);
-        for (const auto &r : rows) {
-            Json::Value it;
-            it["pair"] = r.pair;
-            it["price"] = r.price;
-            it["observed_at"] = util::toIso8601(r.observedAt);
-            items.append(it);
-        }
-        Json::Value v;
-        v["count"] = (int)items.size();
-        v["items"] = items;
-        (*callback)(jsonResp(v));
-    });
+    (void)uid;
+    Json::Value v;
+    v["error"] = "Tick history retired; use GET /historical/ohlc or /historical/ohlc-with-forming";
+    v["successor"] = "/historical/ohlc";
+    cb(jsonResp(v, 410));
 }
 
 void streamMetrics(const HttpRequestPtr &req,

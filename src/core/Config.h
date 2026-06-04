@@ -22,7 +22,7 @@ struct CTraderConfig {
     double requestTimeoutSeconds = 15.0;
     bool includeArchivedSymbols = false;
     bool subscribeAllSymbols = true;
-    int maxSubscribedSymbols = 0;  // 0 = unlimited
+    int maxSubscribedSymbols = 0;  // 0 = unlimited when subscribeAllSymbols
 
     std::string resolvedHost() const {
         return host == "demo" ? demoHost : liveHost;
@@ -41,7 +41,7 @@ struct Config {
     std::string apiBaseUrl;
 
     // Streaming / resiliency tuning
-    double streamIntervalSeconds = 0.5;
+    double streamIntervalSeconds = 1.0;
     double snapshotTimeoutSeconds = 30.0;
     double wsSendTimeoutSeconds = 3.0;
     double alertActionTimeoutSeconds = 8.0;
@@ -56,16 +56,19 @@ struct Config {
     std::string redisRecentKey = "fx:observer:recent";
     int redisRecentMaxlen = 200;
     std::string redisAlertQueueKey = "fx:alerts:events";
-    bool redisPubsubEnabled = true;
+    bool redisPubsubEnabled = false;
     std::string notificationDlqKey = "fx:alerts:notifications:dlq";
 
     // Postgres
     std::string postgresDsn = "postgresql://user:password@localhost:5432/observer";
 
-    // Archive / retention
+    // Legacy tick archive (disabled by default; OHLC uses broker trend bars)
+    bool tickArchiveEnabled = false;
     double archiveIntervalSeconds = 30.0;
     int archiveBatchSize = 200;
-    double candleCheckIntervalSeconds = 0.25;
+
+    double candleCheckIntervalSeconds = 1.0;
+    bool pollFallbackEnabled = false;
     int notificationWorkerCount = 4;
     int notificationMaxRetries = 3;
     double notificationRetryDelaySeconds = 1.0;

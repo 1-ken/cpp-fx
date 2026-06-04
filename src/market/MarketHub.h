@@ -38,43 +38,38 @@ struct FlatPair {
     double ask = 0;
 };
 
+struct SnapshotBundle {
+    std::shared_ptr<Json::Value> grouped;
+    std::vector<FlatPair> flat;
+};
+
 // Central market state: ingests cTrader spot updates, periodically assembles a
-// snapshot, fans it out to WebSocket subscribers, publishes to Redis, and
-// drives alert evaluation. Replaces data_streaming_task in the Python app.
+// snapshot, fans it out to WebSocket subscribers, and drives alert evaluation.
 class MarketHub {
   public:
     MarketHub(const core::Config &cfg, ctrader::SymbolRegistry &registry);
 
-    void setRedis(services::RedisService *redis) { redis_ = redis; }
     void setPostgres(services::PostgresService *pg) { postgres_ = pg; }
     void setReadyFn(std::function<bool()> fn) { readyFn_ = std::move(fn); }
-    // Runs a (potentially blocking) DB task off the main event loop.
     void setDbExecutor(std::function<void(std::function<void()>)> exec) {
         dbExecutor_ = std::move(exec);
     }
 
-    // Sink invoked every broadcast with the grouped snapshot (for WebSocket).
     void setBroadcastSink(std::function<void(std::shared_ptr<Json::Value>)> sink) {
         broadcastSink_ = std::move(sink);
     }
-    // Invoked every broadcast with the flat pair list (for alert evaluation).
     void setAlertSink(std::function<void(std::shared_ptr<std::vector<FlatPair>>)> sink) {
         alertSink_ = std::move(sink);
     }
 
-    // Called from the cTrader loop when a spot update arrives.
     void onSpot(const ctrader::SpotUpdate &update);
-
-    // Start the periodic broadcast loop on the given event loop.
     void start(trantor::EventLoop *loop);
 
-    // Build the grouped snapshot ({market_status, pairs:{currencies,commodities}, ts}).
+    SnapshotBundle buildSnapshot() const;
     std::shared_ptr<Json::Value> buildGroupedSnapshot() const;
 
-    // Latest live price (mid) for a canonical pair, if known.
     bool latestPrice(const std::string &canonicalPair, double &out) const;
 
-    // ---- Stream health ----
     std::string lastSnapshotTs() const;
     double lastSnapshotAgeSeconds() const;
     int snapshotFailureCount() const { return snapshotFailureCount_.load(); }
@@ -103,12 +98,10 @@ class MarketHub {
     };
 
     void tick();
-    std::vector<FlatPair> snapshotFlat() const;
     void persistMetricIfDue(const std::string &status);
 
     const core::Config &cfg_;
     ctrader::SymbolRegistry &registry_;
-    services::RedisService *redis_ = nullptr;
     services::PostgresService *postgres_ = nullptr;
     std::function<bool()> readyFn_;
     std::function<void(std::function<void()>)> dbExecutor_;

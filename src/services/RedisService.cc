@@ -112,48 +112,6 @@ bool RedisService::connect() {
     }
 }
 
-void RedisService::publishSnapshot(const std::string &json) {
-    if (!client_) return;
-    auto onErr = [](const std::exception &e) {
-        LOG_DEBUG << "Redis publishSnapshot error: " << e.what();
-    };
-    auto noop = [](const drogon::nosql::RedisResult &) {};
-    client_->execCommandAsync(noop, onErr, "SET %s %s", cfg_.redisLatestKey.c_str(),
-                              json.c_str());
-    client_->execCommandAsync(noop, onErr, "RPUSH %s %s", cfg_.redisQueueKey.c_str(),
-                              json.c_str());
-    client_->execCommandAsync(noop, onErr, "LPUSH %s %s", cfg_.redisRecentKey.c_str(),
-                              json.c_str());
-    client_->execCommandAsync(noop, onErr, "LTRIM %s 0 %d", cfg_.redisRecentKey.c_str(),
-                              std::max(cfg_.redisRecentMaxlen - 1, 0));
-    if (cfg_.redisPubsubEnabled) {
-        client_->execCommandAsync(noop, onErr, "PUBLISH %s %s",
-                                  cfg_.redisChannel.c_str(), json.c_str());
-    }
-}
-
-void RedisService::readQueue(int batch, std::function<void(std::vector<std::string>)> cb) {
-    if (!client_) {
-        cb({});
-        return;
-    }
-    auto onErr = [cb](const std::exception &e) {
-        LOG_DEBUG << "Redis readQueue error: " << e.what();
-        cb({});
-    };
-    client_->execCommandAsync(
-        [cb](const drogon::nosql::RedisResult &r) {
-            std::vector<std::string> out;
-            if (r.type() == drogon::nosql::RedisResultType::kArray) {
-                for (const auto &item : r.asArray()) out.push_back(item.asString());
-            } else if (r.type() == drogon::nosql::RedisResultType::kString) {
-                out.push_back(r.asString());
-            }
-            cb(std::move(out));
-        },
-        onErr, "LPOP %s %d", cfg_.redisQueueKey.c_str(), batch);
-}
-
 void RedisService::pushJson(const std::string &key, const std::string &json) {
     if (!client_) return;
     client_->execCommandAsync(

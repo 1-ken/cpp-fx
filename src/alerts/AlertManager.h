@@ -35,7 +35,12 @@ class AlertManager {
     void configure(services::PostgresService *pg, services::RedisService *redis,
                    std::function<void(std::function<void()>)> dbExecutor,
                    std::string redisAlertQueueKey);
+    void setSubscriptionChangeCallback(std::function<void()> cb) {
+        onSubscriptionChange_ = std::move(cb);
+    }
     void loadAlerts();
+
+    uint64_t userAlertsRevision(const std::string &userId) const;
 
     Alert createPriceAlert(const std::string &pair, double targetPrice,
                            const std::string &condition, const std::string &userId,
@@ -70,12 +75,20 @@ class AlertManager {
     void persistAlert(const Alert &a);
     void persistDelete(const std::string &id);
     void triggerAlert(Alert &a, double price);
+    void bumpUserRevision(const std::string &userId);
+    void notifySubscriptionChange();
+    static std::string candleIndexKey(const std::string &pair, const std::string &interval);
 
     static int intervalSeconds(const std::string &interval);
 
     mutable std::mutex mu_;
+    mutable std::mutex revMu_;
     std::unordered_map<std::string, Alert> alerts_;
     std::unordered_map<std::string, std::vector<std::string>> activePriceIndex_;
+    std::unordered_map<std::string, std::vector<std::string>> activeCandleIndex_;
+    std::unordered_map<std::string, uint64_t> userAlertsRevision_;
+
+    std::function<void()> onSubscriptionChange_;
 
     services::PostgresService *postgres_ = nullptr;
     services::RedisService *redis_ = nullptr;

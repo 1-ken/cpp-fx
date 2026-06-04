@@ -7,7 +7,6 @@
 
 #include "core/Config.h"
 #include "services/PostgresService.h"
-#include "services/RedisService.h"
 #include "util/ForexMarketHours.h"
 #include "util/PairNormalizer.h"
 #include "util/TimeUtil.h"
@@ -69,13 +68,23 @@ void MarketHub::start(trantor::EventLoop *loop) {
              << cfg_.streamIntervalSeconds << "s)";
 }
 
-std::vector<FlatPair> MarketHub::snapshotFlat() const {
-    std::vector<FlatPair> out;
+SnapshotBundle MarketHub::buildSnapshot() const {
+    SnapshotBundle out;
+    out.grouped = std::make_shared<Json::Value>();
+    (*out.grouped)["market_status"] = util::isForexMarketOpen() ? "open" : "closed";
+
+    Json::Value currencies(Json::arrayValue);
+    Json::Value commodities(Json::arrayValue);
+    std::string ts = util::nowIso8601();
+
     std::lock_guard<std::mutex> lk(mu_);
-    out.reserve(states_.size());
+    if (!lastSnapshotTs_.empty()) ts = lastSnapshotTs_;
+    out.flat.reserve(states_.size());
+
     for (const auto &kv : states_) {
         const PairState &s = kv.second;
         if (!s.hasPrice) continue;
+
         FlatPair fp;
         fp.pair = s.canonical;
         fp.name = s.name;
@@ -86,45 +95,33 @@ std::vector<FlatPair> MarketHub::snapshotFlat() const {
         fp.hasChange = s.hasChange;
         fp.bid = s.bid;
         fp.ask = s.ask;
-        out.push_back(std::move(fp));
+        out.flat.push_back(std::move(fp));
+
+        Json::Value item(Json::objectValue);
+        item["pair"] = s.canonical;
+        item["price"] = s.price;
+        if (s.hasChange) item["change"] = s.change;
+        else item["change"] = Json::Value::null;
+        item["bid"] = s.hasBid ? Json::Value(s.bid) : Json::Value::null;
+        item["ask"] = s.hasAsk ? Json::Value(s.ask) : Json::Value::null;
+        item["common_name"] = s.name;
+        item["source"] = s.group;
+        if (s.group == "currencies")
+            currencies.append(item);
+        else
+            commodities.append(item);
     }
+
+    Json::Value pairs(Json::objectValue);
+    pairs["currencies"] = currencies;
+    pairs["commodities"] = commodities;
+    (*out.grouped)["pairs"] = pairs;
+    (*out.grouped)["ts"] = ts;
     return out;
 }
 
 std::shared_ptr<Json::Value> MarketHub::buildGroupedSnapshot() const {
-    auto snap = std::make_shared<Json::Value>();
-    (*snap)["market_status"] = util::isForexMarketOpen() ? "open" : "closed";
-    Json::Value pairs(Json::objectValue);
-    Json::Value currencies(Json::arrayValue);
-    Json::Value commodities(Json::arrayValue);
-
-    std::string ts = util::nowIso8601();
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!lastSnapshotTs_.empty()) ts = lastSnapshotTs_;
-        for (const auto &kv : states_) {
-            const PairState &s = kv.second;
-            if (!s.hasPrice) continue;
-            Json::Value item(Json::objectValue);
-            item["pair"] = s.canonical;
-            item["price"] = s.price;
-            if (s.hasChange) item["change"] = s.change;
-            else item["change"] = Json::Value::null;
-            item["bid"] = s.hasBid ? Json::Value(s.bid) : Json::Value::null;
-            item["ask"] = s.hasAsk ? Json::Value(s.ask) : Json::Value::null;
-            item["common_name"] = s.name;
-            item["source"] = s.group;
-            if (s.group == "currencies")
-                currencies.append(item);
-            else
-                commodities.append(item);
-        }
-    }
-    pairs["currencies"] = currencies;
-    pairs["commodities"] = commodities;
-    (*snap)["pairs"] = pairs;
-    (*snap)["ts"] = ts;
-    return snap;
+    return buildSnapshot().grouped;
 }
 
 bool MarketHub::latestPrice(const std::string &canonicalPair, double &out) const {
@@ -192,37 +189,19 @@ void MarketHub::tick() {
         return;
     }
 
-    auto grouped = buildGroupedSnapshot();
-    std::string ts = (*grouped)["ts"].asString();
+    auto bundle = buildSnapshot();
+    std::string ts = util::nowIso8601();
     {
         std::lock_guard<std::mutex> lk(mu_);
-        lastSnapshotTs_ = util::nowIso8601();
-        ts = lastSnapshotTs_;
+        lastSnapshotTs_ = ts;
     }
-    (*grouped)["ts"] = ts;
+    (*bundle.grouped)["ts"] = ts;
     snapshotFailureCount_.store(0);
 
-    // Publish flat snapshot to Redis for archival/cache.
-    if (redis_) {
-        Json::Value flat(Json::objectValue);
-        flat["ts"] = ts;
-        Json::Value arr(Json::arrayValue);
-        for (const auto &fp : snapshotFlat()) {
-            Json::Value item(Json::objectValue);
-            item["pair"] = fp.pair;
-            item["price"] = fp.price;
-            if (fp.hasChange) item["change"] = fp.change;
-            item["source"] = fp.group;
-            arr.append(item);
-        }
-        flat["pairs"] = arr;
-        Json::StreamWriterBuilder wb;
-        wb["indentation"] = "";
-        redis_->publishSnapshot(Json::writeString(wb, flat));
+    if (broadcastSink_) broadcastSink_(bundle.grouped);
+    if (alertSink_) {
+        alertSink_(std::make_shared<std::vector<FlatPair>>(std::move(bundle.flat)));
     }
-
-    if (broadcastSink_) broadcastSink_(grouped);
-    if (alertSink_) alertSink_(std::make_shared<std::vector<FlatPair>>(snapshotFlat()));
 
     persistMetricIfDue("healthy");
 }

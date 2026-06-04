@@ -185,6 +185,7 @@ void CandleAlertMonitor::onSpot(const ctrader::SpotUpdate &update) {
 }
 
 void CandleAlertMonitor::pollFallback() {
+    if (!cfg_ || !cfg_->pollFallbackEnabled) return;
     if (!ctrader_ || !ctrader_->isReady() || !util::isForexMarketOpen() || !alerts_) return;
 
     auto active = alerts_->getActiveAlerts();

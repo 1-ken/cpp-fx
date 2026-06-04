@@ -478,6 +478,19 @@ std::vector<std::string> PostgresService::listFavorites(const std::string &userI
     return out;
 }
 
+std::vector<std::string> PostgresService::listAllFavoritePairs() const {
+    std::vector<std::string> out;
+    if (!client_) return out;
+    try {
+        auto r = client_->execSqlSync(
+            "SELECT DISTINCT pair FROM user_favorites ORDER BY pair ASC");
+        for (const auto &row : r) out.push_back(row["pair"].as<std::string>());
+    } catch (const std::exception &e) {
+        LOG_ERROR << "listAllFavoritePairs failed: " << e.what();
+    }
+    return out;
+}
+
 void PostgresService::addFavorite(const std::string &userId, const std::string &pair) {
     if (!client_) throw std::runtime_error("Database unavailable");
     client_->execSqlSync(

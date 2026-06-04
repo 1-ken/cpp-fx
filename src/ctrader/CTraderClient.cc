@@ -172,9 +172,14 @@ void CTraderClient::handleFrame(const std::string &payload) {
         if (cfg_.subscribeAllSymbols) {
             if (cfg_.maxSubscribedSymbols > 0 &&
                 ids.size() > static_cast<size_t>(cfg_.maxSubscribedSymbols)) {
-                ids.resize(cfg_.maxSubscribedSymbols);
+                ids.resize(static_cast<size_t>(cfg_.maxSubscribedSymbols));
             }
             subscribeSpotsBatched(ids);
+            subscribedSpotIds_ = ids;
+        } else if (!pendingSpotIds_.empty()) {
+            subscribeSpotsBatched(pendingSpotIds_);
+            subscribedSpotIds_ = pendingSpotIds_;
+            pendingSpotIds_.clear();
         }
         state_ = State::Ready;
         ready_.store(true);
@@ -272,6 +277,19 @@ void CTraderClient::sendSymbolsListReq() {
     req.set_ctidtraderaccountid(cfg_.accountId);
     req.set_includearchivedsymbols(cfg_.includeArchivedSymbols);
     sendFramed(frame(req));
+}
+
+void CTraderClient::refreshSpotSubscriptions(std::vector<int64_t> symbolIds) {
+    if (!loop_) return;
+    loop_->queueInLoop([this, ids = std::move(symbolIds)]() mutable {
+        if (!ready_.load() || state_ != State::Ready) {
+            pendingSpotIds_ = std::move(ids);
+            return;
+        }
+        if (ids == subscribedSpotIds_) return;
+        subscribeSpotsBatched(ids);
+        subscribedSpotIds_ = std::move(ids);
+    });
 }
 
 void CTraderClient::subscribeSpotsBatched(const std::vector<int64_t> &ids) {

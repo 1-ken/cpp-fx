@@ -54,7 +54,7 @@ Json::Value buildFormingCandle(double price, const std::string &interval) {
     return c;
 }
 
-Json::Value enrich(const Json::Value &grouped, const WsConnContext &ctx) {
+Json::Value enrich(const Json::Value &grouped, WsConnContext &ctx) {
     auto &app = core::AppContext::instance();
     Json::Value payload = grouped;  // deep copy
 
@@ -82,16 +82,22 @@ Json::Value enrich(const Json::Value &grouped, const WsConnContext &ctx) {
     }
 
     if (!ctx.hasStreamParams && app.alerts) {
-        Json::Value alerts(Json::objectValue);
-        Json::Value active(Json::arrayValue);
-        for (const auto &a : app.alerts->getActiveAlertsForUser(ctx.userId))
-            active.append(a.toJson());
-        Json::Value triggered(Json::arrayValue);
-        for (const auto &a : app.alerts->getAllAlertsForUser(ctx.userId))
-            if (a.status == "triggered") triggered.append(a.toJson());
-        alerts["active"] = active;
-        alerts["triggered"] = triggered;
-        payload["alerts"] = alerts;
+        uint64_t rev = app.alerts->userAlertsRevision(ctx.userId);
+        if (rev != ctx.lastAlertsRevision || !ctx.hasCachedAlerts) {
+            Json::Value alerts(Json::objectValue);
+            Json::Value active(Json::arrayValue);
+            for (const auto &a : app.alerts->getActiveAlertsForUser(ctx.userId))
+                active.append(a.toJson());
+            Json::Value triggered(Json::arrayValue);
+            for (const auto &a : app.alerts->getAllAlertsForUser(ctx.userId))
+                if (a.status == "triggered") triggered.append(a.toJson());
+            alerts["active"] = active;
+            alerts["triggered"] = triggered;
+            ctx.lastAlertsRevision = rev;
+            ctx.cachedAlerts = alerts;
+            ctx.hasCachedAlerts = true;
+        }
+        payload["alerts"] = ctx.cachedAlerts;
     }
 
     Json::Value stream(Json::objectValue);

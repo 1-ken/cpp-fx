@@ -104,6 +104,8 @@ void addFavorite(const HttpRequestPtr &req,
                 Json::Value v;
                 v["pairs"] = Json::Value(Json::arrayValue);
                 for (const auto &p : pg.listFavorites(uid)) v["pairs"].append(p);
+                if (AppContext::instance().refreshSubscriptions)
+                    AppContext::instance().refreshSubscriptions();
                 cb(jsonResp(v));
             } catch (const std::exception &e) {
                 core::logApiOutcome("favorites", "add", false, 500, e.what(), uid);
@@ -139,6 +141,8 @@ void removeFavorite(const HttpRequestPtr &req,
                 Json::Value v;
                 v["pairs"] = Json::Value(Json::arrayValue);
                 for (const auto &p : pg.listFavorites(uid)) v["pairs"].append(p);
+                if (AppContext::instance().refreshSubscriptions)
+                    AppContext::instance().refreshSubscriptions();
                 cb(jsonResp(v));
             } catch (const std::exception &e) {
                 core::logApiOutcome("favorites", "remove", false, 500, e.what(), uid);
