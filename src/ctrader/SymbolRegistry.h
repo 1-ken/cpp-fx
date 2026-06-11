@@ -21,8 +21,9 @@ class SymbolRegistry {
     bool has(int64_t id) const;
     std::string nameForId(int64_t id) const;          // raw broker name (EUR/USD)
     std::string canonicalForId(int64_t id) const;      // EURUSD
-    std::string groupForId(int64_t id) const;          // "currencies"/"commodities"
+    std::string groupForId(int64_t id) const;          // "currencies"/"commodities"/"indices"
     std::optional<int64_t> idForCanonical(const std::string &canonical) const;
+    std::optional<int64_t> resolveId(const std::string &pair) const;
 
     std::vector<SymbolInfo> all() const;
     std::vector<int64_t> enabledIds() const;

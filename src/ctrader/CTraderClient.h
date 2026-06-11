@@ -73,6 +73,7 @@ class CTraderClient {
     void sendAccountAuth();
     void sendSymbolsListReq();
     void subscribeSpotsBatched(const std::vector<int64_t> &ids);
+    void unsubscribeSpotsBatched(const std::vector<int64_t> &ids);
     void sendHeartbeat();
     void sendFramed(const std::string &framed);
 

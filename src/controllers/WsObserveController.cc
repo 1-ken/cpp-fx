@@ -12,6 +12,7 @@
 #include "ctrader/CTraderClient.h"
 #include "ctrader/SymbolRegistry.h"
 #include "market/MarketHub.h"
+#include "util/FormingCandle.h"
 #include "util/PairNormalizer.h"
 #include "util/TimeUtil.h"
 
@@ -31,36 +32,45 @@ std::string toJsonString(const Json::Value &v) {
     return Json::writeString(wb, v);
 }
 
-Json::Value buildFormingCandle(double price, const std::string &interval) {
-    int ivSec = util::intervalToSeconds(interval);
-    if (ivSec == 0) ivSec = 60;
-    std::time_t now = std::time(nullptr);
-    long long bucket = (static_cast<long long>(now) / ivSec) * ivSec;
-    std::time_t bucketEnd = static_cast<std::time_t>(bucket + ivSec);
-    double timeIn = static_cast<double>(now - bucket);
-    Json::Value c(Json::objectValue);
-    c["timestamp"] = util::toIso8601(static_cast<std::time_t>(bucket));
-    c["open"] = price;
-    c["high"] = price;
-    c["low"] = price;
-    c["close"] = price;
-    c["volume"] = 1;
-    c["is_forming"] = true;
-    c["interval"] = interval;
-    c["expected_open"] = util::toIso8601(static_cast<std::time_t>(bucket));
-    c["expected_close"] = util::toIso8601(bucketEnd);
-    c["progress_percent"] = (timeIn / ivSec) * 100.0;
-    c["time_remaining_seconds"] = static_cast<double>(ivSec) - timeIn;
-    return c;
+Json::Value buildFormingForPair(const std::string &canon,
+                                const std::string &interval,
+                                market::MarketHub *hub) {
+    if (!hub) return Json::Value::null;
+    double price = 0;
+    if (!hub->latestPrice(canon, price)) return Json::Value::null;
+
+    ctrader::TrendbarData cached{};
+    const ctrader::TrendbarData *lastBar = nullptr;
+    if (hub->cachedTrendbar(canon, interval, cached)) {
+        lastBar = &cached;
+    }
+
+    if (lastBar) {
+        return util::buildFormingCandleMerged(price, interval, lastBar, nullptr);
+    }
+    return util::buildFormingCandleFromSpot(price, interval);
 }
 
 Json::Value enrich(const Json::Value &grouped, WsConnContext &ctx) {
     auto &app = core::AppContext::instance();
     Json::Value payload = grouped;  // deep copy
 
+    Json::Value topForming(Json::nullValue);
+    double chartLivePrice = 0;
+    bool hasChartLivePrice = false;
+
     // Optional pair filter + forming candle enrichment.
     if (ctx.pairCanon) {
         const std::string canon = *ctx.pairCanon;
+        Json::Value forming = buildFormingForPair(canon, ctx.interval, app.hub);
+        if (!forming.isNull()) {
+            topForming = forming;
+            chartLivePrice = forming.get("close", 0.0).asDouble();
+            hasChartLivePrice = true;
+        } else if (app.hub && app.hub->latestPrice(canon, chartLivePrice)) {
+            hasChartLivePrice = true;
+        }
+
         Json::Value filtered(Json::objectValue);
         for (const std::string &group : {std::string("currencies"), std::string("commodities")}) {
             Json::Value matched(Json::arrayValue);
@@ -68,10 +78,8 @@ Json::Value enrich(const Json::Value &grouped, WsConnContext &ctx) {
                 for (const auto &item : payload["pairs"][group]) {
                     if (util::canonicalPair(item.get("pair", "").asString()) != canon) continue;
                     Json::Value enriched = item;
-                    double price = 0;
-                    if (app.hub && app.hub->latestPrice(canon, price)) {
-                        Json::Value fc = buildFormingCandle(price, ctx.interval);
-                        for (const auto &k : fc.getMemberNames()) enriched[k] = fc[k];
+                    if (!forming.isNull()) {
+                        for (const auto &k : forming.getMemberNames()) enriched[k] = forming[k];
                     }
                     matched.append(enriched);
                 }
@@ -79,6 +87,14 @@ Json::Value enrich(const Json::Value &grouped, WsConnContext &ctx) {
             filtered[group] = matched;
         }
         payload["pairs"] = filtered;
+
+        if (ctx.hasStreamParams) {
+            payload["forming_candle"] = topForming;
+            payload["has_forming_candle"] = !topForming.isNull();
+            if (hasChartLivePrice) {
+                payload["chart_live_price"] = chartLivePrice;
+            }
+        }
     }
 
     if (!ctx.hasStreamParams && app.alerts) {

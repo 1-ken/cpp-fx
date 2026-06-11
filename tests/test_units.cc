@@ -3,6 +3,9 @@
 #include <iostream>
 #include <string>
 
+#include "core/Config.h"
+#include "ctrader/SymbolRegistry.h"
+#include "market/AllowedPairs.h"
 #include "services/Notifier.h"
 #include "util/ForexMarketHours.h"
 #include "util/PairNormalizer.h"
@@ -80,6 +83,29 @@ static void testKenyaDateTime() {
     CHECK(util::formatKenyaDateTime("").empty());
 }
 
+static void testSymbolClassification() {
+    CHECK(ctrader::SymbolRegistry::classifyGroup("EURUSD") == "currencies");
+    CHECK(ctrader::SymbolRegistry::classifyGroup("US30") == "indices");
+    CHECK(ctrader::SymbolRegistry::classifyGroup("SpotCrude") == "commodities");
+    CHECK(ctrader::SymbolRegistry::classifyGroup("XAUUSD") == "currencies");
+}
+
+static void testAllowedPairs() {
+    core::Config cfg;
+    cfg.subscribedPairs = {"EURUSD", "GBPUSD", "US30", "SpotCrude", "XAUUSD"};
+    CHECK(market::hasExplicitPairList(cfg));
+    auto allowed = market::buildAllowedCanonicalSet(cfg);
+    CHECK(allowed.size() == 5);
+    CHECK(allowed.count("EURUSD") == 1);
+    CHECK(allowed.count("US30") == 1);
+    CHECK(market::isAllowedPair(cfg, "EUR/USD"));
+    CHECK(!market::isAllowedPair(cfg, "HG1"));
+
+    core::Config emptyCfg;
+    CHECK(!market::hasExplicitPairList(emptyCfg));
+    CHECK(market::isAllowedPair(emptyCfg, "HG1"));
+}
+
 static void testAlertNotificationFormat() {
     std::string sms = services::Notifier::formatAlertSms(
         "EURUSD", 1.0850, 1.0851, "above", "Entry zone reached", "price", "",
@@ -99,6 +125,8 @@ int main() {
     testMarketHours();
     testTimeRoundTrip();
     testKenyaDateTime();
+    testSymbolClassification();
+    testAllowedPairs();
     testAlertNotificationFormat();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";

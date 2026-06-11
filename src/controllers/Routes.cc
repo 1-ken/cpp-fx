@@ -34,6 +34,7 @@
 #include "services/PostgresService.h"
 #include "services/RedisService.h"
 #include "util/ForexMarketHours.h"
+#include "util/FormingCandle.h"
 #include "util/PairNormalizer.h"
 #include "util/TimeUtil.h"
 
@@ -415,8 +416,20 @@ void historicalOhlc(const HttpRequestPtr &req,
                 (*callback)(errResp("error", "Failed to query OHLC: " + res.error, 502));
                 return;
             }
+            std::time_t nowForFilter = std::time(nullptr);
+            long long bucketForFilter =
+                (static_cast<long long>(nowForFilter) / ivSec) * ivSec;
+            const long long bucketMinuteForFilter = bucketForFilter / 60;
+
             Json::Value candles(Json::arrayValue);
-            for (const auto &b : res.bars) candles.append(closedCandleJson(b, ivSec, false));
+            const ctrader::TrendbarData *inBucketBar = nullptr;
+            for (const auto &b : res.bars) {
+                if (!withForming && b.utcTimestampMinutes >= bucketMinuteForFilter) {
+                    inBucketBar = &b;
+                    continue;
+                }
+                candles.append(closedCandleJson(b, ivSec, false));
+            }
 
             Json::Value out;
             out["pair"] = pairOut;
@@ -425,6 +438,16 @@ void historicalOhlc(const HttpRequestPtr &req,
             out["end"] = endOpt ? Json::Value(util::toIso8601(*endOpt)) : Json::Value::null;
 
             if (!withForming) {
+                if (app.hub && inBucketBar) {
+                    app.hub->cacheTrendbar(canon, interval, *inBucketBar);
+                } else if (app.hub && !res.bars.empty()) {
+                    for (auto it = res.bars.rbegin(); it != res.bars.rend(); ++it) {
+                        if (it->utcTimestampMinutes >= bucketMinuteForFilter) {
+                            app.hub->cacheTrendbar(canon, interval, *it);
+                            break;
+                        }
+                    }
+                }
                 out["count"] = (int)candles.size();
                 out["candles"] = candles;
                 (*callback)(jsonResp(out));
@@ -458,38 +481,15 @@ void historicalOhlc(const HttpRequestPtr &req,
             Json::Value formingCandle(Json::nullValue);
             double livePrice = 0;
             if (app.hub && app.hub->latestPrice(canon, livePrice)) {
-                std::time_t bucketEnd = static_cast<std::time_t>(bucket + ivSec);
-                double timeIn = static_cast<double>(now - bucket);
-                double open = livePrice;
-                double high = livePrice;
-                double low = livePrice;
-                double close = livePrice;
-                if (lastBar) {
-                    open = lastBar->open;
-                    high = std::max({lastBar->high, livePrice});
-                    low = std::min({lastBar->low, livePrice});
-                    close = livePrice;
-                } else if (!res.bars.empty()) {
-                    const auto &prev = res.bars.back();
-                    open = prev.close;
-                    high = std::max({prev.high, livePrice});
-                    low = std::min({prev.low, livePrice});
-                    close = livePrice;
+                const ctrader::TrendbarData *prevClosed = nullptr;
+                if (!lastBar && !res.bars.empty()) {
+                    prevClosed = &res.bars.back();
                 }
-                std::time_t formingTs = static_cast<std::time_t>(bucketMinute * 60);
-                Json::Value fc;
-                fc["timestamp"] = util::toIso8601(formingTs);
-                fc["open"] = open;
-                fc["high"] = high;
-                fc["low"] = low;
-                fc["close"] = close;
-                fc["volume"] = 1;
-                fc["is_forming"] = true;
-                fc["expected_open"] = util::toIso8601(formingTs);
-                fc["expected_close"] = util::toIso8601(bucketEnd);
-                fc["progress_percent"] = (timeIn / static_cast<double>(ivSec)) * 100.0;
-                fc["time_remaining_seconds"] = static_cast<double>(ivSec) - timeIn;
-                formingCandle = fc;
+                formingCandle = util::buildFormingCandleMerged(
+                    livePrice, interval, lastBar, prevClosed);
+                if (lastBar && app.hub) {
+                    app.hub->cacheTrendbar(canon, interval, *lastBar);
+                }
                 hasForming = true;
             }
             out["closed_candles_count"] = closedCount;

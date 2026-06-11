@@ -6,6 +6,7 @@
 #include <trantor/utils/Logger.h>
 
 #include "core/Config.h"
+#include "market/AllowedPairs.h"
 #include "services/PostgresService.h"
 #include "util/ForexMarketHours.h"
 #include "util/PairNormalizer.h"
@@ -24,11 +25,15 @@ double monotonicSeconds() {
 }  // namespace
 
 MarketHub::MarketHub(const core::Config &cfg, ctrader::SymbolRegistry &registry)
-    : cfg_(cfg), registry_(registry) {}
+    : cfg_(cfg), registry_(registry) {
+    filterPairs_ = hasExplicitPairList(cfg_);
+    if (filterPairs_) allowedPairs_ = buildAllowedCanonicalSet(cfg_);
+}
 
 void MarketHub::onSpot(const ctrader::SpotUpdate &update) {
     std::string canonical = registry_.canonicalForId(update.symbolId);
     if (canonical.empty()) return;
+    if (filterPairs_ && allowedPairs_.count(canonical) == 0) return;
 
     std::lock_guard<std::mutex> lk(mu_);
     PairState &st = states_[update.symbolId];
@@ -75,8 +80,8 @@ SnapshotBundle MarketHub::buildSnapshot() const {
 
     Json::Value currencies(Json::arrayValue);
     Json::Value commodities(Json::arrayValue);
+    Json::Value indices(Json::arrayValue);
     std::string ts = util::nowIso8601();
-
     std::lock_guard<std::mutex> lk(mu_);
     if (!lastSnapshotTs_.empty()) ts = lastSnapshotTs_;
     out.flat.reserve(states_.size());
@@ -84,6 +89,7 @@ SnapshotBundle MarketHub::buildSnapshot() const {
     for (const auto &kv : states_) {
         const PairState &s = kv.second;
         if (!s.hasPrice) continue;
+        if (filterPairs_ && allowedPairs_.count(s.canonical) == 0) continue;
 
         FlatPair fp;
         fp.pair = s.canonical;
@@ -108,6 +114,8 @@ SnapshotBundle MarketHub::buildSnapshot() const {
         item["source"] = s.group;
         if (s.group == "currencies")
             currencies.append(item);
+        else if (s.group == "indices")
+            indices.append(item);
         else
             commodities.append(item);
     }
@@ -115,6 +123,7 @@ SnapshotBundle MarketHub::buildSnapshot() const {
     Json::Value pairs(Json::objectValue);
     pairs["currencies"] = currencies;
     pairs["commodities"] = commodities;
+    pairs["indices"] = indices;
     (*out.grouped)["pairs"] = pairs;
     (*out.grouped)["ts"] = ts;
     return out;
@@ -134,6 +143,27 @@ bool MarketHub::latestPrice(const std::string &canonicalPair, double &out) const
         }
     }
     return false;
+}
+
+void MarketHub::cacheTrendbar(const std::string &canonicalPair,
+                              const std::string &interval,
+                              const ctrader::TrendbarData &bar) {
+    std::string canon = util::canonicalPair(canonicalPair);
+    if (canon.empty()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    trendbarCache_[canon + ":" + interval] = bar;
+}
+
+bool MarketHub::cachedTrendbar(const std::string &canonicalPair,
+                               const std::string &interval,
+                               ctrader::TrendbarData &out) const {
+    std::string canon = util::canonicalPair(canonicalPair);
+    if (canon.empty()) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = trendbarCache_.find(canon + ":" + interval);
+    if (it == trendbarCache_.end()) return false;
+    out = it->second;
+    return true;
 }
 
 std::string MarketHub::lastSnapshotTs() const {

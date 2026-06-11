@@ -23,6 +23,7 @@ struct CTraderConfig {
     bool includeArchivedSymbols = false;
     bool subscribeAllSymbols = true;
     int maxSubscribedSymbols = 0;  // 0 = unlimited when subscribeAllSymbols
+    bool enforcePairAllowlist = false;  // set when subscribedPairs is non-empty
 
     std::string resolvedHost() const {
         return host == "demo" ? demoHost : liveHost;
@@ -80,6 +81,7 @@ struct Config {
 
     std::vector<std::string> majors = {"USD", "EUR", "JPY", "GBP",
                                        "AUD", "CAD", "CHF", "NZD"};
+    std::vector<std::string> subscribedPairs;
 
     // Auth
     std::string nextAuthSecret;

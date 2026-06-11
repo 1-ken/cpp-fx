@@ -9,6 +9,7 @@
 #include "alerts/AlertManager.h"
 #include "core/Config.h"
 #include "ctrader/CTraderClient.h"
+#include "market/AllowedPairs.h"
 #include "ctrader/SymbolRegistry.h"
 #include "ctrader/Types.h"
 #include "util/ForexMarketHours.h"
@@ -68,7 +69,10 @@ std::set<CandleAlertMonitor::SubKey> CandleAlertMonitor::requiredSubscriptions()
     for (const auto &a : alerts_->getActiveAlerts()) {
         if (a.alertType != "candle_close" || !a.interval) continue;
         if (!registry_) continue;
-        auto symId = registry_->idForCanonical(a.pair);
+        if (cfg_ && market::hasExplicitPairList(*cfg_) &&
+            !market::isAllowedPair(*cfg_, a.pair))
+            continue;
+        auto symId = registry_->resolveId(a.pair);
         if (!symId) continue;
         int period = util::intervalToTrendbarPeriod(*a.interval);
         if (period == 0) continue;

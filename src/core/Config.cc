@@ -195,6 +195,14 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
         }
     }
 
+    if (root.isMember("subscribedPairs") && root["subscribedPairs"].isArray()) {
+        c.subscribedPairs.clear();
+        for (const auto &p : root["subscribedPairs"]) {
+            if (p.isString()) c.subscribedPairs.push_back(p.asString());
+        }
+    }
+    c.ctrader.enforcePairAllowlist = !c.subscribedPairs.empty();
+
     // ---- Auth ----
     c.nextAuthSecret = envStr("NEXTAUTH_SECRET");
     c.authDisabled = envBool("AUTH_DISABLED", false);

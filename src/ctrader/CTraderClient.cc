@@ -50,6 +50,21 @@ std::vector<int64_t> idsNotYetSubscribed(const std::vector<int64_t> &sortedTarge
     return delta;
 }
 
+std::vector<int64_t> idsToUnsubscribe(const std::vector<int64_t> &sortedTarget,
+                                      const std::vector<int64_t> &sortedSubscribed) {
+    std::vector<int64_t> remove;
+    for (int64_t id : sortedSubscribed) {
+        if (!std::binary_search(sortedTarget.begin(), sortedTarget.end(), id)) {
+            remove.push_back(id);
+        }
+    }
+    return remove;
+}
+
+bool shouldSubscribeAllSymbols(const core::CTraderConfig &cfg) {
+    return cfg.subscribeAllSymbols && !cfg.enforcePairAllowlist;
+}
+
 }  // namespace
 
 CTraderClient::CTraderClient(const core::CTraderConfig &cfg) : cfg_(cfg) {
@@ -187,7 +202,7 @@ void CTraderClient::handleFrame(const std::string &payload) {
         LOG_INFO << "cTrader: received " << symbols.size() << " symbols";
         if (symbolsCb_) symbolsCb_(symbols);
 
-        if (cfg_.subscribeAllSymbols) {
+        if (shouldSubscribeAllSymbols(cfg_)) {
             if (cfg_.maxSubscribedSymbols > 0 &&
                 ids.size() > static_cast<size_t>(cfg_.maxSubscribedSymbols)) {
                 ids.resize(static_cast<size_t>(cfg_.maxSubscribedSymbols));
@@ -312,20 +327,20 @@ void CTraderClient::refreshSpotSubscriptions(std::vector<int64_t> symbolIds) {
             pendingSpotIds_ = std::move(ids);
             return;
         }
-        if (cfg_.subscribeAllSymbols) return;
+        if (shouldSubscribeAllSymbols(cfg_)) return;
         if (ids == subscribedSpotIds_) return;
 
-        std::vector<int64_t> delta = idsNotYetSubscribed(ids, subscribedSpotIds_);
-        if (delta.empty()) {
-            subscribedSpotIds_ = std::move(ids);
-            return;
-        }
-        subscribeSpotsBatched(delta);
-        subscribedSpotIds_ = sortedUniqueIds(std::move(ids));
+        std::vector<int64_t> toRemove =
+            idsToUnsubscribe(ids, subscribedSpotIds_);
+        std::vector<int64_t> toAdd = idsNotYetSubscribed(ids, subscribedSpotIds_);
+        if (!toRemove.empty()) unsubscribeSpotsBatched(toRemove);
+        if (!toAdd.empty()) subscribeSpotsBatched(toAdd);
+        subscribedSpotIds_ = std::move(ids);
     });
 }
 
 void CTraderClient::subscribeSpotsBatched(const std::vector<int64_t> &ids) {
+    if (ids.empty()) return;
     for (size_t off = 0; off < ids.size(); off += kSpotSubscribeBatch) {
         ProtoOASubscribeSpotsReq req;
         req.set_ctidtraderaccountid(cfg_.accountId);
@@ -334,6 +349,18 @@ void CTraderClient::subscribeSpotsBatched(const std::vector<int64_t> &ids) {
         sendFramed(frame(req));
     }
     LOG_INFO << "cTrader: subscribed to spots for " << ids.size() << " symbols";
+}
+
+void CTraderClient::unsubscribeSpotsBatched(const std::vector<int64_t> &ids) {
+    if (ids.empty()) return;
+    for (size_t off = 0; off < ids.size(); off += kSpotSubscribeBatch) {
+        ProtoOAUnsubscribeSpotsReq req;
+        req.set_ctidtraderaccountid(cfg_.accountId);
+        size_t end = std::min(off + kSpotSubscribeBatch, ids.size());
+        for (size_t i = off; i < end; ++i) req.add_symbolid(ids[i]);
+        sendFramed(frame(req));
+    }
+    LOG_INFO << "cTrader: unsubscribed from spots for " << ids.size() << " symbols";
 }
 
 void CTraderClient::subscribeLiveTrendbar(int64_t symbolId, int period) {

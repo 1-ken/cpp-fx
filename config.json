@@ -9,7 +9,7 @@
     "reconnectMaxDelaySeconds": 30.0,
     "requestTimeoutSeconds": 15.0,
     "includeArchivedSymbols": false,
-    "subscribeAllSymbols": true,
+    "subscribeAllSymbols": false,
     "maxSubscribedSymbols": 0
   },
   "server": {
@@ -49,5 +49,15 @@
   "notificationRetryDelaySeconds": 1.0,
   "notificationTimezone": "Africa/Nairobi",
   "retentionDays": 7,
-  "majors": ["USD", "EUR", "JPY", "GBP", "AUD", "CAD", "CHF", "NZD"]
+  "majors": ["USD", "EUR", "JPY", "GBP", "AUD", "CAD", "CHF", "NZD"],
+  "subscribedPairs": [
+    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
+    "EURGBP", "EURJPY", "EURCHF", "EURAUD", "EURCAD", "EURNZD",
+    "GBPJPY", "GBPCHF", "GBPAUD", "GBPCAD", "GBPNZD",
+    "AUDJPY", "AUDCAD", "AUDNZD", "CADJPY",
+    "USDTRY", "EURTRY", "USDZAR", "USDMXN", "USDPLN", "USDHUF", "USDBRL", "USDNOK", "USDSEK",
+    "VIX", "EURX", "JPYX", "USDX", "US30", "NAS100", "US500", "UK100", "AUS200",
+    "EUSTX50", "FRA40", "GER40", "HK50", "JPN225", "SPA35", "US2000", "CN50", "SWI20",
+    "XAUUSD", "XAGUSD", "SpotCrude", "SpotBrent", "NatGas"
+  ]
 }

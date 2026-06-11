@@ -69,7 +69,7 @@ int main() {
     notificationQueue.startDlqRetryLoop();
 
     auto refreshSubscriptions = [&]() {
-        if (cfg.ctrader.subscribeAllSymbols) return;
+        if (cfg.ctrader.subscribeAllSymbols && cfg.subscribedPairs.empty()) return;
         if (!ctrader.isReady()) return;
         auto ids = subscriptionPlanner.computeSymbolIds();
         ctrader.refreshSpotSubscriptions(std::move(ids));
@@ -94,11 +94,14 @@ int main() {
 
     ctrader.setSymbolsCallback([&](std::vector<ctrader::SymbolInfo> symbols) {
         registry.update(symbols);
-        if (!cfg.ctrader.subscribeAllSymbols) refreshSubscriptions();
+        if (!cfg.ctrader.subscribeAllSymbols || !cfg.subscribedPairs.empty())
+            refreshSubscriptions();
     });
     ctrader.setStateCallback([&](bool ready) {
         candleMonitor.onConnectionReady(ready);
-        if (ready && !cfg.ctrader.subscribeAllSymbols) refreshSubscriptions();
+        if (ready &&
+            (!cfg.ctrader.subscribeAllSymbols || !cfg.subscribedPairs.empty()))
+            refreshSubscriptions();
     });
     ctrader.setSpotCallback([&](const ctrader::SpotUpdate &u) {
         hub.onSpot(u);

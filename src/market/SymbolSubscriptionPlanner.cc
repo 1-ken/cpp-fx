@@ -9,6 +9,7 @@
 #include "alerts/AlertManager.h"
 #include "core/Config.h"
 #include "ctrader/SymbolRegistry.h"
+#include "market/AllowedPairs.h"
 #include "services/PostgresService.h"
 #include "util/PairNormalizer.h"
 
@@ -31,6 +32,28 @@ bool SymbolSubscriptionPlanner::isMajorForexPair(
 }
 
 std::vector<int64_t> SymbolSubscriptionPlanner::computeSymbolIds() const {
+    if (hasExplicitPairList(cfg_)) {
+        const auto allowed = buildAllowedCanonicalSet(cfg_);
+        std::vector<int64_t> ids;
+        ids.reserve(allowed.size());
+        size_t resolved = 0;
+        for (const auto &pair : allowed) {
+            auto id = registry_.resolveId(pair);
+            if (id) {
+                ids.push_back(*id);
+                ++resolved;
+            } else {
+                LOG_WARN << "Unresolved subscribed pair: " << pair;
+            }
+        }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        LOG_INFO << "Scoped spot subscriptions: " << ids.size() << " symbols ("
+                 << cfg_.subscribedPairs.size() << " pairs requested, " << resolved
+                 << " resolved)";
+        return ids;
+    }
+
     if (cfg_.ctrader.subscribeAllSymbols) {
         auto ids = registry_.enabledIds();
         if (cfg_.ctrader.maxSubscribedSymbols > 0 &&
@@ -63,7 +86,7 @@ std::vector<int64_t> SymbolSubscriptionPlanner::computeSymbolIds() const {
     std::vector<int64_t> ids;
     ids.reserve(pairs.size());
     for (const auto &p : pairs) {
-        auto id = registry_.idForCanonical(p);
+        auto id = registry_.resolveId(p);
         if (id) ids.push_back(*id);
     }
     std::sort(ids.begin(), ids.end());

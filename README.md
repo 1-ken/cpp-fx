@@ -118,7 +118,7 @@ Production runtime tuning comes from [`config.production.json`](config.productio
 
 | Setting | Production value |
 |---------|------------------|
-| Symbols | All broker symbols (`subscribeAllSymbols: true`, `maxSubscribedSymbols: 0`) |
+| Symbols | Curated 55-instrument list (`subscribedPairs` in config, `subscribeAllSymbols: false`) |
 | HTTP threads | `2` |
 | Notification workers | `2` |
 | Stream interval | `2s` |
@@ -169,7 +169,7 @@ cmake --build build -j1 --target ctraderplus_server
 - `curl -sS http://localhost:8000/health` → 200
 - Login latency under 1s
 - `ss -tlnp | grep 8000` → one `ctraderplus_server`
-- Logs show `threads=2` and full symbol subscription (~1600+ spots)
+- Logs show `threads=2` and scoped spot subscription (~55 symbols from `subscribedPairs`)
 - Test SMS alert contains `PAIR`, `TYPE`, `MESSAGE`, and time ending in `EAT`
 - `redis-cli LLEN fx:alerts:notifications:dlq` → 0 on success
 

@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <json/json.h>
@@ -70,6 +71,14 @@ class MarketHub {
 
     bool latestPrice(const std::string &canonicalPair, double &out) const;
 
+    /** Cache last in-bucket trend bar for WS forming-candle merge (key: pair:interval). */
+    void cacheTrendbar(const std::string &canonicalPair,
+                       const std::string &interval,
+                       const ctrader::TrendbarData &bar);
+    bool cachedTrendbar(const std::string &canonicalPair,
+                        const std::string &interval,
+                        ctrader::TrendbarData &out) const;
+
     std::string lastSnapshotTs() const;
     double lastSnapshotAgeSeconds() const;
     int snapshotFailureCount() const { return snapshotFailureCount_.load(); }
@@ -110,11 +119,14 @@ class MarketHub {
 
     mutable std::mutex mu_;
     std::map<int64_t, PairState> states_;
+    std::map<std::string, ctrader::TrendbarData> trendbarCache_;
     std::string lastSnapshotTs_;
     std::atomic<int> snapshotFailureCount_{0};
     std::atomic<int> activeWs_{0};
     bool marketClosedLogged_ = false;
     double lastMetricsPersistMonotonic_ = 0;
+    bool filterPairs_ = false;
+    std::unordered_set<std::string> allowedPairs_;
 };
 
 }  // namespace ctraderplus::market
