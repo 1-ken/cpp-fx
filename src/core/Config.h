@@ -24,6 +24,9 @@ struct CTraderConfig {
     bool subscribeAllSymbols = true;
     int maxSubscribedSymbols = 0;  // 0 = unlimited when subscribeAllSymbols
     bool enforcePairAllowlist = false;  // set when subscribedPairs is non-empty
+    int reconnectCircuitBreakerThreshold = 50;
+    double reconnectCircuitBreakerWindowSeconds = 300.0;
+    double reconnectCircuitBreakerCooldownSeconds = 600.0;
 
     std::string resolvedHost() const {
         return host == "demo" ? demoHost : liveHost;
@@ -45,6 +48,7 @@ struct Config {
     double streamIntervalSeconds = 1.0;
     double snapshotTimeoutSeconds = 30.0;
     double wsSendTimeoutSeconds = 3.0;
+    int wsMaxConnectionsPerIp = 0;  // 0 = unlimited
     double alertActionTimeoutSeconds = 8.0;
     int maxSnapshotFailures = 4;
     double staleSnapshotSeconds = 5.0;

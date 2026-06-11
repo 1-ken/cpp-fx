@@ -1,7 +1,12 @@
 #include "ctrader/CTraderClient.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <random>
+
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 
 #include <trantor/utils/Logger.h>
 
@@ -65,6 +70,19 @@ bool shouldSubscribeAllSymbols(const core::CTraderConfig &cfg) {
     return cfg.subscribeAllSymbols && !cfg.enforcePairAllowlist;
 }
 
+double monotonicSeconds() {
+    return std::chrono::duration<double>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+double jitteredDelay(double base, double maxDelay) {
+    static thread_local std::mt19937 rng(
+        static_cast<uint32_t>(monotonicSeconds() * 1000.0));
+    std::uniform_real_distribution<double> dist(0.0, base * 0.2);
+    return std::min(base + dist(rng), maxDelay);
+}
+
 }  // namespace
 
 CTraderClient::CTraderClient(const core::CTraderConfig &cfg) : cfg_(cfg) {
@@ -115,23 +133,56 @@ void CTraderClient::connect() {
         [this](const trantor::TcpConnectionPtr &c, trantor::MsgBuffer *b) {
             onMessage(c, b);
         });
+    client_->setConnectionErrorCallback([this]() {
+        LOG_WARN << "cTrader: connection error";
+        scheduleReconnect();
+    });
+    client_->setSockOptCallback([](int fd) {
+        int on = 1;
+        ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+#ifdef TCP_KEEPIDLE
+        int idle = 60;
+        int interval = 10;
+        int count = 3;
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+#endif
+    });
     LOG_INFO << "cTrader: connecting to " << cfg_.resolvedHost() << ":" << cfg_.port
              << " (" << ip << ")";
     client_->connect();
 }
 
-void CTraderClient::scheduleReconnect() {
+void CTraderClient::scheduleReconnect(double minDelaySeconds) {
     if (stopping_.load()) return;
-    double delay = reconnectDelay_;
+    if (reconnectScheduled_.exchange(true)) return;
+
+    double now = monotonicSeconds();
+    if (circuitBreakerUntil_ > now) {
+        double delay = circuitBreakerUntil_ - now;
+        LOG_ERROR << "cTrader: circuit breaker open; reconnect paused for " << delay << "s";
+        loop_->runAfter(delay, [this]() {
+            reconnectScheduled_.store(false);
+            connect();
+        });
+        return;
+    }
+
+    noteReconnectAttempt();
+    double delay = jitteredDelay(reconnectDelay_, cfg_.reconnectMaxDelaySeconds);
+    delay = std::max(delay, minDelaySeconds);
     reconnectDelay_ = std::min(reconnectDelay_ * 2.0, cfg_.reconnectMaxDelaySeconds);
     LOG_INFO << "cTrader: reconnecting in " << delay << "s";
-    loop_->runAfter(delay, [this]() { connect(); });
+    loop_->runAfter(delay, [this]() {
+        reconnectScheduled_.store(false);
+        connect();
+    });
 }
 
 void CTraderClient::onConnection(const trantor::TcpConnectionPtr &conn) {
     if (conn->connected()) {
         conn_ = conn;
-        reconnectDelay_ = cfg_.reconnectBaseDelaySeconds;
         state_ = State::AppAuth;
         LOG_INFO << "cTrader: TCP/TLS connected; authenticating application";
         sendApplicationAuth();
@@ -139,6 +190,9 @@ void CTraderClient::onConnection(const trantor::TcpConnectionPtr &conn) {
         LOG_WARN << "cTrader: disconnected";
         conn_.reset();
         ready_.store(false);
+        state_ = State::Disconnected;
+        subscribedSpotIds_.clear();
+        pendingTrendbars_.clear();
         if (stateCb_) stateCb_(false);
         scheduleReconnect();
     }
@@ -171,6 +225,23 @@ void CTraderClient::handleFrame(const std::string &payload) {
 
     if (type == PROTO_OA_APPLICATION_AUTH_RES) {
         LOG_INFO << "cTrader: application authenticated";
+        if (!cfg_.refreshToken.empty()) {
+            state_ = State::RefreshingToken;
+            sendRefreshToken();
+        } else {
+            state_ = State::AccountAuth;
+            sendAccountAuth();
+        }
+        return;
+    }
+    if (type == PROTO_OA_REFRESH_TOKEN_RES) {
+        ProtoOARefreshTokenRes res;
+        res.ParseFromString(inner);
+        cfg_.accessToken = res.accesstoken();
+        if (res.has_refreshtoken() && !res.refreshtoken().empty()) {
+            cfg_.refreshToken = res.refreshtoken();
+        }
+        LOG_INFO << "cTrader: access token refreshed";
         state_ = State::AccountAuth;
         sendAccountAuth();
         return;
@@ -218,6 +289,7 @@ void CTraderClient::handleFrame(const std::string &payload) {
         }
         state_ = State::Ready;
         ready_.store(true);
+        resetBackoffOnReady();
         if (stateCb_) stateCb_(true);
         return;
     }
@@ -264,13 +336,13 @@ void CTraderClient::handleFrame(const std::string &payload) {
     if (type == PROTO_OA_ERROR_RES) {
         ProtoOAErrorRes err;
         err.ParseFromString(inner);
-        const bool alreadySubscribed = err.errorcode() == "ALREADY_SUBSCRIBED";
-        if (alreadySubscribed) {
+        const std::string code = err.errorcode();
+        uint64_t retryAfterMs = err.has_retryafter() ? err.retryafter() : 0;
+        if (code == "ALREADY_SUBSCRIBED") {
             LOG_DEBUG << "cTrader: already subscribed (ignored)";
         } else {
-            LOG_WARN << "cTrader: error " << err.errorcode() << " - " << err.description();
+            handleOaError(code, err.description(), retryAfterMs);
         }
-        // Fail any pending request that carried this clientMsgId.
         const std::string id = envelope.clientmsgid();
         auto it = pendingTrendbars_.find(id);
         if (it != pendingTrendbars_.end()) {
@@ -280,7 +352,7 @@ void CTraderClient::handleFrame(const std::string &payload) {
             pendingTrendbars_.erase(it);
             TrendbarsResult result;
             result.ok = false;
-            result.error = err.errorcode() + ": " + err.description();
+            result.error = code + ": " + err.description();
             if (cb) cb(std::move(result));
         }
         return;
@@ -290,9 +362,10 @@ void CTraderClient::handleFrame(const std::string &payload) {
     }
     if (type == PROTO_OA_ACCOUNTS_TOKEN_INVALIDATED_EVENT ||
         type == PROTO_OA_CLIENT_DISCONNECT_EVENT) {
-        LOG_ERROR << "cTrader: session invalidated by server; will reconnect";
+        LOG_ERROR << "cTrader: session invalidated by server; forcing reconnect";
         ready_.store(false);
         if (stateCb_) stateCb_(false);
+        forceDisconnectAndReconnect(5.0);
         return;
     }
     // Other payload types are ignored for this read-only market data client.
@@ -305,7 +378,14 @@ void CTraderClient::sendApplicationAuth() {
     sendFramed(frame(req));
 }
 
+void CTraderClient::sendRefreshToken() {
+    ProtoOARefreshTokenReq req;
+    req.set_refreshtoken(cfg_.refreshToken);
+    sendFramed(frame(req));
+}
+
 void CTraderClient::sendAccountAuth() {
+    if (outboundPaused()) return;
     ProtoOAAccountAuthReq req;
     req.set_ctidtraderaccountid(cfg_.accountId);
     req.set_accesstoken(cfg_.accessToken);
@@ -340,13 +420,36 @@ void CTraderClient::refreshSpotSubscriptions(std::vector<int64_t> symbolIds) {
 }
 
 void CTraderClient::subscribeSpotsBatched(const std::vector<int64_t> &ids) {
-    if (ids.empty()) return;
-    for (size_t off = 0; off < ids.size(); off += kSpotSubscribeBatch) {
+    if (ids.empty() || outboundPaused()) return;
+    const bool stagger =
+        lastRateLimitAt_ > 0 && (monotonicSeconds() - lastRateLimitAt_) < 120.0;
+    const size_t batchCount =
+        (ids.size() + kSpotSubscribeBatch - 1) / kSpotSubscribeBatch;
+
+    auto sendOneBatch = [this](const std::vector<int64_t> &all, size_t off) {
+        if (outboundPaused()) return;
         ProtoOASubscribeSpotsReq req;
         req.set_ctidtraderaccountid(cfg_.accountId);
-        size_t end = std::min(off + kSpotSubscribeBatch, ids.size());
-        for (size_t i = off; i < end; ++i) req.add_symbolid(ids[i]);
+        size_t end = std::min(off + kSpotSubscribeBatch, all.size());
+        for (size_t i = off; i < end; ++i) req.add_symbolid(all[i]);
         sendFramed(frame(req));
+    };
+
+    if (!stagger || batchCount <= 1) {
+        for (size_t off = 0; off < ids.size(); off += kSpotSubscribeBatch) {
+            sendOneBatch(ids, off);
+        }
+    } else {
+        auto idsCopy = std::make_shared<std::vector<int64_t>>(ids);
+        for (size_t batch = 0; batch < batchCount; ++batch) {
+            size_t off = batch * kSpotSubscribeBatch;
+            double delay = static_cast<double>(batch) * 0.2;
+            loop_->runAfter(delay, [this, idsCopy, off, sendOneBatch]() {
+                sendOneBatch(*idsCopy, off);
+            });
+        }
+        LOG_INFO << "cTrader: staggering spot subscribe across " << batchCount
+                 << " batches (recent rate limit)";
     }
     LOG_INFO << "cTrader: subscribed to spots for " << ids.size() << " symbols";
 }
@@ -401,6 +504,83 @@ void CTraderClient::sendFramed(const std::string &framed) {
 
 std::string CTraderClient::nextClientMsgId() {
     return "req-" + std::to_string(++msgIdCounter_);
+}
+
+std::string CTraderClient::lastErrorCode() const {
+    std::lock_guard<std::mutex> lk(statsMu_);
+    return lastErrorCode_;
+}
+
+bool CTraderClient::circuitBreakerOpen() const {
+    return circuitBreakerUntil_ > monotonicSeconds();
+}
+
+bool CTraderClient::outboundPaused() const {
+    return outboundPausedUntil_ > monotonicSeconds();
+}
+
+void CTraderClient::resetBackoffOnReady() {
+    reconnectDelay_ = cfg_.reconnectBaseDelaySeconds;
+    reconnectAttemptsInWindow_ = 0;
+    reconnectWindowStart_ = std::chrono::steady_clock::now();
+    circuitBreakerUntil_ = 0;
+}
+
+void CTraderClient::noteReconnectAttempt() {
+    ++reconnectCount_;
+    auto now = std::chrono::steady_clock::now();
+    double windowSec = cfg_.reconnectCircuitBreakerWindowSeconds;
+    if (std::chrono::duration<double>(now - reconnectWindowStart_).count() > windowSec) {
+        reconnectWindowStart_ = now;
+        reconnectAttemptsInWindow_ = 0;
+    }
+    if (++reconnectAttemptsInWindow_ >= cfg_.reconnectCircuitBreakerThreshold) {
+        circuitBreakerUntil_ =
+            monotonicSeconds() + cfg_.reconnectCircuitBreakerCooldownSeconds;
+        LOG_ERROR << "cTrader: circuit breaker opened after "
+                  << reconnectAttemptsInWindow_ << " reconnect attempts in "
+                  << windowSec << "s";
+        reconnectAttemptsInWindow_ = 0;
+        reconnectWindowStart_ = now;
+    }
+}
+
+void CTraderClient::handleOaError(const std::string &code, const std::string &description,
+                                  uint64_t retryAfterMs) {
+    {
+        std::lock_guard<std::mutex> lk(statsMu_);
+        lastErrorCode_ = code;
+    }
+    LOG_WARN << "cTrader: error code=" << code << " description=" << description
+             << " retry_after_ms=" << retryAfterMs
+             << " account_id=" << cfg_.accountId;
+
+    if (code == "BLOCKED_PAYLOAD_TYPE") {
+        ++rateLimitCount_;
+        lastRateLimitAt_ = monotonicSeconds();
+        double pauseSec = std::max(60.0, static_cast<double>(retryAfterMs) / 1000.0);
+        outboundPausedUntil_ = monotonicSeconds() + pauseSec;
+        LOG_WARN << "cTrader: rate limited; pausing outbound requests for " << pauseSec << "s";
+        return;
+    }
+    if (code == "CANT_ROUTE_REQUEST") {
+        forceDisconnectAndReconnect(5.0);
+        return;
+    }
+    if (code == "CH_ACCESS_TOKEN_INVALID" || code == "OA_AUTH_TOKEN_EXPIRED") {
+        forceDisconnectAndReconnect(2.0);
+    }
+}
+
+void CTraderClient::forceDisconnectAndReconnect(double minDelaySeconds) {
+    subscribedSpotIds_.clear();
+    pendingTrendbars_.clear();
+    ready_.store(false);
+    state_ = State::Disconnected;
+    if (conn_) conn_->shutdown();
+    conn_.reset();
+    if (stateCb_) stateCb_(false);
+    scheduleReconnect(minDelaySeconds);
 }
 
 void CTraderClient::getTrendbars(int64_t symbolId, int period, int64_t fromMs,

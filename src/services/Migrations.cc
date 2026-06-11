@@ -144,6 +144,47 @@ void migrationUsersGoogleSub(const DbClientPtr &client) {
         "WHERE google_sub IS NOT NULL");
 }
 
+void migrationAlertsSchemaValidate(const DbClientPtr &client) {
+    client->execSqlSync("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS data JSONB");
+    client->execSqlSync(
+        "ALTER TABLE alerts ALTER COLUMN data SET DEFAULT '{}'::jsonb");
+
+    if (columnExists(client, "alerts", "channel")) {
+        migrateAlertsJsonb(client);
+    } else {
+        client->execSqlSync(
+            "UPDATE alerts SET data = '{}'::jsonb WHERE data IS NULL");
+    }
+}
+
+void migrationAlertsLegacyNullable(const DbClientPtr &client) {
+    // Python/Alembic legacy flat columns may still exist with NOT NULL constraints.
+    // JSONB upserts only write core columns + data; legacy columns must be nullable.
+    static const std::vector<std::pair<std::string, bool>> legacyCols = {
+        {"channel", false},
+        {"email", false},
+        {"phone", false},
+        {"custom_message", false},
+        {"triggered_at", false},
+        {"last_checked_price", false},
+        {"close_price", false},
+        {"target_price", false},
+        {"condition", false},
+        {"interval", true},
+        {"direction", false},
+        {"threshold", false},
+        {"last_evaluated_candle_time", false},
+    };
+    for (const auto &[col, quoted] : legacyCols) {
+        if (!columnExists(client, "alerts", col)) continue;
+        const std::string sqlCol = quoted ? "\"" + col + "\"" : col;
+        client->execSqlSync("ALTER TABLE alerts ALTER COLUMN " + sqlCol + " DROP NOT NULL");
+    }
+    if (columnExists(client, "alerts", "channel")) {
+        LOG_INFO << "Legacy alerts flat columns are nullable (JSONB upsert compatible)";
+    }
+}
+
 struct MigrationStep {
     int version;
     const char *name;
@@ -166,6 +207,35 @@ bool tableExists(const DbClientPtr &client, const std::string &table) {
     return r.size() > 0 && r[0]["ok"].as<bool>();
 }
 
+void validateApplicationSchema(const DbClientPtr &client) {
+    if (!tableExists(client, "alerts")) {
+        throw std::runtime_error("Schema validation failed: alerts table missing");
+    }
+    if (!columnExists(client, "alerts", "data")) {
+        throw std::runtime_error("Schema validation failed: alerts.data column missing");
+    }
+    const std::vector<std::string> required = {"id", "user_id", "pair", "status",
+                                               "alert_type", "created_at", "data"};
+    for (const auto &col : required) {
+        if (!columnExists(client, "alerts", col)) {
+            throw std::runtime_error("Schema validation failed: alerts." + col +
+                                     " column missing");
+        }
+    }
+    if (columnExists(client, "alerts", "channel")) {
+        auto r = client->execSqlSync(
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = 'alerts' "
+            "AND column_name = 'channel' LIMIT 1");
+        if (r.size() > 0 && r[0]["is_nullable"].as<std::string>() == "NO") {
+            throw std::runtime_error(
+                "Schema validation failed: alerts.channel is NOT NULL; "
+                "apply migration v5 alerts_legacy_nullable");
+        }
+    }
+    LOG_INFO << "PostgreSQL alerts schema validated (JSONB upsert compatible)";
+}
+
 // Infer how far a legacy Python/Alembic database already is (without touching
 // schema_migrations, which uses varchar version labels in that stack).
 int inferLegacySchemaVersion(const DbClientPtr &client) {
@@ -175,6 +245,16 @@ int inferLegacySchemaVersion(const DbClientPtr &client) {
     if (!columnExists(client, "alerts", "data")) return version;
     version = 2;
     if (columnExists(client, "users", "google_sub")) version = 3;
+    if (version >= 3 && columnExists(client, "alerts", "data")) version = 4;
+    if (version >= 4 && columnExists(client, "alerts", "channel")) {
+        auto r = client->execSqlSync(
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = 'alerts' "
+            "AND column_name = 'channel' LIMIT 1");
+        if (r.size() > 0 && r[0]["is_nullable"].as<std::string>() == "YES") version = 5;
+    } else if (version >= 4 && !columnExists(client, "alerts", "channel")) {
+        version = 5;
+    }
     return version;
 }
 
@@ -229,6 +309,8 @@ int runMigrations(const DbClientPtr &client) {
         {1, "baseline", migrationBaseline},
         {2, "alerts_jsonb", migrateAlertsJsonb},
         {3, "users_google_sub", migrationUsersGoogleSub},
+        {4, "alerts_schema_validate", migrationAlertsSchemaValidate},
+        {5, "alerts_legacy_nullable", migrationAlertsLegacyNullable},
     };
 
     int current = currentMigrationVersion(client);
@@ -251,6 +333,7 @@ int runMigrations(const DbClientPtr &client) {
         LOG_INFO << "Migration v" << step.version << " " << step.name << " applied";
     }
 
+    validateApplicationSchema(client);
     return appliedMax;
 }
 

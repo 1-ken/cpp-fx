@@ -13,6 +13,7 @@ namespace ctraderplus::controllers {
 
 struct WsConnContext {
     std::string userId;
+    std::string peerIp;
     std::string interval = "1m";
     std::optional<std::string> pairCanon;
     bool hasStreamParams = false;

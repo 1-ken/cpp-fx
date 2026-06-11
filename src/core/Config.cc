@@ -108,6 +108,15 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
         jbool(ct, "subscribeAllSymbols", c.ctrader.subscribeAllSymbols);
     c.ctrader.maxSubscribedSymbols =
         jint(ct, "maxSubscribedSymbols", c.ctrader.maxSubscribedSymbols);
+    c.ctrader.reconnectCircuitBreakerThreshold =
+        jint(ct, "reconnectCircuitBreakerThreshold",
+             c.ctrader.reconnectCircuitBreakerThreshold);
+    c.ctrader.reconnectCircuitBreakerWindowSeconds =
+        jnum(ct, "reconnectCircuitBreakerWindowSeconds",
+             c.ctrader.reconnectCircuitBreakerWindowSeconds);
+    c.ctrader.reconnectCircuitBreakerCooldownSeconds =
+        jnum(ct, "reconnectCircuitBreakerCooldownSeconds",
+             c.ctrader.reconnectCircuitBreakerCooldownSeconds);
 
     c.ctrader.clientId = envStr("CTRADER_CLIENT_ID");
     c.ctrader.clientSecret = envStr("CTRADER_CLIENT_SECRET");
@@ -145,6 +154,7 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
     c.streamIntervalSeconds = jnum(root, "streamIntervalSeconds", c.streamIntervalSeconds);
     c.snapshotTimeoutSeconds = jnum(root, "snapshotTimeoutSeconds", c.snapshotTimeoutSeconds);
     c.wsSendTimeoutSeconds = jnum(root, "wsSendTimeoutSeconds", c.wsSendTimeoutSeconds);
+    c.wsMaxConnectionsPerIp = jint(root, "wsMaxConnectionsPerIp", c.wsMaxConnectionsPerIp);
     c.alertActionTimeoutSeconds =
         jnum(root, "alertActionTimeoutSeconds", c.alertActionTimeoutSeconds);
     c.maxSnapshotFailures = jint(root, "maxSnapshotFailures", c.maxSnapshotFailures);

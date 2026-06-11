@@ -281,10 +281,10 @@ std::pair<int, int> PostgresService::deleteOldData(int daysToKeep) {
     return {hist, met};
 }
 
-void PostgresService::upsertAlert(const Json::Value &alert) {
-    if (!client_) return;
+bool PostgresService::upsertAlert(const Json::Value &alert) {
+    if (!client_) return false;
     std::string id = alert.get("id", "").asString();
-    if (id.empty()) return;
+    if (id.empty()) return false;
     std::string userId = alert.get("user_id", "legacy-unassigned").asString();
     std::string pair = alert.get("pair", "").asString();
     std::string status = alert.get("status", "active").asString();
@@ -293,29 +293,50 @@ void PostgresService::upsertAlert(const Json::Value &alert) {
     auto epoch = util::parseIso8601(createdAt);
     double epochSec = epoch ? static_cast<double>(*epoch)
                             : static_cast<double>(std::time(nullptr));
-    // The legacy alerts table has NOT NULL columns (channel/email/phone/custom_message)
-    // with no defaults, so they must be supplied on every insert.
-    std::string channel = alert.get("channel", "email").asString();
-    std::string email = alert.get("email", "").asString();
-    std::string phone = alert.get("phone", "").asString();
-    std::string customMessage = alert.get("custom_message", "").asString();
-    if (channel.empty()) channel = "email";
     Json::StreamWriterBuilder wb;
     wb["indentation"] = "";
     std::string data = Json::writeString(wb, alert);
-    try {
+
+    auto runUpsert = [&]() {
         client_->execSqlSync(
-            "INSERT INTO alerts(id, user_id, pair, status, alert_type, created_at, "
-            "channel, email, phone, custom_message, data) "
-            "VALUES($1,$2,$3,$4,$5,to_timestamp($6),$7,$8,$9,$10,$11::jsonb) "
+            "INSERT INTO alerts(id, user_id, pair, status, alert_type, created_at, data) "
+            "VALUES($1,$2,$3,$4,$5,to_timestamp($6),$7::jsonb) "
             "ON CONFLICT (id) DO UPDATE SET user_id=EXCLUDED.user_id, pair=EXCLUDED.pair, "
             "status=EXCLUDED.status, alert_type=EXCLUDED.alert_type, "
-            "channel=EXCLUDED.channel, email=EXCLUDED.email, phone=EXCLUDED.phone, "
-            "custom_message=EXCLUDED.custom_message, data=EXCLUDED.data",
-            id, userId, pair, status, alertType, epochSec, channel, email, phone,
-            customMessage, data);
+            "created_at=EXCLUDED.created_at, data=EXCLUDED.data",
+            id, userId, pair, status, alertType, epochSec, data);
+    };
+
+    try {
+        runUpsert();
+        return true;
     } catch (const std::exception &e) {
-        LOG_ERROR << "upsertAlert failed: " << e.what();
+        std::string msg = e.what();
+        if (msg.find("current transaction is aborted") != std::string::npos ||
+            msg.find("pipeline") != std::string::npos) {
+            try {
+                runUpsert();
+                return true;
+            } catch (const std::exception &e2) {
+                ++alertUpsertFailures_;
+                LOG_ERROR << "upsertAlert failed after retry: " << e2.what()
+                          << " alert_id=" << id;
+                return false;
+            }
+        }
+        ++alertUpsertFailures_;
+        LOG_ERROR << "upsertAlert failed: " << msg << " alert_id=" << id;
+        return false;
+    }
+}
+
+int PostgresService::countAlerts() const {
+    if (!client_) return 0;
+    try {
+        auto r = client_->execSqlSync("SELECT COUNT(*)::int AS n FROM alerts");
+        return r.empty() ? 0 : r[0]["n"].as<int>();
+    } catch (...) {
+        return 0;
     }
 }
 
@@ -585,7 +606,17 @@ Json::Value PostgresService::adminListUsers() {
         auto r = client_->execSqlSync(
             "SELECT u.user_id, COALESCE(u.username,'') AS username, u.email, u.auth_provider, "
             "to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, "
-            "(SELECT COUNT(*)::int FROM alerts a WHERE a.user_id=u.user_id) AS alert_count "
+            "(SELECT COUNT(*)::int FROM alerts a WHERE a.user_id=u.user_id) AS alert_count, "
+            "(SELECT COUNT(*)::int FROM alerts a WHERE a.user_id=u.user_id AND a.status='active') "
+            "AS active_alerts, "
+            "(SELECT COUNT(*)::int FROM alerts a WHERE a.user_id=u.user_id AND a.status='triggered') "
+            "AS triggered_alerts, "
+            "(SELECT COUNT(*)::int FROM user_favorites f WHERE f.user_id=u.user_id) AS favorites_count, "
+            "(SELECT COUNT(*)::int FROM user_activity_log al WHERE al.user_id=u.user_id) AS activity_count, "
+            "(SELECT to_char(MAX(al.created_at) AT TIME ZONE 'UTC', "
+            "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM user_activity_log al "
+            "WHERE al.user_id=u.user_id AND al.event_type IN ('login_success', 'google_oauth')) "
+            "AS last_login_at "
             "FROM users u ORDER BY u.created_at DESC LIMIT 500");
         for (const auto &row : r) {
             Json::Value u;
@@ -598,6 +629,14 @@ Json::Value PostgresService::adminListUsers() {
             u["auth_provider"] = row["auth_provider"].as<std::string>();
             u["created_at"] = row["created_at"].as<std::string>();
             u["alert_count"] = row["alert_count"].as<int>();
+            u["active_alerts"] = row["active_alerts"].as<int>();
+            u["triggered_alerts"] = row["triggered_alerts"].as<int>();
+            u["favorites_count"] = row["favorites_count"].as<int>();
+            u["activity_count"] = row["activity_count"].as<int>();
+            if (row["last_login_at"].isNull())
+                u["last_login_at"] = Json::Value::null;
+            else
+                u["last_login_at"] = row["last_login_at"].as<std::string>();
             items.append(u);
         }
     } catch (const std::exception &e) {

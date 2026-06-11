@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <future>
 #include <memory>
 #include <random>
 
@@ -60,7 +61,10 @@ void AlertManager::configure(services::PostgresService *pg, services::RedisServi
 
 void AlertManager::loadAlerts() {
     if (!postgres_) {
-        LOG_WARN << "AlertManager started without PostgreSQL; alerts stay in-memory only";
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.clear();
+        rebuildIndexes();
+        LOG_WARN << "AlertManager started without PostgreSQL; alert cache cleared";
         return;
     }
     auto rows = postgres_->listAlerts();
@@ -79,6 +83,12 @@ void AlertManager::loadAlerts() {
     }
     rebuildIndexes();
     LOG_INFO << "Loaded " << alerts_.size() << " alerts";
+    int dbCount = postgres_->countAlerts();
+    if (dbCount != static_cast<int>(alerts_.size())) {
+        LOG_WARN << "Alert count mismatch: PostgreSQL has " << dbCount
+                 << " rows, loaded " << alerts_.size()
+                 << " into memory; check alerts.data JSONB";
+    }
 }
 
 std::string AlertManager::candleIndexKey(const std::string &pair,
@@ -120,38 +130,68 @@ void AlertManager::rebuildIndexes() {
 }
 
 void AlertManager::persistAlert(const Alert &a) {
-    Json::Value payload(Json::objectValue);
-    payload["event_id"] = newUuid();
-    payload["event_ts"] = util::nowIso8601();
-    payload["op"] = "upsert";
-    payload["alert_id"] = a.id;
-    payload["alert"] = a.toJson();
-    if (redis_ && redis_->connected()) {
-        Json::StreamWriterBuilder wb;
-        wb["indentation"] = "";
-        redis_->pushJson(redisAlertQueueKey_, Json::writeString(wb, payload));
-        return;
-    }
-    if (postgres_ && dbExecutor_) {
-        Json::Value alertJson = a.toJson();
-        dbExecutor_([this, alertJson]() { postgres_->upsertAlert(alertJson); });
+    if (!postgres_) return;
+    Json::Value alertJson = a.toJson();
+    const std::string alertId = a.id;
+    auto write = [this, alertJson, alertId]() {
+        if (!postgres_->upsertAlert(alertJson)) {
+            LOG_ERROR << "upsertAlert failed (async) alert_id=" << alertId;
+        }
+    };
+    if (dbExecutor_) {
+        dbExecutor_(std::move(write));
+    } else {
+        write();
     }
 }
 
+bool AlertManager::persistAlertSync(const Alert &a) {
+    if (!postgres_) return false;
+    Json::Value alertJson = a.toJson();
+    if (!dbExecutor_) return postgres_->upsertAlert(alertJson);
+    auto prom = std::make_shared<std::promise<bool>>();
+    auto fut = prom->get_future();
+    dbExecutor_([this, alertJson, prom]() {
+        try {
+            prom->set_value(postgres_->upsertAlert(alertJson));
+        } catch (...) {
+            try {
+                prom->set_exception(std::current_exception());
+            } catch (...) {
+            }
+        }
+    });
+    return fut.get();
+}
+
+bool AlertManager::persistDeleteSync(const std::string &id) {
+    if (!postgres_) return false;
+    if (!dbExecutor_) return postgres_->deleteAlert(id);
+    auto prom = std::make_shared<std::promise<bool>>();
+    auto fut = prom->get_future();
+    dbExecutor_([this, id, prom]() {
+        try {
+            prom->set_value(postgres_->deleteAlert(id));
+        } catch (...) {
+            try {
+                prom->set_exception(std::current_exception());
+            } catch (...) {
+            }
+        }
+    });
+    return fut.get();
+}
+
 void AlertManager::persistDelete(const std::string &id) {
-    if (redis_ && redis_->connected()) {
-        Json::Value payload(Json::objectValue);
-        payload["event_id"] = newUuid();
-        payload["event_ts"] = util::nowIso8601();
-        payload["op"] = "delete";
-        payload["alert_id"] = id;
-        Json::StreamWriterBuilder wb;
-        wb["indentation"] = "";
-        redis_->pushJson(redisAlertQueueKey_, Json::writeString(wb, payload));
-        return;
-    }
-    if (postgres_ && dbExecutor_) {
-        dbExecutor_([this, id]() { postgres_->deleteAlert(id); });
+    if (!postgres_) return;
+    if (dbExecutor_) {
+        dbExecutor_([this, id]() {
+            if (!postgres_->deleteAlert(id)) {
+                LOG_ERROR << "deleteAlert failed (async) alert_id=" << id;
+            }
+        });
+    } else if (!postgres_->deleteAlert(id)) {
+        LOG_ERROR << "deleteAlert failed (async) alert_id=" << id;
     }
 }
 
@@ -162,8 +202,10 @@ int AlertManager::intervalSeconds(const std::string &interval) {
 Alert AlertManager::createPriceAlert(const std::string &pair, double targetPrice,
                                      const std::string &condition,
                                      const std::string &userId, const std::string &email,
-                                     const std::string &channel, const std::string &phone,
+                                     const std::vector<std::string> &channels,
+                                     const std::string &phone,
                                      const std::string &customMessage) {
+    if (!postgres_) throw std::runtime_error("Database unavailable");
     Alert a;
     a.id = newUuid();
     a.userId = userId;
@@ -173,7 +215,8 @@ Alert AlertManager::createPriceAlert(const std::string &pair, double targetPrice
     a.targetPrice = targetPrice;
     a.condition = condition;
     a.email = email;
-    a.channel = channel;
+    a.channels = channels;
+    a.normalizeChannels();
     a.phone = phone;
     a.customMessage = customMessage;
     a.status = "active";
@@ -183,7 +226,12 @@ Alert AlertManager::createPriceAlert(const std::string &pair, double targetPrice
         alerts_[a.id] = a;
         rebuildIndexes();
     }
-    persistAlert(a);
+    if (!persistAlertSync(a)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.erase(a.id);
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
+    }
     bumpUserRevision(a.userId);
     notifySubscriptionChange();
     LOG_INFO << "Created price alert " << a.id << " " << a.pair << " @ " << targetPrice;
@@ -193,8 +241,10 @@ Alert AlertManager::createPriceAlert(const std::string &pair, double targetPrice
 Alert AlertManager::createCandleAlert(const std::string &pair, const std::string &interval,
                                       const std::string &direction, double threshold,
                                       const std::string &userId, const std::string &email,
-                                      const std::string &channel, const std::string &phone,
+                                      const std::vector<std::string> &channels,
+                                      const std::string &phone,
                                       const std::string &customMessage) {
+    if (!postgres_) throw std::runtime_error("Database unavailable");
     std::string iv = interval;
     std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
     if (intervalSeconds(iv) == 0)
@@ -210,7 +260,8 @@ Alert AlertManager::createCandleAlert(const std::string &pair, const std::string
     a.direction = direction;
     a.threshold = threshold;
     a.email = email;
-    a.channel = channel;
+    a.channels = channels;
+    a.normalizeChannels();
     a.phone = phone;
     a.customMessage = customMessage;
     a.status = "active";
@@ -220,7 +271,12 @@ Alert AlertManager::createCandleAlert(const std::string &pair, const std::string
         alerts_[a.id] = a;
         rebuildIndexes();
     }
-    persistAlert(a);
+    if (!persistAlertSync(a)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.erase(a.id);
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
+    }
     bumpUserRevision(a.userId);
     notifySubscriptionChange();
     LOG_INFO << "Created candle alert " << a.id << " " << a.pair << " " << iv << " "
@@ -284,19 +340,28 @@ bool AlertManager::isAlertOwnedBy(const std::string &id, const std::string &user
 
 bool AlertManager::deleteAlert(const std::string &id,
                                const std::optional<std::string> &userId) {
+    if (!postgres_) return false;
     std::string affectedUser;
+    Alert previous;
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = alerts_.find(id);
         if (it == alerts_.end()) return false;
         if (userId && it->second.userId != *userId) return false;
         affectedUser = it->second.userId;
+        previous = it->second;
         alerts_.erase(it);
         rebuildIndexes();
     }
+    if (!persistDeleteSync(id)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_[id] = previous;
+        rebuildIndexes();
+        LOG_ERROR << "Failed to persist delete for alert " << id;
+        return false;
+    }
     bumpUserRevision(affectedUser);
     notifySubscriptionChange();
-    persistDelete(id);
     LOG_INFO << "Deleted alert " << id;
     return true;
 }
@@ -304,12 +369,15 @@ bool AlertManager::deleteAlert(const std::string &id,
 std::optional<Alert> AlertManager::updateAlert(const std::string &id,
                                                const Json::Value &updates,
                                                const std::optional<std::string> &userId) {
+    if (!postgres_) throw std::runtime_error("Database unavailable");
     Alert updated;
+    Alert previous;
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = alerts_.find(id);
         if (it == alerts_.end()) return std::nullopt;
         if (userId && it->second.userId != *userId) return std::nullopt;
+        previous = it->second;
         Alert &a = it->second;
 
         auto setStr = [&](const char *k, std::string &dst) {
@@ -320,7 +388,16 @@ std::optional<Alert> AlertManager::updateAlert(const std::string &id,
                 a.targetPrice = updates["target_price"].asDouble();
             if (updates.isMember("condition") && updates["condition"].isString())
                 a.condition = updates["condition"].asString();
-            setStr("channel", a.channel);
+            if (updates.isMember("channels") && updates["channels"].isArray()) {
+                a.channels.clear();
+                for (const auto &c : updates["channels"]) {
+                    if (c.isString() && !c.asString().empty()) a.channels.push_back(c.asString());
+                }
+                a.normalizeChannels();
+            } else {
+                setStr("channel", a.channel);
+                a.normalizeChannels();
+            }
             setStr("email", a.email);
             setStr("phone", a.phone);
             setStr("custom_message", a.customMessage);
@@ -338,7 +415,16 @@ std::optional<Alert> AlertManager::updateAlert(const std::string &id,
                 a.direction = updates["direction"].asString();
             if (updates.isMember("threshold") && updates["threshold"].isNumeric())
                 a.threshold = updates["threshold"].asDouble();
-            setStr("channel", a.channel);
+            if (updates.isMember("channels") && updates["channels"].isArray()) {
+                a.channels.clear();
+                for (const auto &c : updates["channels"]) {
+                    if (c.isString() && !c.asString().empty()) a.channels.push_back(c.asString());
+                }
+                a.normalizeChannels();
+            } else {
+                setStr("channel", a.channel);
+                a.normalizeChannels();
+            }
             setStr("email", a.email);
             setStr("phone", a.phone);
             setStr("custom_message", a.customMessage);
@@ -347,9 +433,14 @@ std::optional<Alert> AlertManager::updateAlert(const std::string &id,
         updated = a;
         rebuildIndexes();
     }
+    if (!persistAlertSync(updated)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_[id] = previous;
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
+    }
     bumpUserRevision(updated.userId);
     notifySubscriptionChange();
-    persistAlert(updated);
     LOG_INFO << "Updated alert " << id;
     return updated;
 }
@@ -373,8 +464,10 @@ bool AlertManager::priceConditionMet(const Alert &a, double current) {
 
 std::optional<TriggeredAlert> AlertManager::tryTriggerPriceAlert(const std::string &alertId,
                                                                   double currentPrice) {
+    if (!postgres_) return std::nullopt;
     std::optional<TriggeredAlert> result;
     Alert persisted;
+    Alert previous;
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = alerts_.find(alertId);
@@ -383,6 +476,7 @@ std::optional<TriggeredAlert> AlertManager::tryTriggerPriceAlert(const std::stri
         if (a.status != "active" || a.alertType != "price") return std::nullopt;
         a.lastCheckedPrice = currentPrice;
         if (!priceConditionMet(a, currentPrice)) return std::nullopt;
+        previous = a;
         triggerAlert(a, currentPrice);
         TriggeredAlert t;
         t.alert = a;
@@ -391,9 +485,15 @@ std::optional<TriggeredAlert> AlertManager::tryTriggerPriceAlert(const std::stri
         result = t;
         persisted = a;
         rebuildIndexes();
-        bumpUserRevision(a.userId);
     }
-    persistAlert(persisted);
+    if (!persistAlertSync(persisted)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_[alertId] = previous;
+        rebuildIndexes();
+        LOG_ERROR << "Failed to persist triggered price alert " << alertId;
+        return std::nullopt;
+    }
+    bumpUserRevision(persisted.userId);
     LOG_INFO << "Triggered price alert " << persisted.id << " " << persisted.pair
              << " channel=" << persisted.channel << " price=" << currentPrice
              << " target=" << persisted.targetPrice.value_or(0);
@@ -410,7 +510,11 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
         prices[util::canonicalPair(p.pair)] = p.price;
     }
 
-    std::vector<Alert> toPersist;
+    struct PersistBatch {
+        Alert before;
+        Alert after;
+    };
+    std::vector<PersistBatch> toPersist;
     {
         std::lock_guard<std::mutex> lk(mu_);
         for (const auto &pr : prices) {
@@ -424,28 +528,39 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                 if (a.status != "active" || a.alertType != "price") continue;
                 a.lastCheckedPrice = current;
                 if (!priceConditionMet(a, current)) continue;
+                Alert before = a;
                 triggerAlert(a, current);
                 TriggeredAlert t;
                 t.alert = a;
                 t.currentPrice = current;
                 t.alertTypeLabel = "price";
                 triggered.push_back(t);
-                toPersist.push_back(a);
+                toPersist.push_back({before, a});
                 LOG_INFO << "Triggered price alert " << a.id << " " << a.pair
                          << " channel=" << a.channel << " price=" << current
                          << " target=" << a.targetPrice.value_or(0);
             }
         }
-        if (!triggered.empty()) {
+        if (!triggered.empty()) rebuildIndexes();
+    }
+    std::vector<TriggeredAlert> notified;
+    for (const auto &batch : toPersist) {
+        if (postgres_ && !persistAlertSync(batch.after)) {
+            std::lock_guard<std::mutex> lk(mu_);
+            alerts_[batch.after.id] = batch.before;
             rebuildIndexes();
-            for (const auto &t : triggered) bumpUserRevision(t.alert.userId);
+            LOG_ERROR << "Failed to persist triggered price alert " << batch.after.id;
+            continue;
+        }
+        bumpUserRevision(batch.after.userId);
+        for (const auto &t : triggered) {
+            if (t.alert.id == batch.after.id) notified.push_back(t);
         }
     }
-    for (auto &a : toPersist) persistAlert(a);
-    for (const auto &t : triggered) {
+    for (const auto &t : notified) {
         if (onTriggered_) onTriggered_(t);
     }
-    return triggered;
+    return notified;
 }
 
 std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
@@ -470,7 +585,12 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
         if (!find(k)) lookup.emplace_back(k, c);
     }
 
-    std::vector<Alert> toPersist;
+    struct PersistBatch {
+        Alert before;
+        Alert after;
+        bool isTrigger = false;
+    };
+    std::vector<PersistBatch> toPersist;
     {
         std::lock_guard<std::mutex> lk(mu_);
         for (const auto &entry : lookup) {
@@ -498,8 +618,9 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
             if (candleStart && ivSec && createdAt) {
                 std::time_t closeTime = *candleStart + ivSec;
                 if (closeTime <= *createdAt) {
+                    Alert before = a;
                     a.lastEvaluatedCandleTime = candleTsStr;
-                    toPersist.push_back(a);
+                    toPersist.push_back({before, a, false});
                     continue;
                 }
             }
@@ -514,6 +635,7 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
             else if (dir == "below" && close <= thr)
                 should = true;
             if (should) {
+                Alert before = a;
                 a.status = "triggered";
                 a.triggeredAt = util::nowIso8601();
                 a.lastCheckedPrice = close;
@@ -525,22 +647,37 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                 t.alertTypeLabel = "candle_close";
                 t.timeframe = iv;
                 triggered.push_back(t);
-                toPersist.push_back(a);
+                toPersist.push_back({before, a, true});
                 LOG_INFO << "Triggered candle alert " << a.id << " " << a.pair
                          << " channel=" << a.channel << " close=" << close;
             }
             }
         }
-        if (!triggered.empty()) {
-            rebuildIndexes();
-            for (const auto &t : triggered) bumpUserRevision(t.alert.userId);
+        if (!triggered.empty()) rebuildIndexes();
+    }
+    std::vector<TriggeredAlert> notified;
+    for (const auto &batch : toPersist) {
+        if (!postgres_) continue;
+        if (batch.isTrigger) {
+            if (!persistAlertSync(batch.after)) {
+                std::lock_guard<std::mutex> lk(mu_);
+                alerts_[batch.after.id] = batch.before;
+                rebuildIndexes();
+                LOG_ERROR << "Failed to persist triggered candle alert " << batch.after.id;
+                continue;
+            }
+            bumpUserRevision(batch.after.userId);
+            for (const auto &t : triggered) {
+                if (t.alert.id == batch.after.id) notified.push_back(t);
+            }
+        } else {
+            persistAlert(batch.after);
         }
     }
-    for (auto &a : toPersist) persistAlert(a);
-    for (const auto &t : triggered) {
+    for (const auto &t : notified) {
         if (onTriggered_) onTriggered_(t);
     }
-    return triggered;
+    return notified;
 }
 
 int AlertManager::flushPersistenceEvents(int batchSize) {

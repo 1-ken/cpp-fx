@@ -1,10 +1,33 @@
 #include "core/ApiLog.h"
 
 #include <cctype>
+#include <cstdint>
+#include <iomanip>
+#include <sstream>
 
 #include <trantor/utils/Logger.h>
 
 namespace ctraderplus::core {
+
+namespace {
+
+uint64_t fnv1a64(const std::string &s) {
+    uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : s) {
+        h ^= static_cast<uint64_t>(c);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+}  // namespace
+
+std::string hashUserIdForLog(const std::string &userId) {
+    if (userId.empty()) return "";
+    std::ostringstream oss;
+    oss << "u_" << std::hex << std::setw(12) << std::setfill('0') << fnv1a64(userId);
+    return oss.str();
+}
 
 std::string normalizeUsername(const std::string &username) {
     std::string out;
@@ -23,7 +46,7 @@ void logApiOutcome(const char *area, const char *action, bool ok, int httpStatus
     std::string msg = std::string("[") + area + "] " + action + (ok ? " OK" : " FAIL")
                       + " status=" + std::to_string(httpStatus);
     if (!detail.empty()) msg += " detail=" + detail;
-    if (!userId.empty()) msg += " user_id=" + userId;
+    if (!userId.empty()) msg += " user=" + hashUserIdForLog(userId);
     if (ok)
         LOG_INFO << msg;
     else

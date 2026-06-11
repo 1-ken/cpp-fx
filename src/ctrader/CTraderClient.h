@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -47,29 +48,44 @@ class CTraderClient {
     void stop();
 
     bool isReady() const { return ready_.load(); }
+    int64_t reconnectCount() const { return reconnectCount_.load(); }
+    int64_t rateLimitCount() const { return rateLimitCount_.load(); }
+    std::string lastErrorCode() const;
+    bool circuitBreakerOpen() const;
 
-    // Request historical trend bars. The callback is invoked on the client's
-    // event loop (success or failure / timeout).
     void getTrendbars(int64_t symbolId, int period, int64_t fromMs, int64_t toMs,
                       uint32_t count, TrendbarsCallback cb);
 
-    // Subscribe / unsubscribe to a live trend bar series for a symbol.
     void subscribeLiveTrendbar(int64_t symbolId, int period);
     void unsubscribeLiveTrendbar(int64_t symbolId, int period);
 
-    // Replace spot subscriptions (scoped mode). No-op until symbols are loaded.
     void refreshSpotSubscriptions(std::vector<int64_t> symbolIds);
 
   private:
-    enum class State { Disconnected, Connecting, AppAuth, AccountAuth, LoadingSymbols, Ready };
+    enum class State {
+        Disconnected,
+        Connecting,
+        AppAuth,
+        RefreshingToken,
+        AccountAuth,
+        LoadingSymbols,
+        Ready
+    };
 
     void connect();
-    void scheduleReconnect();
+    void scheduleReconnect(double minDelaySeconds = 0.0);
     void onConnection(const trantor::TcpConnectionPtr &conn);
     void onMessage(const trantor::TcpConnectionPtr &conn, trantor::MsgBuffer *buf);
     void handleFrame(const std::string &payload);
+    void handleOaError(const std::string &code, const std::string &description,
+                       uint64_t retryAfterMs);
+    void forceDisconnectAndReconnect(double minDelaySeconds);
+    void resetBackoffOnReady();
+    bool outboundPaused() const;
+    void noteReconnectAttempt();
 
     void sendApplicationAuth();
+    void sendRefreshToken();
     void sendAccountAuth();
     void sendSymbolsListReq();
     void subscribeSpotsBatched(const std::vector<int64_t> &ids);
@@ -87,8 +103,19 @@ class CTraderClient {
 
     std::atomic<bool> ready_{false};
     std::atomic<bool> stopping_{false};
+    std::atomic<bool> reconnectScheduled_{false};
+    std::atomic<int64_t> reconnectCount_{0};
+    std::atomic<int64_t> rateLimitCount_{0};
+    mutable std::mutex statsMu_;
+    std::string lastErrorCode_;
     State state_ = State::Disconnected;
     double reconnectDelay_ = 1.0;
+    double outboundPausedUntil_ = 0;
+    double lastRateLimitAt_ = 0;
+    double circuitBreakerUntil_ = 0;
+    std::chrono::steady_clock::time_point reconnectWindowStart_ =
+        std::chrono::steady_clock::now();
+    int reconnectAttemptsInWindow_ = 0;
     trantor::TimerId heartbeatTimer_ = trantor::InvalidTimerId;
 
     uint64_t msgIdCounter_ = 0;

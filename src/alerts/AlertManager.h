@@ -42,18 +42,20 @@ class AlertManager {
         onTriggered_ = std::move(cb);
     }
     void loadAlerts();
+    bool dbPersistenceEnabled() const { return postgres_ != nullptr; }
 
     uint64_t userAlertsRevision(const std::string &userId) const;
 
     Alert createPriceAlert(const std::string &pair, double targetPrice,
                            const std::string &condition, const std::string &userId,
-                           const std::string &email, const std::string &channel,
+                           const std::string &email,
+                           const std::vector<std::string> &channels,
                            const std::string &phone, const std::string &customMessage);
     Alert createCandleAlert(const std::string &pair, const std::string &interval,
                             const std::string &direction, double threshold,
                             const std::string &userId, const std::string &email,
-                            const std::string &channel, const std::string &phone,
-                            const std::string &customMessage);
+                            const std::vector<std::string> &channels,
+                            const std::string &phone, const std::string &customMessage);
 
     std::optional<Alert> getAlert(const std::string &id) const;
     std::vector<Alert> getAllAlerts() const;
@@ -79,6 +81,8 @@ class AlertManager {
   private:
     void rebuildIndexes();
     void persistAlert(const Alert &a);
+    bool persistAlertSync(const Alert &a);
+    bool persistDeleteSync(const std::string &id);
     void persistDelete(const std::string &id);
     void triggerAlert(Alert &a, double price);
     static bool priceConditionMet(const Alert &a, double current);

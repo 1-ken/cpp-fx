@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <ctime>
+#include <unordered_map>
 
 #include <trantor/utils/Logger.h>
 
 #include "alerts/AlertManager.h"
+#include "core/ApiLog.h"
 #include "core/AppContext.h"
 #include "core/Auth.h"
 #include "core/Config.h"
@@ -24,6 +26,41 @@ std::mutex WsObserveController::connsMu_;
 std::set<WebSocketConnectionPtr> WsObserveController::conns_;
 
 namespace {
+
+std::mutex wsConnStatsMu_;
+std::unordered_map<std::string, int> wsConnsPerUser_;
+std::unordered_map<std::string, int> wsConnsPerIp_;
+
+int countUserWsConnections(const std::string &userId) {
+    std::lock_guard<std::mutex> lk(wsConnStatsMu_);
+    auto it = wsConnsPerUser_.find(userId);
+    return it == wsConnsPerUser_.end() ? 0 : it->second;
+}
+
+int countIpWsConnections(const std::string &ip) {
+    std::lock_guard<std::mutex> lk(wsConnStatsMu_);
+    auto it = wsConnsPerIp_.find(ip);
+    return it == wsConnsPerIp_.end() ? 0 : it->second;
+}
+
+void trackWsOpen(const std::string &userId, const std::string &ip) {
+    std::lock_guard<std::mutex> lk(wsConnStatsMu_);
+    ++wsConnsPerUser_[userId];
+    if (!ip.empty()) ++wsConnsPerIp_[ip];
+}
+
+void trackWsClose(const std::string &userId, const std::string &ip) {
+    std::lock_guard<std::mutex> lk(wsConnStatsMu_);
+    if (auto it = wsConnsPerUser_.find(userId); it != wsConnsPerUser_.end()) {
+        if (--it->second <= 0) wsConnsPerUser_.erase(it);
+    }
+    if (!ip.empty()) {
+        if (auto it = wsConnsPerIp_.find(ip); it != wsConnsPerIp_.end()) {
+            if (--it->second <= 0) wsConnsPerIp_.erase(it);
+        }
+    }
+}
+
 const std::set<std::string> kValidIntervals = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"};
 
 std::string toJsonString(const Json::Value &v) {
@@ -137,8 +174,16 @@ void WsObserveController::handleNewConnection(const HttpRequestPtr &req,
         return;
     }
 
+    const std::string peerIp = req->getPeerAddr().toIp();
+    const int ipLimit = app.config->wsMaxConnectionsPerIp;
+    if (ipLimit > 0 && countIpWsConnections(peerIp) >= ipLimit) {
+        conn->shutdown(CloseCode::kViolation, "too many connections from this IP");
+        return;
+    }
+
     auto ctx = std::make_shared<WsConnContext>();
     ctx->userId = auth.userId;
+    ctx->peerIp = peerIp;
 
     std::string intervalParam = req->getParameter("interval");
     std::string pairParam = req->getParameter("pair");
@@ -174,7 +219,10 @@ void WsObserveController::handleNewConnection(const HttpRequestPtr &req,
         std::lock_guard<std::mutex> lk(connsMu_);
         conns_.insert(conn);
     }
-    LOG_INFO << "WebSocket connected (interval=" << ctx->interval
+    trackWsOpen(ctx->userId, peerIp);
+    const int userConns = countUserWsConnections(ctx->userId);
+    LOG_INFO << "WebSocket connected user=" << core::hashUserIdForLog(ctx->userId)
+             << " user_conns=" << userConns << " interval=" << ctx->interval
              << " pair=" << (ctx->pairCanon ? *ctx->pairCanon : "all") << ")";
 }
 
@@ -187,7 +235,10 @@ void WsObserveController::handleConnectionClosed(const WebSocketConnectionPtr &c
     auto &app = core::AppContext::instance();
     if (conn->hasContext()) {
         auto ctx = conn->getContext<WsConnContext>();
-        if (ctx && ctx->counted && app.hub) app.hub->decWs();
+        if (ctx) {
+            trackWsClose(ctx->userId, ctx->peerIp);
+            if (ctx->counted && app.hub) app.hub->decWs();
+        }
     }
     std::lock_guard<std::mutex> lk(connsMu_);
     conns_.erase(conn);

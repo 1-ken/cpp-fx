@@ -31,6 +31,7 @@
 #include "ctrader/CTraderClient.h"
 #include "ctrader/SymbolRegistry.h"
 #include "market/MarketHub.h"
+#include "market/SymbolSubscriptionPlanner.h"
 #include "services/PostgresService.h"
 #include "services/RedisService.h"
 #include "util/ForexMarketHours.h"
@@ -91,6 +92,56 @@ bool channelRequiresEmail(const std::string &channel) { return channel == "email
 
 bool channelRequiresPhone(const std::string &channel) {
     return channel == "sms" || channel == "call";
+}
+
+bool channelsRequireEmail(const std::vector<std::string> &channels) {
+    return std::any_of(channels.begin(), channels.end(),
+                       [](const std::string &c) { return channelRequiresEmail(c); });
+}
+
+bool channelsRequirePhone(const std::vector<std::string> &channels) {
+    return std::any_of(channels.begin(), channels.end(),
+                       [](const std::string &c) { return channelRequiresPhone(c); });
+}
+
+bool channelsRequireCustomMessage(const std::vector<std::string> &channels,
+                                  const std::string &customMessage) {
+    return std::any_of(channels.begin(), channels.end(), [&](const std::string &c) {
+        return requiresCustomMessage(c, customMessage);
+    });
+}
+
+std::vector<std::string> parseChannels(const Json::Value &body, std::string &err) {
+    std::vector<std::string> channels;
+    if (body.isMember("channels") && body["channels"].isArray()) {
+        for (const auto &c : body["channels"]) {
+            if (!c.isString()) {
+                err = "channels must contain strings";
+                return {};
+            }
+            std::string ch = c.asString();
+            if (!channelValid(ch)) {
+                err = "Channel must be 'email', 'sms', 'call', or 'sound'";
+                return {};
+            }
+            if (std::find(channels.begin(), channels.end(), ch) == channels.end())
+                channels.push_back(ch);
+        }
+    } else if (body.isMember("channel") && body["channel"].isString()) {
+        std::string ch = body["channel"].asString();
+        if (!channelValid(ch)) {
+            err = "Channel must be 'email', 'sms', 'call', or 'sound'";
+            return {};
+        }
+        channels.push_back(ch);
+    } else {
+        channels.push_back("email");
+    }
+    if (channels.empty()) {
+        err = "At least one notification channel is required";
+        return {};
+    }
+    return channels;
 }
 
 std::optional<std::time_t> parseQueryTime(const std::string &s) {
@@ -216,6 +267,21 @@ void streamHealth(const HttpRequestPtr &req,
     v["ws_subscriber_count"] = app.hub->activeWsCount();
     v["queue_subscriber_count"] = 0;
     v["retention_days"] = cfg.retentionDays;
+    v["ctrader_connected"] = app.ctrader && app.ctrader->isReady();
+    if (app.ctrader) {
+        v["ctrader_reconnect_count"] = app.ctrader->reconnectCount();
+        v["ctrader_rate_limit_count"] = app.ctrader->rateLimitCount();
+        v["ctrader_last_error"] = app.ctrader->lastErrorCode();
+        v["ctrader_circuit_breaker_open"] = app.ctrader->circuitBreakerOpen();
+    }
+    if (app.postgres) {
+        v["db_alert_upsert_failures_total"] =
+            static_cast<Json::Int64>(app.postgres->alertUpsertFailures());
+    }
+    if (app.subscriptionPlanner && app.registry) {
+        auto ids = app.subscriptionPlanner->computeSymbolIds();
+        v["subscribed_symbol_count"] = static_cast<int>(ids.size());
+    }
     cb(jsonResp(v));
 }
 
@@ -504,11 +570,25 @@ void historicalOhlc(const HttpRequestPtr &req,
 
 // ---- Alerts ----
 
+bool rejectAlertsWithoutDb(std::function<void(const HttpResponsePtr &)> &cb) {
+    if (!core::isDbReadyForAuth()) {
+        cb(errResp("detail", "Database not ready", 503));
+        return true;
+    }
+    auto &app = AppContext::instance();
+    if (!app.alerts || !app.alerts->dbPersistenceEnabled()) {
+        cb(errResp("detail", "Alert persistence unavailable", 503));
+        return true;
+    }
+    return false;
+}
+
 void createAlert(const HttpRequestPtr &req,
                  std::function<void(const HttpResponsePtr &)> &&cb) {
     auto &app = AppContext::instance();
     std::string uid;
     if (!authOrReject(req, cb, uid)) return;
+    if (rejectAlertsWithoutDb(cb)) return;
     auto body = req->getJsonObject();
     if (!body) {
         cb(errResp("detail", "Invalid JSON body", 400));
@@ -536,43 +616,45 @@ void createAlert(const HttpRequestPtr &req,
         }
     }
 
-    std::string channel = b.get("channel", "email").asString();
+    std::string parseErr;
+    auto channels = parseChannels(b, parseErr);
+    if (channels.empty()) {
+        cb(errResp("detail", parseErr.empty() ? "Invalid channels" : parseErr, 400));
+        return;
+    }
     std::string email = b.get("email", "").asString();
     std::string phone = b.get("phone", "").asString();
     std::string customMessage = trimStr(b.get("custom_message", "").asString());
     bool isCandle = b.isMember("interval") && b["interval"].isString() &&
                     !b["interval"].asString().empty();
 
+    if (channelsRequireEmail(channels) && email.empty()) {
+        cb(errResp("detail", "Email is required for email alerts", 400));
+        return;
+    }
+    if (channelsRequirePhone(channels) && phone.empty()) {
+        cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
+        return;
+    }
+    if (channelsRequireCustomMessage(channels, customMessage)) {
+        cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
+        return;
+    }
+
     if (isCandle) {
         std::string interval = b["interval"].asString();
         std::string direction = b.get("direction", "").asString();
         double threshold = b.get("threshold", 0.0).asDouble();
-        if (!channelValid(channel)) {
-            cb(errResp("detail",
-                       "Channel must be 'email', 'sms', 'call', or 'sound'", 400));
-            return;
-        }
-        if (channelRequiresEmail(channel) && email.empty()) {
-            cb(errResp("detail", "Email is required for email alerts", 400));
-            return;
-        }
-        if (channelRequiresPhone(channel) && phone.empty()) {
-            cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
-            return;
-        }
-        if (requiresCustomMessage(channel, customMessage)) {
-            cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
-            return;
-        }
         if (direction != "above" && direction != "below") {
             cb(errResp("detail", "Direction must be 'above' or 'below'", 400));
             return;
         }
         try {
-            auto a = app.alerts->createCandleAlert(pair, interval, direction, threshold,
-                                                   uid, email, channel, phone, customMessage);
+            auto a = app.alerts->createCandleAlert(pair, interval, direction, threshold, uid,
+                                                   email, channels, phone, customMessage);
             std::ostringstream detail;
-            detail << "pair=" << pair << " channel=" << channel << " interval=" << interval;
+            detail << "pair=" << pair << " channels=" << channels.size()
+                   << " interval=" << interval;
             core::logApiOutcome("alerts", "create", true, 200, detail.str(), uid);
             Json::Value meta;
             meta["pair"] = pair;
@@ -583,6 +665,13 @@ void createAlert(const HttpRequestPtr &req,
             v["success"] = true;
             v["alert"] = a.toJson();
             cb(jsonResp(v));
+        } catch (const std::runtime_error &e) {
+            const std::string msg = e.what();
+            if (msg == "Alert not persisted" || msg == "Database unavailable") {
+                cb(errResp("detail", msg, 503));
+            } else {
+                cb(errResp("detail", msg, 400));
+            }
         } catch (const std::exception &e) {
             cb(errResp("detail", e.what(), 400));
         }
@@ -595,44 +684,36 @@ void createAlert(const HttpRequestPtr &req,
         cb(errResp("detail", "Condition must be 'above', 'below', or 'equal'", 400));
         return;
     }
-    if (!channelValid(channel)) {
-        cb(errResp("detail",
-                   "Channel must be 'email', 'sms', 'call', or 'sound'", 400));
-        return;
+    try {
+        auto a = app.alerts->createPriceAlert(pair, target, condition, uid, email, channels,
+                                              phone, customMessage);
+        double livePrice = 0;
+        if (app.hub && app.hub->latestPrice(a.pair, livePrice)) {
+            app.alerts->tryTriggerPriceAlert(a.id, livePrice);
+            if (auto updated = app.alerts->getAlert(a.id)) a = *updated;
+        }
+        std::ostringstream detail;
+        detail << "pair=" << pair << " channels=" << channels.size() << " target=" << target
+               << " condition=" << condition;
+        if (a.status == "triggered") detail << " triggered=1";
+        core::logApiOutcome("alerts", "create", true, 200, detail.str(), uid);
+        Json::Value meta;
+        meta["pair"] = pair;
+        meta["alert_id"] = a.id;
+        meta["type"] = "price";
+        logActivityAsync(uid, "alert_create", clientIp(req), clientUserAgent(req), meta);
+        Json::Value v;
+        v["success"] = true;
+        v["alert"] = a.toJson();
+        cb(jsonResp(v));
+    } catch (const std::runtime_error &e) {
+        const std::string msg = e.what();
+        if (msg == "Alert not persisted" || msg == "Database unavailable") {
+            cb(errResp("detail", msg, 503));
+        } else {
+            cb(errResp("detail", msg, 400));
+        }
     }
-    if (channelRequiresEmail(channel) && email.empty()) {
-        cb(errResp("detail", "Email is required for email alerts", 400));
-        return;
-    }
-    if (channelRequiresPhone(channel) && phone.empty()) {
-        cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
-        return;
-    }
-    if (requiresCustomMessage(channel, customMessage)) {
-        cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
-        return;
-    }
-    auto a = app.alerts->createPriceAlert(pair, target, condition, uid, email, channel,
-                                          phone, customMessage);
-    double livePrice = 0;
-    if (app.hub && app.hub->latestPrice(a.pair, livePrice)) {
-        app.alerts->tryTriggerPriceAlert(a.id, livePrice);
-        if (auto updated = app.alerts->getAlert(a.id)) a = *updated;
-    }
-    std::ostringstream detail;
-    detail << "pair=" << pair << " channel=" << channel << " target=" << target
-           << " condition=" << condition;
-    if (a.status == "triggered") detail << " triggered=1";
-    core::logApiOutcome("alerts", "create", true, 200, detail.str(), uid);
-    Json::Value meta;
-    meta["pair"] = pair;
-    meta["alert_id"] = a.id;
-    meta["type"] = "price";
-    logActivityAsync(uid, "alert_create", clientIp(req), clientUserAgent(req), meta);
-    Json::Value v;
-    v["success"] = true;
-    v["alert"] = a.toJson();
-    cb(jsonResp(v));
 }
 
 void listAlerts(const HttpRequestPtr &req,
@@ -640,6 +721,7 @@ void listAlerts(const HttpRequestPtr &req,
     auto &app = AppContext::instance();
     std::string uid;
     if (!authOrReject(req, cb, uid)) return;
+    if (rejectAlertsWithoutDb(cb)) return;
     auto all = app.alerts->getAllAlertsForUser(uid);
     Json::Value active(Json::arrayValue), triggered(Json::arrayValue), allArr(Json::arrayValue);
     for (const auto &a : app.alerts->getActiveAlertsSortedForUser(uid)) active.append(a.toJson());
@@ -664,6 +746,7 @@ void getAlert(const HttpRequestPtr &req, std::function<void(const HttpResponsePt
     auto &app = AppContext::instance();
     std::string uid;
     if (!authOrReject(req, cb, uid)) return;
+    if (rejectAlertsWithoutDb(cb)) return;
     if (!app.alerts->isAlertOwnedBy(alertId, uid)) {
         cb(errResp("detail", "Alert not found", 404));
         return;
@@ -677,17 +760,22 @@ void deleteAlert(const HttpRequestPtr &req, std::function<void(const HttpRespons
     auto &app = AppContext::instance();
     std::string uid;
     if (!authOrReject(req, cb, uid)) return;
-    if (app.alerts->deleteAlert(alertId, uid)) {
-        Json::Value meta;
-        meta["alert_id"] = alertId;
-        logActivityAsync(uid, "alert_delete", clientIp(req), clientUserAgent(req), meta);
-        Json::Value v;
-        v["success"] = true;
-        v["message"] = "Alert deleted";
-        cb(jsonResp(v));
+    if (rejectAlertsWithoutDb(cb)) return;
+    if (!app.alerts->isAlertOwnedBy(alertId, uid)) {
+        cb(errResp("detail", "Alert not found", 404));
         return;
     }
-    cb(errResp("detail", "Alert not found", 404));
+    if (!app.alerts->deleteAlert(alertId, uid)) {
+        cb(errResp("detail", "Alert not persisted", 503));
+        return;
+    }
+    Json::Value meta;
+    meta["alert_id"] = alertId;
+    logActivityAsync(uid, "alert_delete", clientIp(req), clientUserAgent(req), meta);
+    Json::Value v;
+    v["success"] = true;
+    v["message"] = "Alert deleted";
+    cb(jsonResp(v));
 }
 
 void updateAlert(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> &&cb,
@@ -695,6 +783,7 @@ void updateAlert(const HttpRequestPtr &req, std::function<void(const HttpRespons
     auto &app = AppContext::instance();
     std::string uid;
     if (!authOrReject(req, cb, uid)) return;
+    if (rejectAlertsWithoutDb(cb)) return;
     auto existing = app.alerts->getAlert(alertId);
     if (!existing || existing->userId != uid) {
         cb(errResp("detail", "Alert not found", 404));
@@ -702,13 +791,33 @@ void updateAlert(const HttpRequestPtr &req, std::function<void(const HttpRespons
     }
     auto body = req->getJsonObject();
     Json::Value updates = body ? *body : Json::Value(Json::objectValue);
-    std::string channel = existing->channel;
-    if (updates.isMember("channel") && updates["channel"].isString())
-        channel = updates["channel"].asString();
+    std::vector<std::string> channels = existing->effectiveChannels();
+    if (updates.isMember("channels") || updates.isMember("channel")) {
+        std::string parseErr;
+        channels = parseChannels(updates, parseErr);
+        if (channels.empty()) {
+            cb(errResp("detail", parseErr.empty() ? "Invalid channels" : parseErr, 400));
+            return;
+        }
+    }
+    std::string email = existing->email;
+    if (updates.isMember("email") && updates["email"].isString())
+        email = updates["email"].asString();
+    std::string phone = existing->phone;
+    if (updates.isMember("phone") && updates["phone"].isString())
+        phone = updates["phone"].asString();
     std::string customMessage = existing->customMessage;
     if (updates.isMember("custom_message") && updates["custom_message"].isString())
         customMessage = trimStr(updates["custom_message"].asString());
-    if (requiresCustomMessage(channel, customMessage)) {
+    if (channelsRequireEmail(channels) && email.empty()) {
+        cb(errResp("detail", "Email is required for email alerts", 400));
+        return;
+    }
+    if (channelsRequirePhone(channels) && phone.empty()) {
+        cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
+        return;
+    }
+    if (channelsRequireCustomMessage(channels, customMessage)) {
         cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
         return;
     }
@@ -726,6 +835,13 @@ void updateAlert(const HttpRequestPtr &req, std::function<void(const HttpRespons
         v["success"] = true;
         v["alert"] = updated->toJson();
         cb(jsonResp(v));
+    } catch (const std::runtime_error &e) {
+        const std::string msg = e.what();
+        if (msg == "Alert not persisted" || msg == "Database unavailable") {
+            cb(errResp("detail", msg, 503));
+        } else {
+            cb(errResp("detail", msg, 400));
+        }
     } catch (const std::exception &e) {
         cb(errResp("detail", e.what(), 400));
     }

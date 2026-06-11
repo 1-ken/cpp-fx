@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <json/json.h>
 
@@ -16,7 +17,8 @@ struct Alert {
     std::string status = "active";  // active, triggered, disabled
     std::string createdAt;
     std::string alertType = "price";  // price | candle_close
-    std::string channel = "email";    // email | sms | call | sound (in-app)
+    std::string channel = "email";    // primary / legacy single channel
+    std::vector<std::string> channels;  // email | sms | call | sound
     std::string email;
     std::string phone;
     std::string customMessage;
@@ -34,6 +36,17 @@ struct Alert {
     std::optional<double> threshold;
     std::optional<std::string> lastEvaluatedCandleTime;
 
+    void normalizeChannels() {
+        if (channels.empty() && !channel.empty()) channels.push_back(channel);
+        if (!channels.empty()) channel = channels.front();
+    }
+
+    std::vector<std::string> effectiveChannels() const {
+        if (!channels.empty()) return channels;
+        if (!channel.empty()) return {channel};
+        return {};
+    }
+
     Json::Value toJson() const {
         Json::Value v(Json::objectValue);
         v["id"] = id;
@@ -42,7 +55,11 @@ struct Alert {
         v["status"] = status;
         v["created_at"] = createdAt;
         v["alert_type"] = alertType;
-        v["channel"] = channel;
+        Json::Value chArr(Json::arrayValue);
+        auto eff = effectiveChannels();
+        for (const auto &c : eff) chArr.append(c);
+        v["channels"] = chArr;
+        v["channel"] = eff.empty() ? channel : eff.front();
         v["email"] = email;
         v["phone"] = phone;
         v["custom_message"] = customMessage;
@@ -71,6 +88,12 @@ struct Alert {
         a.createdAt = v.get("created_at", "").asString();
         a.alertType = v.get("alert_type", "price").asString();
         a.channel = v.get("channel", "email").asString();
+        if (v.isMember("channels") && v["channels"].isArray()) {
+            for (const auto &c : v["channels"]) {
+                if (c.isString() && !c.asString().empty()) a.channels.push_back(c.asString());
+            }
+        }
+        a.normalizeChannels();
         a.email = v.get("email", "").asString();
         a.phone = v.get("phone", "").asString();
         a.customMessage = v.get("custom_message", "").asString();

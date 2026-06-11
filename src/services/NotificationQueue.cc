@@ -1,6 +1,8 @@
 #include "services/NotificationQueue.h"
 
+#include <atomic>
 #include <json/json.h>
+#include <memory>
 
 #include <trantor/utils/Logger.h>
 
@@ -12,40 +14,38 @@ namespace ctraderplus::services {
 
 namespace {
 
-void dispatchOne(Notifier &notifier, const alerts::TriggeredAlert &t,
-                 std::function<void(bool)> onDone) {
-    const alerts::Alert &a = t.alert;
+void dispatchOneChannel(Notifier &notifier, const alerts::TriggeredAlert &t,
+                        const std::string &channel,
+                        std::function<void(bool)> onDone) {
+    alerts::Alert a = t.alert;
+    a.channel = channel;
+    alerts::TriggeredAlert copy = t;
+    copy.alert = a;
+
     double target = a.alertType == "candle_close" ? a.threshold.value_or(0)
                                                   : a.targetPrice.value_or(0);
     std::string cond = a.alertType == "candle_close" ? a.direction.value_or("")
                                                      : a.condition.value_or("");
-    std::string triggeredAt =
-        a.triggeredAt.value_or(util::nowIso8601());
+    std::string triggeredAt = a.triggeredAt.value_or(util::nowIso8601());
 
-    if (a.channel == "sound") {
+    if (channel == "sound") {
         LOG_INFO << "[alerts] in-app sound alert triggered pair=" << a.pair << " id=" << a.id;
         onDone(true);
         return;
     }
 
-    LOG_INFO << "[alerts] dispatch notification channel=" << a.channel << " pair=" << a.pair
+    LOG_INFO << "[alerts] dispatch notification channel=" << channel << " pair=" << a.pair
              << " id=" << a.id;
 
     std::string smsBody = Notifier::formatAlertSms(
-        a.pair, target, t.currentPrice, cond, a.customMessage, a.alertType, t.timeframe,
+        a.pair, target, copy.currentPrice, cond, a.customMessage, a.alertType, copy.timeframe,
         triggeredAt);
     std::string emailBody = Notifier::formatAlertEmailBody(
-        a.pair, target, t.currentPrice, cond, a.customMessage, a.alertType, t.timeframe,
+        a.pair, target, copy.currentPrice, cond, a.customMessage, a.alertType, copy.timeframe,
         triggeredAt);
     std::string subject = Notifier::formatAlertSubject(a.pair, a.alertType);
 
-    if (a.channel.empty()) {
-        LOG_ERROR << "[alerts] notification skipped: empty channel id=" << a.id;
-        onDone(false);
-        return;
-    }
-
-    if (a.channel == "sms") {
+    if (channel == "sms") {
         notifier.sendSms(a.phone, smsBody, [a, onDone](bool ok) {
             if (ok) {
                 LOG_INFO << "[alerts] SMS sent pair=" << a.pair << " phone=" << a.phone;
@@ -54,7 +54,7 @@ void dispatchOne(Notifier &notifier, const alerts::TriggeredAlert &t,
             }
             onDone(ok);
         });
-    } else if (a.channel == "call") {
+    } else if (channel == "call") {
         notifier.sendCall(a.phone, a.customMessage, [a, onDone](bool ok) {
             if (ok) {
                 LOG_INFO << "[alerts] call placed pair=" << a.pair << " phone=" << a.phone;
@@ -71,6 +71,29 @@ void dispatchOne(Notifier &notifier, const alerts::TriggeredAlert &t,
                 LOG_WARN << "[alerts] email failed pair=" << a.pair << " email=" << a.email;
             }
             onDone(ok);
+        });
+    }
+}
+
+void dispatchAllChannels(Notifier &notifier, const alerts::TriggeredAlert &t,
+                         std::function<void(bool)> onDone) {
+    auto channels = t.alert.effectiveChannels();
+    if (channels.empty()) {
+        LOG_ERROR << "[alerts] notification skipped: no channels id=" << t.alert.id;
+        onDone(false);
+        return;
+    }
+    if (channels.size() == 1) {
+        dispatchOneChannel(notifier, t, channels.front(), std::move(onDone));
+        return;
+    }
+
+    auto remaining = std::make_shared<std::atomic<size_t>>(channels.size());
+    auto anyOk = std::make_shared<std::atomic<bool>>(false);
+    for (const auto &channel : channels) {
+        dispatchOneChannel(notifier, t, channel, [remaining, anyOk, onDone](bool ok) {
+            if (ok) anyOk->store(true);
+            if (remaining->fetch_sub(1) == 1) onDone(anyOk->load());
         });
     }
 }
@@ -132,7 +155,7 @@ void NotificationQueue::processJob(Job job) {
         }
         pushDlq(triggered.alert);
     };
-    dispatchOne(*notifier_, triggered, onDone);
+    dispatchAllChannels(*notifier_, triggered, onDone);
 }
 
 void NotificationQueue::pushDlq(const alerts::Alert &a) {

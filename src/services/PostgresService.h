@@ -74,9 +74,11 @@ class PostgresService {
 
     std::pair<int, int> deleteOldData(int daysToKeep);
 
-    void upsertAlert(const Json::Value &alert);
+    bool upsertAlert(const Json::Value &alert);
     bool deleteAlert(const std::string &alertId);
     std::vector<Json::Value> listAlerts();
+    int countAlerts() const;
+    int64_t alertUpsertFailures() const { return alertUpsertFailures_; }
 
     UserStateRow getOrCreateUserState(const std::string &userId);
     UserStateRow completeUserOnboarding(const std::string &userId);
@@ -109,6 +111,7 @@ class PostgresService {
   private:
     const core::Config &cfg_;
     drogon::orm::DbClientPtr client_;
+    int64_t alertUpsertFailures_ = 0;
 };
 
 }  // namespace ctraderplus::services
