@@ -189,6 +189,36 @@ void RedisService::deleteKey(const std::string &key, std::function<void()> cb) {
         [cb](const std::exception &) { cb(); }, "DEL %s", key.c_str());
 }
 
+std::optional<std::string> RedisService::getStringSync(const std::string &key) {
+    if (!client_) return std::nullopt;
+    try {
+        return client_->execCommandSync<std::optional<std::string>>(
+            [](const drogon::nosql::RedisResult &r) -> std::optional<std::string> {
+                if (r.type() == drogon::nosql::RedisResultType::kString) return r.asString();
+                return std::nullopt;
+            },
+            "GET %s", key.c_str());
+    } catch (const std::exception &e) {
+        LOG_WARN << "Redis getStringSync error: " << e.what();
+        return std::nullopt;
+    }
+}
+
+bool RedisService::setStringSync(const std::string &key, const std::string &value) {
+    if (!client_) return false;
+    try {
+        return client_->execCommandSync<bool>(
+            [](const drogon::nosql::RedisResult &r) {
+                return r.type() == drogon::nosql::RedisResultType::kStatus &&
+                       r.asString() == "OK";
+            },
+            "SET %s %s", key.c_str(), value.c_str());
+    } catch (const std::exception &e) {
+        LOG_WARN << "Redis setStringSync error: " << e.what();
+        return false;
+    }
+}
+
 void RedisService::requeueJsonBatch(const std::string &key,
                                     const std::vector<std::string> &items) {
     if (!client_ || items.empty()) return;

@@ -168,6 +168,7 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
     c.redisRecentKey = jstr(root, "redisRecentKey", c.redisRecentKey);
     c.redisRecentMaxlen = jint(root, "redisRecentMaxlen", c.redisRecentMaxlen);
     c.redisAlertQueueKey = jstr(root, "redisAlertQueueKey", c.redisAlertQueueKey);
+    c.redisCtraderTokenKey = jstr(root, "redisCtraderTokenKey", c.redisCtraderTokenKey);
     c.redisPubsubEnabled =
         envBool("REDIS_PUBSUB_ENABLED", jbool(root, "redisPubsubEnabled", c.redisPubsubEnabled));
     c.notificationDlqKey = jstr(root, "notificationDlqKey", c.notificationDlqKey);

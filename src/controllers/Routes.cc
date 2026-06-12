@@ -273,6 +273,7 @@ void streamHealth(const HttpRequestPtr &req,
         v["ctrader_rate_limit_count"] = app.ctrader->rateLimitCount();
         v["ctrader_last_error"] = app.ctrader->lastErrorCode();
         v["ctrader_circuit_breaker_open"] = app.ctrader->circuitBreakerOpen();
+        v["ctrader_token_degraded"] = app.ctrader->isTokenDegraded();
     }
     if (app.postgres) {
         v["db_alert_upsert_failures_total"] =

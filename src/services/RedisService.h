@@ -35,6 +35,10 @@ class RedisService {
                    std::function<void(std::optional<std::string>)> cb);
     void deleteKey(const std::string &key, std::function<void()> cb);
 
+    // Blocking helpers for startup paths (cTrader token load).
+    std::optional<std::string> getStringSync(const std::string &key);
+    bool setStringSync(const std::string &key, const std::string &value);
+
   private:
     const core::Config &cfg_;
     std::string host_ = "127.0.0.1";

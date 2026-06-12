@@ -61,6 +61,7 @@ struct Config {
     std::string redisRecentKey = "fx:observer:recent";
     int redisRecentMaxlen = 200;
     std::string redisAlertQueueKey = "fx:alerts:events";
+    std::string redisCtraderTokenKey = "fx:ctrader:tokens";
     bool redisPubsubEnabled = false;
     std::string notificationDlqKey = "fx:alerts:notifications:dlq";
 

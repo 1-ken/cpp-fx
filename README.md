@@ -130,11 +130,20 @@ variables in Dokploy (not build-time Docker ARGs — avoids baking secrets into
 image layers). Do not commit `.env`.
 
 - **Required:** `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`,
-  `CTRADER_ACCESS_TOKEN`, `CTRADER_ACCOUNT_ID`, `DATABASE_URL`, `REDIS_URL`,
-  `NEXTAUTH_SECRET`, `AUTH_DISABLED=0`
-- **Optional:** `CTRADER_HOST`, `CTRADER_REFRESH_TOKEN`, `WS_URL`,
-  `API_BASE_URL`, `ADMIN_PHONE`, `CORS_ALLOW_ORIGIN`, notification provider vars
-  (see [`.env.example`](.env.example))
+  `CTRADER_ACCESS_TOKEN`, `CTRADER_REFRESH_TOKEN`, `CTRADER_ACCOUNT_ID`,
+  `DATABASE_URL`, `REDIS_URL`, `NEXTAUTH_SECRET`, `AUTH_DISABLED=0`
+- **Optional:** `CTRADER_HOST`, `WS_URL`, `API_BASE_URL`, `ADMIN_PHONE`,
+  `CORS_ALLOW_ORIGIN`, notification provider vars (see [`.env.example`](.env.example))
+
+**cTrader tokens:** set both `CTRADER_ACCESS_TOKEN` and `CTRADER_REFRESH_TOKEN`
+from the [cTrader Playground](https://openapi.ctrader.com) OAuth flow. After the
+first successful refresh the server persists tokens to Redis key
+`fx:ctrader:tokens` (override via `redisCtraderTokenKey` in config); Redis wins
+over env on restart so production keeps working across redeploys.
+
+**Admin OTP:** set `ADMIN_PHONE` (backend) and `NEXT_PUBLIC_ADMIN_PHONE` (frontend,
+same E.164 value). SMS delivery requires `SMS_GATE_USERNAME` and
+`SMS_GATE_PASSWORD`; without them `/api/v1/admin/otp/request` returns 500.
 
 **Alert notifications (SMS / email / call)** include pair, trigger type (`price` /
 `candle_close`), custom message, and trigger time in **Kenya time (EAT)**.

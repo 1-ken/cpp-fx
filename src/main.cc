@@ -18,6 +18,7 @@
 #include "core/AppContext.h"
 #include "core/Config.h"
 #include "ctrader/CTraderClient.h"
+#include "ctrader/CTraderTokenStore.h"
 #include "ctrader/SymbolRegistry.h"
 #include "market/MarketHub.h"
 #include "market/SymbolSubscriptionPlanner.h"
@@ -37,7 +38,6 @@ int main() {
     LOG_INFO << "Starting cTrader Plus C++ observer";
 
     static ctrader::SymbolRegistry registry;
-    static ctrader::CTraderClient ctrader(cfg.ctrader);
     static market::MarketHub hub(cfg, registry);
     static alerts::AlertManager alertManager;
     static alerts::CandleAlertMonitor candleMonitor;
@@ -61,6 +61,22 @@ int main() {
 
     services::RedisService *redisPtr = redisOk ? &redis : nullptr;
     services::PostgresService *pgPtr = pgOk ? &postgres : nullptr;
+
+    core::CTraderConfig ctraderCfg = cfg.ctrader;
+    if (redisOk) {
+        ctrader::CTraderTokenStore::mergeFromRedis(redisPtr, cfg.redisCtraderTokenKey,
+                                                   ctraderCfg);
+    }
+    static ctrader::CTraderClient ctrader(ctraderCfg);
+    if (redisOk) {
+        ctrader.setOnTokensRefreshed([&](const std::string &access,
+                                         const std::string &refresh) {
+            ctraderCfg.accessToken = access;
+            ctraderCfg.refreshToken = refresh;
+            ctrader::CTraderTokenStore::save(redisPtr, cfg.redisCtraderTokenKey,
+                                             {access, refresh});
+        });
+    }
 
     subscriptionPlanner.setPostgres(pgPtr);
     alertManager.configure(pgPtr, redisPtr, dbExec, cfg.redisAlertQueueKey);

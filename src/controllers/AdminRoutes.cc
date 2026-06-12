@@ -182,16 +182,17 @@ void adminOtpRequest(const HttpRequestPtr &req,
         cb(jsonResp(resp));
     };
 
-    auto sendSms = [&]() {
+    const std::string smsTo = cfg.adminPhone;
+    auto sendSms = [finish, code, smsTo, &app]() {
         if (!app.notifier) {
             LOG_INFO << "Admin OTP (no notifier): " << code;
             finish(true);
             return;
         }
         std::string msg = "FX Alert admin code: " + code;
-        app.notifier->sendSms(cfg.adminPhone, msg, [finish](bool smsOk) {
+        app.notifier->sendSms(smsTo, msg, [finish](bool smsOk) {
             if (!smsOk) LOG_WARN << "Admin OTP SMS failed; code logged server-side";
-            finish(true);
+            finish(smsOk);
         });
     };
 

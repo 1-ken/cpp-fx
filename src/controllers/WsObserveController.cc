@@ -246,17 +246,30 @@ void WsObserveController::handleConnectionClosed(const WebSocketConnectionPtr &c
 
 void WsObserveController::broadcastToAll(std::shared_ptr<Json::Value> grouped) {
     if (!grouped) return;
-    std::vector<WebSocketConnectionPtr> snapshot;
+    struct Target {
+        WebSocketConnectionPtr conn;
+        std::shared_ptr<WsConnContext> ctx;
+    };
+    std::vector<Target> snapshot;
+    snapshot.reserve(16);
     {
         std::lock_guard<std::mutex> lk(connsMu_);
-        snapshot.assign(conns_.begin(), conns_.end());
+        snapshot.reserve(conns_.size());
+        for (const auto &conn : conns_) {
+            if (!conn || !conn->connected() || !conn->hasContext()) continue;
+            auto ctx = conn->getContext<WsConnContext>();
+            if (!ctx) continue;
+            snapshot.push_back({conn, ctx});
+        }
     }
-    for (auto &conn : snapshot) {
-        if (!conn->connected() || !conn->hasContext()) continue;
-        auto ctx = conn->getContext<WsConnContext>();
-        if (!ctx) continue;
-        Json::Value payload = enrich(*grouped, *ctx);
-        conn->send(toJsonString(payload));
+    for (auto &target : snapshot) {
+        if (!target.conn || !target.conn->connected() || !target.ctx) continue;
+        try {
+            Json::Value payload = enrich(*grouped, *target.ctx);
+            target.conn->send(toJsonString(payload));
+        } catch (const std::exception &e) {
+            LOG_WARN << "WebSocket broadcast failed: " << e.what();
+        }
     }
 }
 

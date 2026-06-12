@@ -31,6 +31,8 @@ using SymbolsCallback = std::function<void(std::vector<SymbolInfo>)>;
 using SpotCallback = std::function<void(const SpotUpdate &)>;
 using StateCallback = std::function<void(bool ready)>;
 using TrendbarsCallback = std::function<void(TrendbarsResult)>;
+using TokensRefreshedCallback =
+    std::function<void(const std::string &accessToken, const std::string &refreshToken)>;
 
 // Manages the TLS Protobuf connection to the cTrader Open API: application +
 // account auth, heartbeats, symbol discovery, spot subscriptions, live and
@@ -43,11 +45,15 @@ class CTraderClient {
     void setSymbolsCallback(SymbolsCallback cb) { symbolsCb_ = std::move(cb); }
     void setSpotCallback(SpotCallback cb) { spotCb_ = std::move(cb); }
     void setStateCallback(StateCallback cb) { stateCb_ = std::move(cb); }
+    void setOnTokensRefreshed(TokensRefreshedCallback cb) {
+        onTokensRefreshed_ = std::move(cb);
+    }
 
     void start();
     void stop();
 
     bool isReady() const { return ready_.load(); }
+    bool isTokenDegraded() const;
     int64_t reconnectCount() const { return reconnectCount_.load(); }
     int64_t rateLimitCount() const { return rateLimitCount_.load(); }
     std::string lastErrorCode() const;
@@ -87,6 +93,10 @@ class CTraderClient {
     void sendApplicationAuth();
     void sendRefreshToken();
     void sendAccountAuth();
+    void afterApplicationAuth();
+    void applyTokens(const std::string &accessToken, const std::string &refreshToken);
+    void enterTokenDegraded(const char *reason);
+    void tryHttpTokenRefresh(std::function<void(bool ok)> done);
     void sendSymbolsListReq();
     void subscribeSpotsBatched(const std::vector<int64_t> &ids);
     void unsubscribeSpotsBatched(const std::vector<int64_t> &ids);
@@ -129,6 +139,11 @@ class CTraderClient {
     SymbolsCallback symbolsCb_;
     SpotCallback spotCb_;
     StateCallback stateCb_;
+    TokensRefreshedCallback onTokensRefreshed_;
+
+    bool tokenDegraded_ = false;
+    double tokenDegradedUntil_ = 0;
+    int tokenRefreshFailures_ = 0;
 
     std::vector<int64_t> pendingSpotIds_;
     std::vector<int64_t> subscribedSpotIds_;

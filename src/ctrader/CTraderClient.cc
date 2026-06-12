@@ -4,12 +4,14 @@
 #include <chrono>
 #include <cstring>
 #include <random>
+#include <utility>
 
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 
 #include <trantor/utils/Logger.h>
 
+#include "ctrader/CTraderAuth.h"
 #include "ctrader/ProtoUtil.h"
 #include "util/HostResolve.h"
 
@@ -116,6 +118,15 @@ void CTraderClient::connect() {
     if (stopping_.load()) return;
     state_ = State::Connecting;
     ready_.store(false);
+
+    if (client_) {
+        client_->disconnect();
+        client_.reset();
+    }
+    if (conn_) {
+        conn_->shutdown();
+        conn_.reset();
+    }
 
     std::string ip = util::resolveHostToIpv4(cfg_.resolvedHost());
     if (ip.empty()) {
@@ -225,23 +236,15 @@ void CTraderClient::handleFrame(const std::string &payload) {
 
     if (type == PROTO_OA_APPLICATION_AUTH_RES) {
         LOG_INFO << "cTrader: application authenticated";
-        if (!cfg_.refreshToken.empty()) {
-            state_ = State::RefreshingToken;
-            sendRefreshToken();
-        } else {
-            state_ = State::AccountAuth;
-            sendAccountAuth();
-        }
+        afterApplicationAuth();
         return;
     }
     if (type == PROTO_OA_REFRESH_TOKEN_RES) {
         ProtoOARefreshTokenRes res;
         res.ParseFromString(inner);
-        cfg_.accessToken = res.accesstoken();
-        if (res.has_refreshtoken() && !res.refreshtoken().empty()) {
-            cfg_.refreshToken = res.refreshtoken();
-        }
-        LOG_INFO << "cTrader: access token refreshed";
+        std::string refresh = res.has_refreshtoken() ? res.refreshtoken() : "";
+        applyTokens(res.accesstoken(), refresh);
+        LOG_INFO << "cTrader: access token refreshed (proto)";
         state_ = State::AccountAuth;
         sendAccountAuth();
         return;
@@ -382,6 +385,60 @@ void CTraderClient::sendRefreshToken() {
     ProtoOARefreshTokenReq req;
     req.set_refreshtoken(cfg_.refreshToken);
     sendFramed(frame(req));
+}
+
+void CTraderClient::applyTokens(const std::string &accessToken,
+                                const std::string &refreshToken) {
+    cfg_.accessToken = accessToken;
+    if (!refreshToken.empty()) cfg_.refreshToken = refreshToken;
+    tokenDegraded_ = false;
+    tokenDegradedUntil_ = 0;
+    tokenRefreshFailures_ = 0;
+    if (onTokensRefreshed_) onTokensRefreshed_(cfg_.accessToken, cfg_.refreshToken);
+}
+
+void CTraderClient::enterTokenDegraded(const char *reason) {
+    tokenDegraded_ = true;
+    tokenDegradedUntil_ = monotonicSeconds() + 600.0;
+    LOG_ERROR << "cTrader: token degraded — " << reason;
+}
+
+bool CTraderClient::isTokenDegraded() const {
+    if (!tokenDegraded_) return false;
+    return monotonicSeconds() < tokenDegradedUntil_;
+}
+
+void CTraderClient::tryHttpTokenRefresh(std::function<void(bool ok)> done) {
+    refreshAccessTokenHttp(
+        cfg_, loop_,
+        [this, done = std::move(done)](std::optional<CTraderTokenPair> pair) mutable {
+            if (pair) {
+                applyTokens(pair->accessToken, pair->refreshToken);
+                LOG_INFO << "cTrader: access token refreshed (HTTP)";
+                done(true);
+                return;
+            }
+            done(false);
+        });
+}
+
+void CTraderClient::afterApplicationAuth() {
+    if (cfg_.refreshToken.empty()) {
+        LOG_ERROR << "cTrader: CTRADER_REFRESH_TOKEN missing; account auth may fail";
+        state_ = State::AccountAuth;
+        sendAccountAuth();
+        return;
+    }
+    tryHttpTokenRefresh([this](bool ok) {
+        if (ok) {
+            state_ = State::AccountAuth;
+            sendAccountAuth();
+            return;
+        }
+        LOG_WARN << "cTrader: HTTP token refresh failed; trying proto refresh";
+        state_ = State::RefreshingToken;
+        sendRefreshToken();
+    });
 }
 
 void CTraderClient::sendAccountAuth() {
@@ -568,6 +625,19 @@ void CTraderClient::handleOaError(const std::string &code, const std::string &de
         return;
     }
     if (code == "CH_ACCESS_TOKEN_INVALID" || code == "OA_AUTH_TOKEN_EXPIRED") {
+        if (++tokenRefreshFailures_ <= 2 && !cfg_.refreshToken.empty()) {
+            tryHttpTokenRefresh([this](bool ok) {
+                if (ok) {
+                    state_ = State::AccountAuth;
+                    sendAccountAuth();
+                    return;
+                }
+                enterTokenDegraded("token_refresh_failed");
+                forceDisconnectAndReconnect(2.0);
+            });
+            return;
+        }
+        enterTokenDegraded("token_invalid");
         forceDisconnectAndReconnect(2.0);
     }
 }
