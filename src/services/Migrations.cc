@@ -1,7 +1,5 @@
 #include "services/Migrations.h"
 
-#include <algorithm>
-#include <functional>
 #include <stdexcept>
 #include <vector>
 
@@ -13,6 +11,8 @@ namespace ctraderplus::services {
 
 namespace {
 
+constexpr int kSchemaReconcileVersion = 7;
+
 bool columnExists(const DbClientPtr &client, const std::string &table,
                   const std::string &column) {
     auto r = client->execSqlSync(
@@ -20,6 +20,12 @@ bool columnExists(const DbClientPtr &client, const std::string &table,
         "WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2 LIMIT 1",
         table, column);
     return r.size() > 0;
+}
+
+bool tableExists(const DbClientPtr &client, const std::string &table) {
+    auto r = client->execSqlSync(
+        "SELECT to_regclass('public.' || $1) IS NOT NULL AS ok", table);
+    return r.size() > 0 && r[0]["ok"].as<bool>();
 }
 
 void migrateAlertsJsonb(const DbClientPtr &client) {
@@ -53,16 +59,48 @@ void migrateAlertsJsonb(const DbClientPtr &client) {
         "THEN NULL ELSE to_char(last_evaluated_candle_time AT TIME ZONE 'UTC', "
         "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END"
         ") WHERE data IS NULL");
+}
 
-    auto r = client->execSqlSync(
-        "SELECT COUNT(*)::bigint AS n FROM alerts WHERE data IS NOT NULL");
-    if (r.size() > 0) {
-        LOG_INFO << "Migrated legacy alerts rows to JSONB data column (total with data: "
-                 << r[0]["n"].as<long long>() << ")";
+void reconcileAlertsLegacyNullable(const DbClientPtr &client) {
+    static const std::vector<std::pair<std::string, bool>> legacyCols = {
+        {"channel", false},       {"email", false},         {"phone", false},
+        {"custom_message", false}, {"triggered_at", false}, {"last_checked_price", false},
+        {"close_price", false},   {"target_price", false},  {"condition", false},
+        {"interval", true},       {"direction", false},    {"threshold", false},
+        {"last_evaluated_candle_time", false},
+    };
+    for (const auto &[col, quoted] : legacyCols) {
+        if (!columnExists(client, "alerts", col)) continue;
+        const std::string sqlCol = quoted ? "\"" + col + "\"" : col;
+        client->execSqlSync("ALTER TABLE alerts ALTER COLUMN " + sqlCol + " DROP NOT NULL");
     }
 }
 
-void migrationBaseline(const DbClientPtr &client) {
+void reconcileLegacyPricingUsers(const DbClientPtr &client) {
+    // Pre-pricing users: never logged in since last_login column existed (NULL),
+    // already onboarded, but subscription state was backfilled incorrectly.
+    auto r = client->execSqlSync(
+        "UPDATE user_states us SET "
+        "pricing_intro_required = TRUE, "
+        "subscription_tier = 'none', "
+        "trial_started_at = NULL, "
+        "tour_completed_at = NULL, "
+        "paywall_dismissed_at = NULL "
+        "FROM users u "
+        "WHERE us.user_id = u.user_id "
+        "AND us.pricing_intro_required = FALSE "
+        "AND us.onboarding_completed_at IS NOT NULL "
+        "AND u.last_login IS NULL "
+        "AND (us.trial_started_at IS NOT NULL "
+        "OR us.subscription_tier IN ('trial', 'free') "
+        "OR us.tour_completed_at IS NOT NULL)");
+    if (r.affectedRows() > 0) {
+        LOG_INFO << "Reconciled legacy pre-pricing users for tour-first trial (rows="
+                 << r.affectedRows() << ")";
+    }
+}
+
+void reconcileApplicationSchema(const DbClientPtr &client) {
     client->execSqlSync(
         "CREATE TABLE IF NOT EXISTS historical_prices ("
         "id BIGSERIAL PRIMARY KEY,"
@@ -71,6 +109,7 @@ void migrationBaseline(const DbClientPtr &client) {
         "observed_at TIMESTAMPTZ NOT NULL)");
     client->execSqlSync(
         "CREATE INDEX IF NOT EXISTS ix_hist_pair_time ON historical_prices(pair, observed_at)");
+
     client->execSqlSync(
         "CREATE TABLE IF NOT EXISTS stream_metrics ("
         "id BIGSERIAL PRIMARY KEY,"
@@ -81,6 +120,7 @@ void migrationBaseline(const DbClientPtr &client) {
         "stream_status VARCHAR(32) NOT NULL DEFAULT 'healthy')");
     client->execSqlSync(
         "CREATE INDEX IF NOT EXISTS ix_metrics_time ON stream_metrics(observed_at)");
+
     client->execSqlSync(
         "CREATE TABLE IF NOT EXISTS alerts ("
         "id VARCHAR(64) PRIMARY KEY,"
@@ -91,13 +131,12 @@ void migrationBaseline(const DbClientPtr &client) {
         "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
         "data JSONB NOT NULL DEFAULT '{}'::jsonb)");
     client->execSqlSync("CREATE INDEX IF NOT EXISTS ix_alerts_user_id ON alerts(user_id)");
+
     client->execSqlSync(
         "CREATE TABLE IF NOT EXISTS user_states ("
         "user_id VARCHAR(128) PRIMARY KEY,"
         "first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
         "onboarding_completed_at TIMESTAMPTZ)");
-    // Column/table names mirror the legacy Python/Alembic schema so a fresh C++
-    // install and an existing shared database stay compatible.
     client->execSqlSync(
         "CREATE TABLE IF NOT EXISTS users ("
         "user_id VARCHAR(128) PRIMARY KEY,"
@@ -110,6 +149,7 @@ void migrationBaseline(const DbClientPtr &client) {
         "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
     client->execSqlSync(
         "CREATE INDEX IF NOT EXISTS ix_users_username ON users(username)");
+
     client->execSqlSync(
         "CREATE TABLE IF NOT EXISTS user_favorites ("
         "id BIGSERIAL PRIMARY KEY,"
@@ -119,6 +159,7 @@ void migrationBaseline(const DbClientPtr &client) {
         "CONSTRAINT uq_user_favorites_user_pair UNIQUE (user_id, pair))");
     client->execSqlSync(
         "CREATE INDEX IF NOT EXISTS ix_user_favorites_user_id ON user_favorites(user_id)");
+
     client->execSqlSync(
         "CREATE TABLE IF NOT EXISTS user_activity_log ("
         "id UUID PRIMARY KEY,"
@@ -134,77 +175,57 @@ void migrationBaseline(const DbClientPtr &client) {
     client->execSqlSync(
         "CREATE INDEX IF NOT EXISTS ix_user_activity_log_event_type "
         "ON user_activity_log(event_type)");
-}
 
-void migrationUsersGoogleSub(const DbClientPtr &client) {
+    client->execSqlSync(
+        "CREATE TABLE IF NOT EXISTS cpp_schema_migrations ("
+        "version INT PRIMARY KEY,"
+        "name VARCHAR(128) NOT NULL,"
+        "applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
+
     client->execSqlSync(
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub VARCHAR(128)");
     client->execSqlSync(
         "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_google_sub ON users(google_sub) "
         "WHERE google_sub IS NOT NULL");
-}
+    client->execSqlSync(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ");
 
-void migrationAlertsSchemaValidate(const DbClientPtr &client) {
     client->execSqlSync("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS data JSONB");
     client->execSqlSync(
         "ALTER TABLE alerts ALTER COLUMN data SET DEFAULT '{}'::jsonb");
-
     if (columnExists(client, "alerts", "channel")) {
         migrateAlertsJsonb(client);
     } else {
         client->execSqlSync(
             "UPDATE alerts SET data = '{}'::jsonb WHERE data IS NULL");
     }
-}
+    reconcileAlertsLegacyNullable(client);
 
-void migrationAlertsLegacyNullable(const DbClientPtr &client) {
-    // Python/Alembic legacy flat columns may still exist with NOT NULL constraints.
-    // JSONB upserts only write core columns + data; legacy columns must be nullable.
-    static const std::vector<std::pair<std::string, bool>> legacyCols = {
-        {"channel", false},
-        {"email", false},
-        {"phone", false},
-        {"custom_message", false},
-        {"triggered_at", false},
-        {"last_checked_price", false},
-        {"close_price", false},
-        {"target_price", false},
-        {"condition", false},
-        {"interval", true},
-        {"direction", false},
-        {"threshold", false},
-        {"last_evaluated_candle_time", false},
-    };
-    for (const auto &[col, quoted] : legacyCols) {
-        if (!columnExists(client, "alerts", col)) continue;
-        const std::string sqlCol = quoted ? "\"" + col + "\"" : col;
-        client->execSqlSync("ALTER TABLE alerts ALTER COLUMN " + sqlCol + " DROP NOT NULL");
-    }
-    if (columnExists(client, "alerts", "channel")) {
-        LOG_INFO << "Legacy alerts flat columns are nullable (JSONB upsert compatible)";
-    }
-}
-
-struct MigrationStep {
-    int version;
-    const char *name;
-    std::function<void(const DbClientPtr &)> apply;
-};
-
-void recordMigration(const DbClientPtr &client, int version, const char *name);
-
-void ensureCppMigrationsTable(const DbClientPtr &client) {
     client->execSqlSync(
-        "CREATE TABLE IF NOT EXISTS cpp_schema_migrations ("
-        "version INT PRIMARY KEY,"
-        "name VARCHAR(128) NOT NULL,"
-        "applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
-}
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS tour_completed_at TIMESTAMPTZ");
+    client->execSqlSync(
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMPTZ");
+    client->execSqlSync(
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS subscription_tier "
+        "VARCHAR(32) NOT NULL DEFAULT 'none'");
+    client->execSqlSync(
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS paywall_dismissed_at TIMESTAMPTZ");
+    client->execSqlSync(
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS pricing_intro_required "
+        "BOOLEAN NOT NULL DEFAULT FALSE");
 
-bool tableExists(const DbClientPtr &client, const std::string &table) {
-    auto r = client->execSqlSync(
-        "SELECT to_regclass('public.' || $1) IS NOT NULL AS ok", table);
-    return r.size() > 0 && r[0]["ok"].as<bool>();
+    client->execSqlSync(
+        "CREATE TABLE IF NOT EXISTS user_daily_usage ("
+        "user_id VARCHAR(128) NOT NULL,"
+        "usage_date DATE NOT NULL,"
+        "sms_sent INT NOT NULL DEFAULT 0,"
+        "calls_made INT NOT NULL DEFAULT 0,"
+        "PRIMARY KEY (user_id, usage_date))");
+    client->execSqlSync(
+        "CREATE INDEX IF NOT EXISTS ix_user_daily_usage_user_date "
+        "ON user_daily_usage(user_id, usage_date)");
+
+    reconcileLegacyPricingUsers(client);
 }
 
 void validateApplicationSchema(const DbClientPtr &client) {
@@ -229,68 +250,17 @@ void validateApplicationSchema(const DbClientPtr &client) {
             "AND column_name = 'channel' LIMIT 1");
         if (r.size() > 0 && r[0]["is_nullable"].as<std::string>() == "NO") {
             throw std::runtime_error(
-                "Schema validation failed: alerts.channel is NOT NULL; "
-                "apply migration v5 alerts_legacy_nullable");
+                "Schema validation failed: alerts.channel is NOT NULL");
         }
     }
-    LOG_INFO << "PostgreSQL alerts schema validated (JSONB upsert compatible)";
-}
-
-// Infer how far a legacy Python/Alembic database already is (without touching
-// schema_migrations, which uses varchar version labels in that stack).
-int inferLegacySchemaVersion(const DbClientPtr &client) {
-    int version = 0;
-    if (tableExists(client, "historical_prices") || tableExists(client, "users"))
-        version = 1;
-    if (!columnExists(client, "alerts", "data")) return version;
-    version = 2;
-    if (columnExists(client, "users", "google_sub")) version = 3;
-    if (version >= 3 && columnExists(client, "alerts", "data")) version = 4;
-    if (version >= 4 && columnExists(client, "alerts", "channel")) {
-        auto r = client->execSqlSync(
-            "SELECT is_nullable FROM information_schema.columns "
-            "WHERE table_schema = 'public' AND table_name = 'alerts' "
-            "AND column_name = 'channel' LIMIT 1");
-        if (r.size() > 0 && r[0]["is_nullable"].as<std::string>() == "YES") version = 5;
-    } else if (version >= 4 && !columnExists(client, "alerts", "channel")) {
-        version = 5;
+    if (!columnExists(client, "users", "last_login")) {
+        throw std::runtime_error("Schema validation failed: users.last_login missing");
     }
-    return version;
-}
-
-void reconcileTrackedVersion(const DbClientPtr &client, int tracked, int actual) {
-    if (tracked <= actual) return;
-    LOG_WARN << "cpp_schema_migrations had v" << tracked << " but schema is v" << actual
-             << "; re-applying pending migrations";
-    client->execSqlSync("DELETE FROM cpp_schema_migrations WHERE version > $1", actual);
-}
-
-void seedCppMigrations(const DbClientPtr &client, int upToVersion,
-                       const std::vector<MigrationStep> &steps) {
-    for (const auto &step : steps) {
-        if (step.version > upToVersion) break;
-        recordMigration(client, step.version, step.name);
+    if (!columnExists(client, "user_states", "pricing_intro_required")) {
+        throw std::runtime_error(
+            "Schema validation failed: user_states.pricing_intro_required missing");
     }
-}
-
-int currentMigrationVersion(const DbClientPtr &client) {
-    ensureCppMigrationsTable(client);
-    auto r = client->execSqlSync(
-        "SELECT COALESCE(MAX(version), 0)::int AS v FROM cpp_schema_migrations");
-    if (r.size() == 0) return 0;
-    int tracked = r[0]["v"].as<int>();
-    int actual = inferLegacySchemaVersion(client);
-    if (tracked > 0) {
-        reconcileTrackedVersion(client, tracked, actual);
-        return std::min(tracked, actual);
-    }
-
-    int legacy = actual;
-    if (legacy > 0) {
-        LOG_INFO << "Detected legacy PostgreSQL schema at version " << legacy
-                 << "; recording in cpp_schema_migrations";
-    }
-    return legacy;
+    LOG_INFO << "PostgreSQL schema validated (reconcile compatible)";
 }
 
 void recordMigration(const DbClientPtr &client, int version, const char *name) {
@@ -305,36 +275,12 @@ void recordMigration(const DbClientPtr &client, int version, const char *name) {
 int runMigrations(const DbClientPtr &client) {
     if (!client) throw std::runtime_error("PostgreSQL client is null");
 
-    const std::vector<MigrationStep> steps = {
-        {1, "baseline", migrationBaseline},
-        {2, "alerts_jsonb", migrateAlertsJsonb},
-        {3, "users_google_sub", migrationUsersGoogleSub},
-        {4, "alerts_schema_validate", migrationAlertsSchemaValidate},
-        {5, "alerts_legacy_nullable", migrationAlertsLegacyNullable},
-    };
-
-    int current = currentMigrationVersion(client);
-    int appliedMax = current;
-
-    if (current > 0) {
-        auto tracked = client->execSqlSync(
-            "SELECT COUNT(*)::bigint AS n FROM cpp_schema_migrations");
-        if (tracked.size() > 0 && tracked[0]["n"].as<long long>() == 0) {
-            seedCppMigrations(client, current, steps);
-        }
-    }
-
-    for (const auto &step : steps) {
-        if (step.version <= current) continue;
-        LOG_INFO << "Applying migration v" << step.version << " " << step.name;
-        step.apply(client);
-        recordMigration(client, step.version, step.name);
-        appliedMax = step.version;
-        LOG_INFO << "Migration v" << step.version << " " << step.name << " applied";
-    }
-
+    LOG_INFO << "Reconciling PostgreSQL application schema...";
+    reconcileApplicationSchema(client);
     validateApplicationSchema(client);
-    return appliedMax;
+    recordMigration(client, kSchemaReconcileVersion, "schema_reconcile");
+    LOG_INFO << "Schema reconcile complete (version=" << kSchemaReconcileVersion << ")";
+    return kSchemaReconcileVersion;
 }
 
 }  // namespace ctraderplus::services

@@ -34,6 +34,7 @@
 #include "market/SymbolSubscriptionPlanner.h"
 #include "services/PostgresService.h"
 #include "services/RedisService.h"
+#include "services/SubscriptionService.h"
 #include "util/ForexMarketHours.h"
 #include "util/FormingCandle.h"
 #include "util/PairNormalizer.h"
@@ -56,6 +57,78 @@ HttpResponsePtr errResp(const std::string &detailKey, const std::string &msg, in
     Json::Value v;
     v[detailKey] = msg;
     return jsonResp(v, code);
+}
+
+HttpResponsePtr subscriptionErrResp(const services::SubscriptionCheckResult &check) {
+    Json::Value v;
+    v["detail"] = check.message;
+    v["code"] = check.code;
+    return jsonResp(v, 402);
+}
+
+void appendSubscriptionToBootstrap(Json::Value &v, services::PostgresService *pg,
+                                   const std::string &uid) {
+    if (!pg || !pg->available()) {
+        v["subscriptionTier"] = "none";
+        v["trialStartedAt"] = Json::Value::null;
+        v["tourCompletedAt"] = Json::Value::null;
+        v["trialDaysRemaining"] = 0;
+        v["trialExpired"] = false;
+        v["paywallRequired"] = false;
+        v["requiresPricingIntro"] = false;
+        Json::Value daily;
+        daily["sms"] = 0;
+        daily["smsLimit"] = services::SubscriptionService::kTrialSmsLimit;
+        daily["calls"] = 0;
+        daily["callsLimit"] = services::SubscriptionService::kTrialCallLimit;
+        v["dailyUsage"] = daily;
+        Json::Value freeLimits;
+        freeLimits["maxAlerts"] = services::SubscriptionService::kFreeMaxAlerts;
+        Json::Value allowedChannels(Json::arrayValue);
+        allowedChannels.append("sound");
+        freeLimits["allowedChannels"] = allowedChannels;
+        v["freeTierLimits"] = freeLimits;
+        return;
+    }
+    services::SubscriptionService sub(*pg);
+    auto state = sub.getState(uid);
+    Json::Value subJson = sub.toBootstrapJson(state);
+    for (const auto &key : subJson.getMemberNames()) {
+        v[key] = subJson[key];
+    }
+}
+
+bool rejectIfSubscriptionBlocksCreate(AppContext &app, const std::string &uid,
+                                      const std::vector<std::string> &channels,
+                                      std::function<void(const HttpResponsePtr &)> &cb) {
+    if (!app.postgres || !app.postgres->available()) return false;
+    services::SubscriptionService sub(*app.postgres);
+    const int activeCount = app.alerts
+                                ? static_cast<int>(app.alerts->getActiveAlertsForUser(uid).size())
+                                : 0;
+    auto check = sub.canCreateAlert(uid, channels, activeCount);
+    if (!check.allowed) {
+        cb(subscriptionErrResp(check));
+        return true;
+    }
+    return false;
+}
+
+bool rejectIfSubscriptionBlocksUpdate(AppContext &app, const std::string &uid,
+                                      const std::vector<std::string> &channels,
+                                      std::function<void(const HttpResponsePtr &)> &cb) {
+    if (!app.postgres || !app.postgres->available()) return false;
+    services::SubscriptionService sub(*app.postgres);
+    int activeCount = app.alerts
+                          ? static_cast<int>(app.alerts->getActiveAlertsForUser(uid).size())
+                          : 0;
+    if (activeCount > 0) --activeCount;
+    auto check = sub.canCreateAlert(uid, channels, activeCount);
+    if (!check.allowed) {
+        cb(subscriptionErrResp(check));
+        return true;
+    }
+    return false;
 }
 
 // Resolve the authenticated user; on failure invokes cb with an error response.
@@ -307,6 +380,7 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
         v["wsUrl"] = app.config->wsUrl;
         v["apiBaseUrl"] =
             app.config->apiBaseUrl.empty() ? Json::Value::null : Json::Value(app.config->apiBaseUrl);
+        appendSubscriptionToBootstrap(v, app.postgres, uid);
         return v;
     };
 
@@ -348,15 +422,121 @@ void onboardingComplete(const HttpRequestPtr &req,
                     cb(errResp("detail", "Database unavailable", 503));
                     return;
                 }
+                services::SubscriptionService sub(pg);
+                auto subState = sub.getState(uid);
                 Json::Value v;
                 v["success"] = true;
                 v["userId"] = st.userId;
                 v["onboardingCompletedAt"] = util::toIso8601(*st.onboardingCompletedAt);
                 v["isFirstTimeUser"] = false;
+                Json::Value subJson = sub.toBootstrapJson(subState);
+                for (const auto &key : subJson.getMemberNames()) {
+                    v[key] = subJson[key];
+                }
                 core::logApiOutcome("user", "onboarding_complete", true, 200, "ok", uid);
                 cb(jsonResp(v));
             } catch (const std::exception &e) {
                 core::logApiOutcome("user", "onboarding_complete", false, 503, e.what(), uid);
+                cb(errResp("detail", "Database unavailable", 503));
+            }
+        })) {
+        cb(errResp("detail", "Database not ready", 503));
+    }
+}
+
+void tourComplete(const HttpRequestPtr &req,
+                  std::function<void(const HttpResponsePtr &)> &&cb) {
+    auto &app = AppContext::instance();
+    std::string uid;
+    if (!authOrReject(req, cb, uid)) return;
+    if (!core::isDbReadyForAuth()) {
+        cb(errResp("detail", "Database not ready", 503));
+        return;
+    }
+    if (!core::withPostgres([&](services::PostgresService &pg) {
+            try {
+                services::SubscriptionService sub(pg);
+                auto state = sub.completeTour(uid);
+                Json::Value v;
+                v["success"] = true;
+                v["userId"] = uid;
+                Json::Value subJson = sub.toBootstrapJson(state);
+                for (const auto &key : subJson.getMemberNames()) {
+                    v[key] = subJson[key];
+                }
+                core::logApiOutcome("user", "tour_complete", true, 200, "ok", uid);
+                cb(jsonResp(v));
+            } catch (const std::exception &e) {
+                core::logApiOutcome("user", "tour_complete", false, 503, e.what(), uid);
+                cb(errResp("detail", "Database unavailable", 503));
+            }
+        })) {
+        cb(errResp("detail", "Database not ready", 503));
+    }
+}
+
+void dismissPaywall(const HttpRequestPtr &req,
+                    std::function<void(const HttpResponsePtr &)> &&cb) {
+    auto &app = AppContext::instance();
+    std::string uid;
+    if (!authOrReject(req, cb, uid)) return;
+    if (!core::isDbReadyForAuth()) {
+        cb(errResp("detail", "Database not ready", 503));
+        return;
+    }
+    if (!core::withPostgres([&](services::PostgresService &pg) {
+            try {
+                services::SubscriptionService sub(pg);
+                sub.dismissPaywall(uid);
+                auto state = sub.getState(uid);
+                Json::Value v;
+                v["success"] = true;
+                Json::Value subJson = sub.toBootstrapJson(state);
+                for (const auto &key : subJson.getMemberNames()) {
+                    v[key] = subJson[key];
+                }
+                cb(jsonResp(v));
+            } catch (const std::exception &e) {
+                cb(errResp("detail", "Database unavailable", 503));
+            }
+        })) {
+        cb(errResp("detail", "Database not ready", 503));
+    }
+}
+
+void selectTier(const HttpRequestPtr &req,
+                std::function<void(const HttpResponsePtr &)> &&cb) {
+    auto &app = AppContext::instance();
+    std::string uid;
+    if (!authOrReject(req, cb, uid)) return;
+    if (!core::isDbReadyForAuth()) {
+        cb(errResp("detail", "Database not ready", 503));
+        return;
+    }
+    auto body = req->getJsonObject();
+    if (!body || !body->isMember("tier") || !(*body)["tier"].isString()) {
+        cb(errResp("detail", "tier is required", 400));
+        return;
+    }
+    const std::string tier = (*body)["tier"].asString();
+    if (!core::withPostgres([&](services::PostgresService &pg) {
+            try {
+                services::SubscriptionService sub(pg);
+                std::string status;
+                if (!sub.selectTier(uid, tier, status)) {
+                    cb(errResp("detail", "Invalid subscription tier", 400));
+                    return;
+                }
+                auto state = sub.getState(uid);
+                Json::Value v;
+                v["success"] = true;
+                v["status"] = status;
+                Json::Value subJson = sub.toBootstrapJson(state);
+                for (const auto &key : subJson.getMemberNames()) {
+                    v[key] = subJson[key];
+                }
+                cb(jsonResp(v));
+            } catch (const std::exception &e) {
                 cb(errResp("detail", "Database unavailable", 503));
             }
         })) {
@@ -641,6 +821,7 @@ void createAlert(const HttpRequestPtr &req,
         cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
         return;
     }
+    if (rejectIfSubscriptionBlocksCreate(app, uid, channels, cb)) return;
 
     if (isCandle) {
         std::string interval = b["interval"].asString();
@@ -822,6 +1003,7 @@ void updateAlert(const HttpRequestPtr &req, std::function<void(const HttpRespons
         cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
         return;
     }
+    if (rejectIfSubscriptionBlocksUpdate(app, uid, channels, cb)) return;
     try {
         auto updated = app.alerts->updateAlert(alertId, updates, uid);
         if (!updated) {
@@ -869,6 +1051,9 @@ void registerRoutes() {
     fw.registerHandler("/stream-health", &streamHealth, {Get});
     fw.registerHandler("/me", &me, {Get});
     fw.registerHandler("/onboarding/complete", &onboardingComplete, {Post});
+    fw.registerHandler("/tour/complete", &tourComplete, {Post});
+    fw.registerHandler("/subscription/dismiss-paywall", &dismissPaywall, {Post});
+    fw.registerHandler("/subscription/select-tier", &selectTier, {Post});
 
     fw.registerHandler("/historical", &historical, {Get});
     fw.registerHandler("/historical/stream-metrics", &streamMetrics, {Get});

@@ -370,6 +370,10 @@ std::vector<Json::Value> PostgresService::listAlerts() {
 }
 
 UserStateRow PostgresService::getOrCreateUserState(const std::string &userId) {
+    return getUserStateFull(userId);
+}
+
+UserStateRow PostgresService::getUserStateFull(const std::string &userId) {
     UserStateRow row;
     row.userId = userId;
     if (!client_) return row;
@@ -381,50 +385,166 @@ UserStateRow PostgresService::getOrCreateUserState(const std::string &userId) {
         auto r = client_->execSqlSync(
             "SELECT EXTRACT(EPOCH FROM first_seen_at)::bigint AS fs, "
             "EXTRACT(EPOCH FROM onboarding_completed_at)::bigint AS oc, "
-            "onboarding_completed_at IS NULL AS is_null "
+            "onboarding_completed_at IS NULL AS oc_null, "
+            "EXTRACT(EPOCH FROM tour_completed_at)::bigint AS tc, "
+            "tour_completed_at IS NULL AS tc_null, "
+            "EXTRACT(EPOCH FROM trial_started_at)::bigint AS ts, "
+            "trial_started_at IS NULL AS ts_null, "
+            "COALESCE(subscription_tier, 'none') AS subscription_tier, "
+            "COALESCE(pricing_intro_required, FALSE) AS pricing_intro_required, "
+            "EXTRACT(EPOCH FROM paywall_dismissed_at)::bigint AS pd, "
+            "paywall_dismissed_at IS NULL AS pd_null "
             "FROM user_states WHERE user_id=$1",
             userId);
         if (r.size() > 0) {
             const auto &rr = r[0];
             row.firstSeenAt = static_cast<std::time_t>(rr["fs"].as<long long>());
-            if (!rr["is_null"].as<bool>())
+            if (!rr["oc_null"].as<bool>())
                 row.onboardingCompletedAt =
                     static_cast<std::time_t>(rr["oc"].as<long long>());
+            if (!rr["tc_null"].as<bool>())
+                row.tourCompletedAt = static_cast<std::time_t>(rr["tc"].as<long long>());
+            if (!rr["ts_null"].as<bool>())
+                row.trialStartedAt = static_cast<std::time_t>(rr["ts"].as<long long>());
+            row.subscriptionTier = rr["subscription_tier"].as<std::string>();
+            row.pricingIntroRequired = rr["pricing_intro_required"].as<bool>();
+            if (!rr["pd_null"].as<bool>())
+                row.paywallDismissedAt = static_cast<std::time_t>(rr["pd"].as<long long>());
         }
     } catch (const std::exception &e) {
-        LOG_ERROR << "getOrCreateUserState failed: " << e.what();
+        LOG_ERROR << "getUserStateFull failed: " << e.what();
         throw;
     }
     return row;
 }
 
 UserStateRow PostgresService::completeUserOnboarding(const std::string &userId) {
-    UserStateRow row;
-    row.userId = userId;
     if (!client_) throw std::runtime_error("Database unavailable");
     try {
         client_->execSqlSync(
             "INSERT INTO user_states(user_id, first_seen_at, onboarding_completed_at) "
             "VALUES($1, NOW(), NOW()) "
-            "ON CONFLICT (user_id) DO UPDATE SET onboarding_completed_at = "
-            "COALESCE(user_states.onboarding_completed_at, NOW())",
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "onboarding_completed_at = COALESCE(user_states.onboarding_completed_at, NOW())",
             userId);
-        auto r = client_->execSqlSync(
-            "SELECT EXTRACT(EPOCH FROM first_seen_at)::bigint AS fs, "
-            "EXTRACT(EPOCH FROM onboarding_completed_at)::bigint AS oc "
-            "FROM user_states WHERE user_id=$1",
+        client_->execSqlSync(
+            "UPDATE user_states SET "
+            "trial_started_at = COALESCE(trial_started_at, NOW()), "
+            "subscription_tier = CASE "
+            "WHEN subscription_tier IN ('none', '') THEN 'trial' "
+            "ELSE subscription_tier END "
+            "WHERE user_id = $1 AND pricing_intro_required = FALSE",
             userId);
-        if (r.size() > 0) {
-            const auto &rr = r[0];
-            row.firstSeenAt = static_cast<std::time_t>(rr["fs"].as<long long>());
-            row.onboardingCompletedAt =
-                static_cast<std::time_t>(rr["oc"].as<long long>());
-        }
+        return getUserStateFull(userId);
     } catch (const std::exception &e) {
         LOG_ERROR << "completeUserOnboarding failed: " << e.what();
         throw;
     }
-    return row;
+}
+
+UserStateRow PostgresService::completeTour(const std::string &userId) {
+    if (!client_) throw std::runtime_error("Database unavailable");
+    try {
+        client_->execSqlSync(
+            "INSERT INTO user_states(user_id, first_seen_at, tour_completed_at) "
+            "VALUES($1, NOW(), NOW()) "
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "tour_completed_at = COALESCE(user_states.tour_completed_at, NOW())",
+            userId);
+        client_->execSqlSync(
+            "UPDATE user_states SET "
+            "trial_started_at = COALESCE(trial_started_at, NOW()), "
+            "subscription_tier = 'trial', "
+            "pricing_intro_required = FALSE "
+            "WHERE user_id = $1 AND pricing_intro_required = TRUE",
+            userId);
+        return getUserStateFull(userId);
+    } catch (const std::exception &e) {
+        LOG_ERROR << "completeTour failed: " << e.what();
+        throw;
+    }
+}
+
+void PostgresService::autoDowngradeIfTrialExpired(const std::string &userId) {
+    if (!client_) return;
+    try {
+        client_->execSqlSync(
+            "UPDATE user_states SET subscription_tier = 'free' "
+            "WHERE user_id = $1 AND subscription_tier = 'trial' "
+            "AND trial_started_at IS NOT NULL "
+            "AND trial_started_at <= NOW() - INTERVAL '14 days'",
+            userId);
+    } catch (const std::exception &e) {
+        LOG_ERROR << "autoDowngradeIfTrialExpired failed: " << e.what();
+    }
+}
+
+void PostgresService::dismissPaywall(const std::string &userId) {
+    if (!client_) throw std::runtime_error("Database unavailable");
+    client_->execSqlSync(
+        "UPDATE user_states SET paywall_dismissed_at = COALESCE(paywall_dismissed_at, NOW()) "
+        "WHERE user_id = $1",
+        userId);
+}
+
+void PostgresService::setSubscriptionTier(const std::string &userId, const std::string &tier) {
+    if (!client_) throw std::runtime_error("Database unavailable");
+    client_->execSqlSync("UPDATE user_states SET subscription_tier = $2 WHERE user_id = $1",
+                         userId, tier);
+}
+
+DailyUsageRow PostgresService::getDailyUsage(const std::string &userId) {
+    DailyUsageRow usage;
+    if (!client_) return usage;
+    try {
+        auto r = client_->execSqlSync(
+            "SELECT COALESCE(sms_sent, 0)::int AS sms, COALESCE(calls_made, 0)::int AS calls "
+            "FROM user_daily_usage WHERE user_id = $1 AND usage_date = CURRENT_DATE",
+            userId);
+        if (r.size() > 0) {
+            usage.smsSent = r[0]["sms"].as<int>();
+            usage.callsMade = r[0]["calls"].as<int>();
+        }
+    } catch (const std::exception &e) {
+        LOG_ERROR << "getDailyUsage failed: " << e.what();
+    }
+    return usage;
+}
+
+bool PostgresService::incrementDailySms(const std::string &userId) {
+    if (!client_) return false;
+    try {
+        auto r = client_->execSqlSync(
+            "INSERT INTO user_daily_usage(user_id, usage_date, sms_sent, calls_made) "
+            "VALUES($1, CURRENT_DATE, 1, 0) "
+            "ON CONFLICT (user_id, usage_date) DO UPDATE SET "
+            "sms_sent = user_daily_usage.sms_sent + 1 "
+            "WHERE user_daily_usage.sms_sent < 10 "
+            "RETURNING sms_sent",
+            userId);
+        return r.size() > 0;
+    } catch (const std::exception &e) {
+        LOG_ERROR << "incrementDailySms failed: " << e.what();
+        return false;
+    }
+}
+
+bool PostgresService::incrementDailyCall(const std::string &userId) {
+    if (!client_) return false;
+    try {
+        auto r = client_->execSqlSync(
+            "INSERT INTO user_daily_usage(user_id, usage_date, sms_sent, calls_made) "
+            "VALUES($1, CURRENT_DATE, 0, 1) "
+            "ON CONFLICT (user_id, usage_date) DO UPDATE SET "
+            "calls_made = user_daily_usage.calls_made + 1 "
+            "WHERE user_daily_usage.calls_made < 5 "
+            "RETURNING calls_made",
+            userId);
+        return r.size() > 0;
+    } catch (const std::exception &e) {
+        LOG_ERROR << "incrementDailyCall failed: " << e.what();
+        return false;
+    }
 }
 
 UserRow PostgresService::createUser(const std::string &userId, const std::string &username,
@@ -484,6 +604,15 @@ void PostgresService::upsertGoogleUser(const std::string &userId,
         "email=EXCLUDED.email, display_name=EXCLUDED.display_name, "
         "avatar_url=EXCLUDED.avatar_url, google_sub=EXCLUDED.google_sub, auth_provider='google'",
         userId, uname, email, displayName, avatarUrl, googleSub);
+}
+
+void PostgresService::updateLastLogin(const std::string &userId) {
+    if (!client_) return;
+    try {
+        client_->execSqlSync("UPDATE users SET last_login = NOW() WHERE user_id = $1", userId);
+    } catch (const std::exception &e) {
+        LOG_ERROR << "updateLastLogin failed: " << e.what();
+    }
 }
 
 std::vector<std::string> PostgresService::listFavorites(const std::string &userId) {
@@ -613,10 +742,7 @@ Json::Value PostgresService::adminListUsers() {
             "AS triggered_alerts, "
             "(SELECT COUNT(*)::int FROM user_favorites f WHERE f.user_id=u.user_id) AS favorites_count, "
             "(SELECT COUNT(*)::int FROM user_activity_log al WHERE al.user_id=u.user_id) AS activity_count, "
-            "(SELECT to_char(MAX(al.created_at) AT TIME ZONE 'UTC', "
-            "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM user_activity_log al "
-            "WHERE al.user_id=u.user_id AND al.event_type IN ('login_success', 'google_oauth')) "
-            "AS last_login_at "
+            "to_char(u.last_login AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS last_login_at "
             "FROM users u ORDER BY u.created_at DESC LIMIT 500");
         for (const auto &row : r) {
             Json::Value u;

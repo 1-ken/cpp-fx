@@ -8,6 +8,9 @@
 
 #include "services/Notifier.h"
 #include "services/RedisService.h"
+#include "services/PostgresService.h"
+#include "services/SubscriptionService.h"
+#include "core/AppContext.h"
 #include "util/TimeUtil.h"
 
 namespace ctraderplus::services {
@@ -34,6 +37,18 @@ void dispatchOneChannel(Notifier &notifier, const alerts::TriggeredAlert &t,
         return;
     }
 
+    auto &app = core::AppContext::instance();
+    if ((channel == "sms" || channel == "call") && app.postgres && app.postgres->available()) {
+        services::SubscriptionService sub(*app.postgres);
+        auto check = sub.canSendNotification(a.userId, channel);
+        if (!check.allowed) {
+            LOG_WARN << "[alerts] notification skipped (" << check.code << "): " << check.message
+                     << " pair=" << a.pair << " id=" << a.id << " channel=" << channel;
+            onDone(true);
+            return;
+        }
+    }
+
     LOG_INFO << "[alerts] dispatch notification channel=" << channel << " pair=" << a.pair
              << " id=" << a.id;
 
@@ -46,18 +61,20 @@ void dispatchOneChannel(Notifier &notifier, const alerts::TriggeredAlert &t,
     std::string subject = Notifier::formatAlertSubject(a.pair, a.alertType);
 
     if (channel == "sms") {
-        notifier.sendSms(a.phone, smsBody, [a, onDone](bool ok) {
+        notifier.sendSms(a.phone, smsBody, [a, onDone, postgres = app.postgres](bool ok) {
             if (ok) {
                 LOG_INFO << "[alerts] SMS sent pair=" << a.pair << " phone=" << a.phone;
+                if (postgres && postgres->available()) postgres->incrementDailySms(a.userId);
             } else {
                 LOG_WARN << "[alerts] SMS failed pair=" << a.pair << " phone=" << a.phone;
             }
             onDone(ok);
         });
     } else if (channel == "call") {
-        notifier.sendCall(a.phone, a.customMessage, [a, onDone](bool ok) {
+        notifier.sendCall(a.phone, a.customMessage, [a, onDone, postgres = app.postgres](bool ok) {
             if (ok) {
                 LOG_INFO << "[alerts] call placed pair=" << a.pair << " phone=" << a.phone;
+                if (postgres && postgres->available()) postgres->incrementDailyCall(a.userId);
             } else {
                 LOG_WARN << "[alerts] call failed pair=" << a.pair << " phone=" << a.phone;
             }

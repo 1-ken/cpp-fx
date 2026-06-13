@@ -155,6 +155,7 @@ void authLogin(const HttpRequestPtr &req,
                 }
                 logActivityAsync(user->userId, "login_success", clientIp(req),
                                  clientUserAgent(req));
+                pg.updateLastLogin(user->userId);
                 core::logApiOutcome("auth", "login", true, 200, "username=" + username,
                                     user->userId);
                 Json::Value v;
@@ -191,6 +192,7 @@ void authGoogleSync(const HttpRequestPtr &req,
     if (!core::withPostgres([&](services::PostgresService &pg) {
             try {
                 pg.upsertGoogleUser(uid, googleSub, email, displayName, avatarUrl);
+                pg.updateLastLogin(uid);
                 logActivityAsync(uid, "google_oauth", clientIp(req), clientUserAgent(req));
                 core::logApiOutcome("auth", "google_sync", true, 200,
                                     "google_sub=" + googleSub, uid);

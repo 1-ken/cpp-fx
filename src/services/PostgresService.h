@@ -32,6 +32,16 @@ struct UserStateRow {
     std::string userId;
     std::time_t firstSeenAt = 0;
     std::optional<std::time_t> onboardingCompletedAt;
+    std::optional<std::time_t> tourCompletedAt;
+    std::optional<std::time_t> trialStartedAt;
+    std::string subscriptionTier = "none";
+    std::optional<std::time_t> paywallDismissedAt;
+    bool pricingIntroRequired = false;
+};
+
+struct DailyUsageRow {
+    int smsSent = 0;
+    int callsMade = 0;
 };
 
 struct UserRow {
@@ -43,6 +53,7 @@ struct UserRow {
     std::string avatarUrl;
     std::string authProvider;
     std::time_t createdAt = 0;
+    std::optional<std::time_t> lastLogin;
     bool disabled = false;
 };
 
@@ -81,7 +92,15 @@ class PostgresService {
     int64_t alertUpsertFailures() const { return alertUpsertFailures_; }
 
     UserStateRow getOrCreateUserState(const std::string &userId);
+    UserStateRow getUserStateFull(const std::string &userId);
     UserStateRow completeUserOnboarding(const std::string &userId);
+    UserStateRow completeTour(const std::string &userId);
+    void autoDowngradeIfTrialExpired(const std::string &userId);
+    void dismissPaywall(const std::string &userId);
+    void setSubscriptionTier(const std::string &userId, const std::string &tier);
+    DailyUsageRow getDailyUsage(const std::string &userId);
+    bool incrementDailySms(const std::string &userId);
+    bool incrementDailyCall(const std::string &userId);
 
     // Users / auth
     UserRow createUser(const std::string &userId, const std::string &username,
@@ -90,6 +109,7 @@ class PostgresService {
     void upsertGoogleUser(const std::string &userId, const std::string &googleSub,
                           const std::string &email, const std::string &displayName,
                           const std::string &avatarUrl);
+    void updateLastLogin(const std::string &userId);
 
     // Favorites
     std::vector<std::string> listFavorites(const std::string &userId);
