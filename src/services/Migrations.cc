@@ -225,6 +225,32 @@ void reconcileApplicationSchema(const DbClientPtr &client) {
         "CREATE INDEX IF NOT EXISTS ix_user_daily_usage_user_date "
         "ON user_daily_usage(user_id, usage_date)");
 
+    client->execSqlSync(
+        "CREATE TABLE IF NOT EXISTS marketers ("
+        "code VARCHAR(64) PRIMARY KEY,"
+        "name VARCHAR(256) NOT NULL,"
+        "active BOOLEAN NOT NULL DEFAULT true,"
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
+
+    client->execSqlSync(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_marketer_code VARCHAR(64)");
+    client->execSqlSync(
+        "CREATE INDEX IF NOT EXISTS ix_users_referred_by_marketer "
+        "ON users(referred_by_marketer_code) "
+        "WHERE referred_by_marketer_code IS NOT NULL");
+
+    client->execSqlSync(
+        "CREATE TABLE IF NOT EXISTS user_feedback ("
+        "id UUID PRIMARY KEY,"
+        "user_id VARCHAR(128) NOT NULL,"
+        "enjoying BOOLEAN NOT NULL,"
+        "improvements TEXT,"
+        "source VARCHAR(64) NOT NULL DEFAULT 'alert_create',"
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
+    client->execSqlSync(
+        "CREATE INDEX IF NOT EXISTS ix_user_feedback_created_at "
+        "ON user_feedback(created_at DESC)");
+
     reconcileLegacyPricingUsers(client);
 }
 
@@ -259,6 +285,9 @@ void validateApplicationSchema(const DbClientPtr &client) {
     if (!columnExists(client, "user_states", "pricing_intro_required")) {
         throw std::runtime_error(
             "Schema validation failed: user_states.pricing_intro_required missing");
+    }
+    if (!tableExists(client, "user_feedback")) {
+        throw std::runtime_error("Schema validation failed: user_feedback table missing");
     }
     LOG_INFO << "PostgreSQL schema validated (reconcile compatible)";
 }

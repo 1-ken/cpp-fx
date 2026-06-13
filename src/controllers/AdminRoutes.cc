@@ -52,6 +52,26 @@ std::string trim(const std::string &s) {
     return s.substr(a, b - a + 1);
 }
 
+std::string normalizeMarketerCode(const std::string &code) {
+    std::string out;
+    out.reserve(code.size());
+    for (unsigned char c : code) {
+        if (c >= 'A' && c <= 'Z')
+            out.push_back(static_cast<char>(c + 32));
+        else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')
+            out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
+bool isValidMarketerCodeFormat(const std::string &code) {
+    if (code.size() < 3 || code.size() > 32) return false;
+    for (unsigned char c : code) {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
+    }
+    return true;
+}
+
 std::string normalizePhone(const std::string &phone) {
     std::string out;
     for (char c : phone) {
@@ -336,6 +356,9 @@ void adminActivity(const HttpRequestPtr &req,
     if (!adminOrReject(req, cb)) return;
     if (!adminDbReadyOrReject(cb)) return;
     std::string eventType = req->getParameter("event_type");
+    std::string userId = trim(req->getParameter("user_id"));
+    std::string startDate = trim(req->getParameter("start_date"));
+    std::string endDate = trim(req->getParameter("end_date"));
     int limit = 100;
     if (!req->getParameter("limit").empty()) {
         try {
@@ -345,10 +368,11 @@ void adminActivity(const HttpRequestPtr &req,
     }
     auto &app = AppContext::instance();
     auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
-    app.dbExec([&app, eventType, limit, callback]() {
+    app.dbExec([&app, eventType, userId, startDate, endDate, limit, callback]() {
         try {
             Json::Value v;
-            v["items"] = app.postgres->adminListActivity(eventType, limit);
+            v["items"] = app.postgres->adminListActivity(eventType, userId, startDate, endDate,
+                                                         limit);
             core::logApiOutcome("admin", "activity", true, 200,
                                 "count=" + std::to_string(v["items"].size()));
             (*callback)(jsonResp(v));
@@ -369,6 +393,150 @@ void adminSystemHealth(const HttpRequestPtr &req,
     cb(jsonResp(out, code));
 }
 
+void adminListMarketers(const HttpRequestPtr &req,
+                        std::function<void(const HttpResponsePtr &)> &&cb) {
+    if (!adminOrReject(req, cb)) return;
+    if (!adminDbReadyOrReject(cb)) return;
+    auto &app = AppContext::instance();
+    auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    app.dbExec([&app, callback]() {
+        try {
+            Json::Value v;
+            v["items"] = app.postgres->adminListMarketers();
+            core::logApiOutcome("admin", "marketers_list", true, 200,
+                                "count=" + std::to_string(v["items"].size()));
+            (*callback)(jsonResp(v));
+        } catch (const std::exception &e) {
+            core::logApiOutcome("admin", "marketers_list", false, 500, e.what());
+            (*callback)(errResp("Failed to load marketers", 500));
+        }
+    });
+}
+
+void adminCreateMarketer(const HttpRequestPtr &req,
+                         std::function<void(const HttpResponsePtr &)> &&cb) {
+    if (!adminOrReject(req, cb)) return;
+    if (!adminDbReadyOrReject(cb)) return;
+
+    auto body = req->getJsonObject();
+    if (!body) {
+        cb(errResp("Invalid request body", 400));
+        return;
+    }
+
+    std::string code = normalizeMarketerCode(trim(body->get("code", "").asString()));
+    std::string name = trim(body->get("name", "").asString());
+    if (!isValidMarketerCodeFormat(code)) {
+        cb(errResp("Marketer code must be 3-32 characters (a-z, 0-9, underscore)", 400));
+        return;
+    }
+    if (name.empty()) {
+        cb(errResp("Marketer name is required", 400));
+        return;
+    }
+
+    auto &app = AppContext::instance();
+    auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    app.dbExec([&app, code, name, callback]() {
+        try {
+            Json::Value item = app.postgres->adminCreateMarketer(code, name);
+            core::logApiOutcome("admin", "marketers_create", true, 201, "code=" + code);
+            (*callback)(jsonResp(item, 201));
+        } catch (const std::exception &e) {
+            std::string msg = e.what();
+            if (msg.find("duplicate") != std::string::npos ||
+                msg.find("unique") != std::string::npos) {
+                core::logApiOutcome("admin", "marketers_create", false, 409, "code_taken");
+                (*callback)(errResp("Marketer code already exists", 409));
+                return;
+            }
+            core::logApiOutcome("admin", "marketers_create", false, 500, msg);
+            (*callback)(errResp("Failed to create marketer", 500));
+        }
+    });
+}
+
+void adminUpdateMarketer(const HttpRequestPtr &req,
+                         std::function<void(const HttpResponsePtr &)> &&cb,
+                         std::string code) {
+    if (!adminOrReject(req, cb)) return;
+    if (!adminDbReadyOrReject(cb)) return;
+
+    code = normalizeMarketerCode(trim(code));
+    if (!isValidMarketerCodeFormat(code)) {
+        cb(errResp("Invalid marketer code", 400));
+        return;
+    }
+
+    auto body = req->getJsonObject();
+    if (!body) {
+        cb(errResp("Invalid request body", 400));
+        return;
+    }
+
+    std::optional<std::string> name;
+    std::optional<bool> active;
+    if (body->isMember("name")) name = trim(body->get("name", "").asString());
+    if (body->isMember("active")) active = body->get("active", false).asBool();
+    if (!name && !active) {
+        cb(errResp("Nothing to update", 400));
+        return;
+    }
+    if (name && name->empty()) {
+        cb(errResp("Marketer name cannot be empty", 400));
+        return;
+    }
+
+    auto &app = AppContext::instance();
+    auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    app.dbExec([&app, code, name, active, callback]() {
+        try {
+            Json::Value item = app.postgres->adminUpdateMarketer(code, name, active);
+            core::logApiOutcome("admin", "marketers_update", true, 200, "code=" + code);
+            (*callback)(jsonResp(item));
+        } catch (const std::runtime_error &e) {
+            std::string msg = e.what();
+            if (msg.find("not found") != std::string::npos) {
+                core::logApiOutcome("admin", "marketers_update", false, 404, msg);
+                (*callback)(errResp("Marketer not found", 404));
+                return;
+            }
+            core::logApiOutcome("admin", "marketers_update", false, 500, msg);
+            (*callback)(errResp("Failed to update marketer", 500));
+        } catch (const std::exception &e) {
+            core::logApiOutcome("admin", "marketers_update", false, 500, e.what());
+            (*callback)(errResp("Failed to update marketer", 500));
+        }
+    });
+}
+
+void adminFeedback(const HttpRequestPtr &req,
+                   std::function<void(const HttpResponsePtr &)> &&cb) {
+    if (!adminOrReject(req, cb)) return;
+    if (!adminDbReadyOrReject(cb)) return;
+    int limit = 100;
+    if (!req->getParameter("limit").empty()) {
+        try {
+            limit = std::stoi(req->getParameter("limit"));
+        } catch (...) {
+        }
+    }
+    auto &app = AppContext::instance();
+    auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    app.dbExec([&app, limit, callback]() {
+        try {
+            Json::Value v;
+            v["items"] = app.postgres->adminListFeedback(limit);
+            core::logApiOutcome("admin", "feedback", true, 200,
+                                "count=" + std::to_string(v["items"].size()));
+            (*callback)(jsonResp(v));
+        } catch (const std::exception &e) {
+            core::logApiOutcome("admin", "feedback", false, 500, e.what());
+            (*callback)(errResp("Failed to load feedback", 500));
+        }
+    });
+}
+
 }  // namespace
 
 void registerAdminRoutes() {
@@ -379,7 +547,11 @@ void registerAdminRoutes() {
     fw.registerHandler("/api/v1/admin/metrics/users", &adminMetricsUsers, {Get});
     fw.registerHandler("/api/v1/admin/alerts", &adminAlerts, {Get});
     fw.registerHandler("/api/v1/admin/activity", &adminActivity, {Get});
+    fw.registerHandler("/api/v1/admin/feedback", &adminFeedback, {Get});
     fw.registerHandler("/api/v1/admin/system/health", &adminSystemHealth, {Get});
+    fw.registerHandler("/api/v1/admin/marketers", &adminListMarketers, {Get});
+    fw.registerHandler("/api/v1/admin/marketers", &adminCreateMarketer, {Post});
+    fw.registerHandler("/api/v1/admin/marketers/{1}", &adminUpdateMarketer, {Patch});
 }
 
 }  // namespace ctraderplus::controllers

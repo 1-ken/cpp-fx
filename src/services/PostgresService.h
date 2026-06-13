@@ -104,12 +104,15 @@ class PostgresService {
 
     // Users / auth
     UserRow createUser(const std::string &userId, const std::string &username,
-                       const std::string &passwordHash);
+                       const std::string &passwordHash,
+                       const std::string &marketerCode = "");
     std::optional<UserRow> findUserByUsername(const std::string &username);
     void upsertGoogleUser(const std::string &userId, const std::string &googleSub,
                           const std::string &email, const std::string &displayName,
                           const std::string &avatarUrl);
     void updateLastLogin(const std::string &userId);
+    bool isActiveMarketer(const std::string &code);
+    bool claimReferral(const std::string &userId, const std::string &marketerCode);
 
     // Favorites
     std::vector<std::string> listFavorites(const std::string &userId);
@@ -126,7 +129,17 @@ class PostgresService {
     Json::Value adminOverview();
     Json::Value adminListUsers();
     Json::Value adminListAlerts(const std::string &statusFilter, int limit);
-    Json::Value adminListActivity(const std::string &eventTypeFilter, int limit);
+    Json::Value adminListActivity(const std::string &eventTypeFilter,
+                                  const std::string &userIdFilter,
+                                  const std::string &startDateFilter,
+                                  const std::string &endDateFilter, int limit);
+    Json::Value adminListMarketers();
+    Json::Value adminCreateMarketer(const std::string &code, const std::string &name);
+    Json::Value adminUpdateMarketer(const std::string &code, const std::optional<std::string> &name,
+                                    const std::optional<bool> &active);
+    void insertUserFeedback(const std::string &userId, bool enjoying,
+                            const std::string &improvements, const std::string &source);
+    Json::Value adminListFeedback(int limit);
 
   private:
     const core::Config &cfg_;

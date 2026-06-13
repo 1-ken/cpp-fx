@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpResponse.h>
@@ -41,6 +42,35 @@ std::string trim(const std::string &s) {
     if (a == std::string::npos) return "";
     size_t b = s.find_last_not_of(" \t\r\n");
     return s.substr(a, b - a + 1);
+}
+
+std::string normalizeMarketerCode(const std::string &code) {
+    std::string out;
+    out.reserve(code.size());
+    for (unsigned char c : code) {
+        if (c >= 'A' && c <= 'Z')
+            out.push_back(static_cast<char>(c + 32));
+        else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')
+            out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
+bool isValidMarketerCodeFormat(const std::string &code) {
+    if (code.size() < 3 || code.size() > 32) return false;
+    for (unsigned char c : code) {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
+    }
+    return true;
+}
+
+std::optional<std::string> resolveMarketerCode(const std::string &raw,
+                                               services::PostgresService &pg) {
+    std::string code = normalizeMarketerCode(trim(raw));
+    if (code.empty()) return std::nullopt;
+    if (!isValidMarketerCodeFormat(code)) return std::nullopt;
+    if (!pg.isActiveMarketer(code)) return std::nullopt;
+    return code;
 }
 
 bool authOrReject(const HttpRequestPtr &req,
@@ -103,7 +133,13 @@ void authRegister(const HttpRequestPtr &req,
                 std::string userId = util::generateUuid();
                 if (userId.empty()) userId = username;
                 std::string hash = core::hashPassword(password);
-                pg.createUser(userId, username, hash);
+                std::string marketerCode;
+                if (body->isMember("marketer_code")) {
+                    auto resolved = resolveMarketerCode(
+                        body->get("marketer_code", "").asString(), pg);
+                    if (resolved) marketerCode = *resolved;
+                }
+                pg.createUser(userId, username, hash, marketerCode);
                 logActivityAsync(userId, "register", clientIp(req), clientUserAgent(req));
                 core::logApiOutcome("auth", "register", true, 200, "username=" + username,
                                     userId);
@@ -209,6 +245,42 @@ void authGoogleSync(const HttpRequestPtr &req,
     }
 }
 
+void authClaimReferral(const HttpRequestPtr &req,
+                     std::function<void(const HttpResponsePtr &)> &&cb) {
+    std::string uid;
+    if (!authOrReject(req, cb, uid)) return;
+    if (!dbReadyOrReject(cb)) return;
+
+    auto body = req->getJsonObject();
+    if (!body) {
+        core::logApiOutcome("auth", "claim_referral", false, 400, "invalid_body", uid);
+        cb(errResp("Invalid request body", 400));
+        return;
+    }
+
+    if (!core::withPostgres([&](services::PostgresService &pg) {
+            try {
+                auto resolved = resolveMarketerCode(
+                    body->get("marketer_code", "").asString(), pg);
+                Json::Value v;
+                v["success"] = true;
+                v["attributed"] = false;
+                if (resolved) {
+                    v["attributed"] = pg.claimReferral(uid, *resolved);
+                }
+                core::logApiOutcome("auth", "claim_referral", true, 200,
+                                    v["attributed"].asBool() ? "attributed" : "skipped", uid);
+                cb(jsonResp(v));
+            } catch (const std::exception &e) {
+                LOG_ERROR << "[auth] claim_referral ERROR: " << e.what();
+                core::logApiOutcome("auth", "claim_referral", false, 500, e.what(), uid);
+                cb(errResp("Claim referral failed", 500));
+            }
+        })) {
+        cb(errResp("Database not ready", 503));
+    }
+}
+
 }  // namespace
 
 void registerAuthRoutes() {
@@ -216,6 +288,7 @@ void registerAuthRoutes() {
     fw.registerHandler("/api/v1/auth/register", &authRegister, {Post});
     fw.registerHandler("/api/v1/auth/login", &authLogin, {Post});
     fw.registerHandler("/api/v1/auth/oauth/google-sync", &authGoogleSync, {Post});
+    fw.registerHandler("/api/v1/auth/claim-referral", &authClaimReferral, {Post});
 }
 
 }  // namespace ctraderplus::controllers

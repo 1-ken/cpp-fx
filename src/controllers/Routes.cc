@@ -444,6 +444,48 @@ void onboardingComplete(const HttpRequestPtr &req,
     }
 }
 
+void submitFeedback(const HttpRequestPtr &req,
+                    std::function<void(const HttpResponsePtr &)> &&cb) {
+    std::string uid;
+    if (!authOrReject(req, cb, uid)) return;
+    if (!core::isDbReadyForAuth()) {
+        cb(errResp("detail", "Database not ready", 503));
+        return;
+    }
+
+    auto body = req->getJsonObject();
+    if (!body || !body->isMember("enjoying") || !(*body)["enjoying"].isBool()) {
+        cb(errResp("detail", "Field 'enjoying' (boolean) is required", 400));
+        return;
+    }
+
+    const bool enjoying = (*body)["enjoying"].asBool();
+    std::string improvements;
+    if (body->isMember("improvements") && (*body)["improvements"].isString()) {
+        improvements = (*body)["improvements"].asString();
+    }
+    std::string source = "alert_create";
+    if (body->isMember("source") && (*body)["source"].isString()) {
+        source = (*body)["source"].asString();
+        if (source.size() > 64) source = source.substr(0, 64);
+    }
+
+    if (!core::withPostgres([&](services::PostgresService &pg) {
+            try {
+                pg.insertUserFeedback(uid, enjoying, improvements, source);
+                Json::Value v;
+                v["success"] = true;
+                core::logApiOutcome("user", "feedback", true, 200, enjoying ? "yes" : "no", uid);
+                cb(jsonResp(v));
+            } catch (const std::exception &e) {
+                core::logApiOutcome("user", "feedback", false, 500, e.what(), uid);
+                cb(errResp("detail", "Failed to save feedback", 500));
+            }
+        })) {
+        cb(errResp("detail", "Database not ready", 503));
+    }
+}
+
 void tourComplete(const HttpRequestPtr &req,
                   std::function<void(const HttpResponsePtr &)> &&cb) {
     auto &app = AppContext::instance();
@@ -1051,6 +1093,7 @@ void registerRoutes() {
     fw.registerHandler("/stream-health", &streamHealth, {Get});
     fw.registerHandler("/me", &me, {Get});
     fw.registerHandler("/onboarding/complete", &onboardingComplete, {Post});
+    fw.registerHandler("/feedback", &submitFeedback, {Post});
     fw.registerHandler("/tour/complete", &tourComplete, {Post});
     fw.registerHandler("/subscription/dismiss-paywall", &dismissPaywall, {Post});
     fw.registerHandler("/subscription/select-tier", &selectTier, {Post});
