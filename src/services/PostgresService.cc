@@ -58,6 +58,63 @@ std::string dsnWithConnectTimeout(const std::string &dsn, int seconds) {
     return dsn + sep + "connect_timeout=" + std::to_string(seconds);
 }
 
+std::string trimUserStr(const std::string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+std::string normalizeUserPhone(const std::string &phone) {
+    std::string out;
+    out.reserve(phone.size());
+    for (char c : phone) {
+        if (std::isdigit(static_cast<unsigned char>(c))) out.push_back(c);
+        else if (c == '+' && out.empty()) out.push_back(c);
+    }
+    return out;
+}
+
+std::string deriveGoogleUsername(const std::string &displayName, const std::string &email,
+                                 const std::string &googleSub) {
+    std::string candidate = trimUserStr(displayName);
+    if (candidate.empty() && !email.empty()) {
+        auto at = email.find('@');
+        candidate = at == std::string::npos ? email : email.substr(0, at);
+        candidate = trimUserStr(candidate);
+    }
+    if (candidate.empty() && !googleSub.empty()) {
+        candidate = "user-" + googleSub.substr(0, std::min<size_t>(8, googleSub.size()));
+    }
+    if (candidate.size() > 128) candidate = candidate.substr(0, 128);
+    return candidate;
+}
+
+bool usernameTakenByOther(const DbClientPtr &client, const std::string &username,
+                          const std::string &excludeUserId) {
+    auto r = client->execSqlSync(
+        "SELECT 1 FROM users WHERE username = $1 AND user_id <> $2 LIMIT 1", username,
+        excludeUserId);
+    return r.size() > 0;
+}
+
+std::string resolveUniqueUsername(const DbClientPtr &client, const std::string &candidate,
+                                  const std::string &excludeUserId) {
+    if (candidate.empty()) return candidate;
+    std::string base = candidate.size() > 128 ? candidate.substr(0, 128) : candidate;
+    if (!usernameTakenByOther(client, base, excludeUserId)) return base;
+    for (int suffix = 2; suffix < 1000; ++suffix) {
+        std::string tag = "-" + std::to_string(suffix);
+        std::string attempt = base;
+        if (attempt.size() + tag.size() > 128) {
+            attempt = attempt.substr(0, 128 - tag.size());
+        }
+        attempt += tag;
+        if (!usernameTakenByOther(client, attempt, excludeUserId)) return attempt;
+    }
+    return base.substr(0, std::min<size_t>(120, base.size())) + "-x";
+}
+
 }  // namespace
 
 PostgresService::PostgresService(const core::Config &cfg) : cfg_(cfg) {}
@@ -604,16 +661,20 @@ void PostgresService::upsertGoogleUser(const std::string &userId,
                                        const std::string &displayName,
                                        const std::string &avatarUrl) {
     if (!client_) return;
-    std::string uname = "google:" + googleSub;
-    if (uname.size() > 128) uname = uname.substr(0, 128);
+    std::string candidate = deriveGoogleUsername(displayName, email, googleSub);
+    std::string uname = resolveUniqueUsername(client_, candidate, userId);
+    if (uname.empty()) {
+        uname = "google:" + googleSub;
+        if (uname.size() > 128) uname = uname.substr(0, 128);
+    }
     client_->execSqlSync(
         "INSERT INTO users(user_id, username, email, display_name, avatar_url, google_sub, "
         "auth_provider, created_at) "
         "VALUES($1, $2, $3, $4, $5, $6, 'google', NOW()) "
         "ON CONFLICT (user_id) DO UPDATE SET "
-        "email=EXCLUDED.email, display_name=EXCLUDED.display_name, "
+        "username=EXCLUDED.username, email=EXCLUDED.email, display_name=EXCLUDED.display_name, "
         "avatar_url=EXCLUDED.avatar_url, google_sub=EXCLUDED.google_sub, auth_provider='google'",
-        userId, uname, email, displayName, avatarUrl, googleSub);
+        userId, uname, email, uname, avatarUrl, googleSub);
 }
 
 void PostgresService::updateLastLogin(const std::string &userId) {
@@ -623,6 +684,39 @@ void PostgresService::updateLastLogin(const std::string &userId) {
     } catch (const std::exception &e) {
         LOG_ERROR << "updateLastLogin failed: " << e.what();
     }
+}
+
+std::optional<std::string> PostgresService::getUserPhone(const std::string &userId) {
+    if (!client_) return std::nullopt;
+    try {
+        auto r = client_->execSqlSync("SELECT phone FROM users WHERE user_id = $1", userId);
+        if (r.size() == 0 || r[0]["phone"].isNull()) return std::nullopt;
+        std::string phone = trimUserStr(r[0]["phone"].as<std::string>());
+        if (phone.empty()) return std::nullopt;
+        return phone;
+    } catch (const std::exception &e) {
+        LOG_ERROR << "getUserPhone failed: " << e.what();
+        return std::nullopt;
+    }
+}
+
+void PostgresService::updateUserPhone(const std::string &userId, const std::string &phone,
+                                      bool forceUpdate) {
+    if (!client_) throw std::runtime_error("Database unavailable");
+    std::string normalized = normalizeUserPhone(phone);
+    if (normalized.size() < 8) {
+        throw std::runtime_error("Phone number is too short");
+    }
+    if (normalized.size() > 32) normalized = normalized.substr(0, 32);
+    if (forceUpdate) {
+        client_->execSqlSync("UPDATE users SET phone = $2 WHERE user_id = $1", userId,
+                             normalized);
+        return;
+    }
+    client_->execSqlSync(
+        "UPDATE users SET phone = $2 WHERE user_id = $1 "
+        "AND (phone IS NULL OR TRIM(phone) = '')",
+        userId, normalized);
 }
 
 bool PostgresService::isActiveMarketer(const std::string &code) {
@@ -784,7 +878,7 @@ Json::Value PostgresService::adminListUsers() {
     try {
         auto r = client_->execSqlSync(
             "SELECT u.user_id, COALESCE(u.username,'') AS username, u.email, u.auth_provider, "
-            "u.referred_by_marketer_code, m.name AS marketer_name, "
+            "u.phone, u.referred_by_marketer_code, m.name AS marketer_name, "
             "to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, "
             "(SELECT COUNT(*)::int FROM alerts a WHERE a.user_id=u.user_id) AS alert_count, "
             "(SELECT COUNT(*)::int FROM alerts a WHERE a.user_id=u.user_id AND a.status='active') "
@@ -806,6 +900,10 @@ Json::Value PostgresService::adminListUsers() {
             else
                 u["email"] = row["email"].as<std::string>();
             u["auth_provider"] = row["auth_provider"].as<std::string>();
+            if (row["phone"].isNull())
+                u["phone"] = Json::Value::null;
+            else
+                u["phone"] = row["phone"].as<std::string>();
             u["created_at"] = row["created_at"].as<std::string>();
             if (row["referred_by_marketer_code"].isNull())
                 u["referred_by_marketer_code"] = Json::Value::null;

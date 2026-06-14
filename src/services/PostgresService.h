@@ -111,6 +111,8 @@ class PostgresService {
                           const std::string &email, const std::string &displayName,
                           const std::string &avatarUrl);
     void updateLastLogin(const std::string &userId);
+    std::optional<std::string> getUserPhone(const std::string &userId);
+    void updateUserPhone(const std::string &userId, const std::string &phone, bool forceUpdate);
     bool isActiveMarketer(const std::string &code);
     bool claimReferral(const std::string &userId, const std::string &marketerCode);
 

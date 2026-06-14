@@ -369,8 +369,8 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
         return;
     }
 
-    auto buildBootstrap = [&app, uid](bool firstTime,
-                                      std::optional<std::time_t> completedAt) {
+    auto buildBootstrap = [&app, uid](bool firstTime, std::optional<std::time_t> completedAt,
+                                      const std::optional<std::string> &phone) {
         Json::Value v;
         v["userId"] = uid;
         v["isFirstTimeUser"] = firstTime;
@@ -380,24 +380,30 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
         v["wsUrl"] = app.config->wsUrl;
         v["apiBaseUrl"] =
             app.config->apiBaseUrl.empty() ? Json::Value::null : Json::Value(app.config->apiBaseUrl);
+        if (phone) {
+            v["phone"] = *phone;
+        } else {
+            v["phone"] = Json::Value::null;
+        }
         appendSubscriptionToBootstrap(v, app.postgres, uid);
         return v;
     };
 
     if (!app.postgres || !app.postgres->available()) {
-        cb(jsonResp(buildBootstrap(true, std::nullopt)));
+        cb(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt)));
         return;
     }
     if (!core::withPostgres([&](services::PostgresService &pg) {
             try {
                 auto st = pg.getOrCreateUserState(uid);
                 bool firstTime = !st.onboardingCompletedAt.has_value();
+                auto phone = pg.getUserPhone(uid);
                 core::logApiOutcome("user", "me", true, 200,
                                     firstTime ? "first_time" : "returning", uid);
-                cb(jsonResp(buildBootstrap(firstTime, st.onboardingCompletedAt)));
+                cb(jsonResp(buildBootstrap(firstTime, st.onboardingCompletedAt, phone)));
             } catch (const std::exception &e) {
                 core::logApiOutcome("user", "me", false, 500, e.what(), uid);
-                cb(jsonResp(buildBootstrap(true, std::nullopt)));
+                cb(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt)));
             }
         })) {
         cb(errResp("detail", "Database not ready", 503));
@@ -438,6 +444,51 @@ void onboardingComplete(const HttpRequestPtr &req,
             } catch (const std::exception &e) {
                 core::logApiOutcome("user", "onboarding_complete", false, 503, e.what(), uid);
                 cb(errResp("detail", "Database unavailable", 503));
+            }
+        })) {
+        cb(errResp("detail", "Database not ready", 503));
+    }
+}
+
+void updateUserPhone(const HttpRequestPtr &req,
+                     std::function<void(const HttpResponsePtr &)> &&cb) {
+    std::string uid;
+    if (!authOrReject(req, cb, uid)) return;
+    if (!core::isDbReadyForAuth()) {
+        cb(errResp("detail", "Database not ready", 503));
+        return;
+    }
+
+    auto body = req->getJsonObject();
+    if (!body || !body->isMember("phone")) {
+        cb(errResp("detail", "Field 'phone' is required", 400));
+        return;
+    }
+
+    std::string phone = (*body)["phone"].asString();
+    const std::string onlyIfEmpty = req->getParameter("only_if_empty");
+    const bool forceUpdate = onlyIfEmpty != "true" && onlyIfEmpty != "1";
+
+    if (!core::withPostgres([&](services::PostgresService &pg) {
+            try {
+                pg.updateUserPhone(uid, phone, forceUpdate);
+                Json::Value v;
+                v["success"] = true;
+                auto saved = pg.getUserPhone(uid);
+                if (saved) {
+                    v["phone"] = *saved;
+                } else {
+                    v["phone"] = Json::Value::null;
+                }
+                core::logApiOutcome("user", "update_phone", true, 200,
+                                    forceUpdate ? "force" : "if_empty", uid);
+                cb(jsonResp(v));
+            } catch (const std::runtime_error &e) {
+                core::logApiOutcome("user", "update_phone", false, 400, e.what(), uid);
+                cb(errResp("detail", e.what(), 400));
+            } catch (const std::exception &e) {
+                core::logApiOutcome("user", "update_phone", false, 500, e.what(), uid);
+                cb(errResp("detail", "Failed to save phone", 500));
             }
         })) {
         cb(errResp("detail", "Database not ready", 503));
@@ -806,6 +857,18 @@ bool rejectAlertsWithoutDb(std::function<void(const HttpResponsePtr &)> &cb) {
     return false;
 }
 
+void maybeSaveUserPhoneFromAlert(const std::string &uid, const std::string &phone,
+                                 const std::vector<std::string> &channels) {
+    if (trimStr(phone).empty() || !channelsRequirePhone(channels)) return;
+    core::withPostgres([&](services::PostgresService &pg) {
+        try {
+            pg.updateUserPhone(uid, phone, false);
+        } catch (const std::exception &e) {
+            LOG_DEBUG << "maybeSaveUserPhoneFromAlert: " << e.what();
+        }
+    });
+}
+
 void createAlert(const HttpRequestPtr &req,
                  std::function<void(const HttpResponsePtr &)> &&cb) {
     auto &app = AppContext::instance();
@@ -885,6 +948,7 @@ void createAlert(const HttpRequestPtr &req,
             meta["alert_id"] = a.id;
             meta["type"] = "candle_close";
             logActivityAsync(uid, "alert_create", clientIp(req), clientUserAgent(req), meta);
+            maybeSaveUserPhoneFromAlert(uid, phone, channels);
             Json::Value v;
             v["success"] = true;
             v["alert"] = a.toJson();
@@ -926,6 +990,7 @@ void createAlert(const HttpRequestPtr &req,
         meta["alert_id"] = a.id;
         meta["type"] = "price";
         logActivityAsync(uid, "alert_create", clientIp(req), clientUserAgent(req), meta);
+        maybeSaveUserPhoneFromAlert(uid, phone, channels);
         Json::Value v;
         v["success"] = true;
         v["alert"] = a.toJson();
@@ -1092,6 +1157,7 @@ void registerRoutes() {
     fw.registerHandler("/client-config", &clientConfig, {Get});
     fw.registerHandler("/stream-health", &streamHealth, {Get});
     fw.registerHandler("/me", &me, {Get});
+    fw.registerHandler("/user/phone", &updateUserPhone, {Post});
     fw.registerHandler("/onboarding/complete", &onboardingComplete, {Post});
     fw.registerHandler("/feedback", &submitFeedback, {Post});
     fw.registerHandler("/tour/complete", &tourComplete, {Post});

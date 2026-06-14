@@ -1,5 +1,7 @@
 #include "services/Migrations.h"
 
+#include <algorithm>
+#include <cctype>
 #include <stdexcept>
 #include <vector>
 
@@ -97,6 +99,65 @@ void reconcileLegacyPricingUsers(const DbClientPtr &client) {
     if (r.affectedRows() > 0) {
         LOG_INFO << "Reconciled legacy pre-pricing users for tour-first trial (rows="
                  << r.affectedRows() << ")";
+    }
+}
+
+std::string trimMigrationStr(const std::string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+bool migrationUsernameTaken(const DbClientPtr &client, const std::string &username,
+                            const std::string &excludeUserId) {
+    auto r = client->execSqlSync(
+        "SELECT 1 FROM users WHERE username = $1 AND user_id <> $2 LIMIT 1", username,
+        excludeUserId);
+    return r.size() > 0;
+}
+
+std::string migrationResolveUniqueUsername(const DbClientPtr &client,
+                                           const std::string &candidate,
+                                           const std::string &excludeUserId) {
+    std::string base = candidate;
+    if (base.size() > 128) base = base.substr(0, 128);
+    if (!migrationUsernameTaken(client, base, excludeUserId)) return base;
+    for (int suffix = 2; suffix < 1000; ++suffix) {
+        std::string attempt = base;
+        std::string tag = "-" + std::to_string(suffix);
+        if (attempt.size() + tag.size() > 128) {
+            attempt = attempt.substr(0, 128 - tag.size());
+        }
+        attempt += tag;
+        if (!migrationUsernameTaken(client, attempt, excludeUserId)) return attempt;
+    }
+    return base.substr(0, 120) + "-x";
+}
+
+void reconcileGoogleUsernames(const DbClientPtr &client) {
+    auto rows = client->execSqlSync(
+        "SELECT user_id, COALESCE(display_name, '') AS display_name "
+        "FROM users "
+        "WHERE auth_provider = 'google' "
+        "AND username LIKE 'google:%' "
+        "AND display_name IS NOT NULL "
+        "AND TRIM(display_name) <> '' "
+        "ORDER BY created_at ASC");
+    int updated = 0;
+    for (const auto &row : rows) {
+        std::string userId = row["user_id"].as<std::string>();
+        std::string displayName = trimMigrationStr(row["display_name"].as<std::string>());
+        if (displayName.empty()) continue;
+        std::string username =
+            migrationResolveUniqueUsername(client, displayName, userId);
+        client->execSqlSync(
+            "UPDATE users SET username = $2, display_name = $2 WHERE user_id = $1", userId,
+            username);
+        ++updated;
+    }
+    if (updated > 0) {
+        LOG_INFO << "Reconciled Google usernames from display_name (rows=" << updated << ")";
     }
 }
 
@@ -251,7 +312,11 @@ void reconcileApplicationSchema(const DbClientPtr &client) {
         "CREATE INDEX IF NOT EXISTS ix_user_feedback_created_at "
         "ON user_feedback(created_at DESC)");
 
+    client->execSqlSync(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(32)");
+
     reconcileLegacyPricingUsers(client);
+    reconcileGoogleUsernames(client);
 }
 
 void validateApplicationSchema(const DbClientPtr &client) {
