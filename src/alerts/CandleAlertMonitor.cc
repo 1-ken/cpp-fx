@@ -67,14 +67,23 @@ std::set<CandleAlertMonitor::SubKey> CandleAlertMonitor::requiredSubscriptions()
     std::set<SubKey> needed;
     if (!alerts_) return needed;
     for (const auto &a : alerts_->getActiveAlerts()) {
-        if (a.alertType != "candle_close" || !a.interval) continue;
         if (!registry_) continue;
+        std::string interval;
+        if (a.alertType == "candle_close" && a.interval) {
+            interval = *a.interval;
+        } else if (a.alertType == "prev_day_level") {
+            const std::string trig = a.dolTrigger.value_or("sweep");
+            if (trig != "displacement" && trig != "reversal") continue;
+            interval = "1d";  // displacement/reversal confirm on the daily close
+        } else {
+            continue;
+        }
         if (cfg_ && market::hasExplicitPairList(*cfg_) &&
             !market::isAllowedPair(*cfg_, a.pair))
             continue;
         auto symId = registry_->resolveId(a.pair);
         if (!symId) continue;
-        int period = util::intervalToTrendbarPeriod(*a.interval);
+        int period = util::intervalToTrendbarPeriod(interval);
         if (period == 0) continue;
         needed.insert(SubKey{*symId, period});
     }
@@ -125,6 +134,9 @@ std::optional<Json::Value> CandleAlertMonitor::candleJsonFromBar(
     candle["pair"] = canon;
     candle["interval"] = interval;
     candle["timestamp"] = util::toIso8601(bar.utcTimestampMinutes * 60);
+    candle["open"] = bar.open;
+    candle["high"] = bar.high;
+    candle["low"] = bar.low;
     candle["close"] = bar.close;
     return candle;
 }
@@ -195,18 +207,27 @@ void CandleAlertMonitor::pollFallback() {
     auto active = alerts_->getActiveAlerts();
     std::set<SubKey> seen;
     for (const auto &a : active) {
-        if (a.alertType != "candle_close" || !a.interval) continue;
+        std::string interval;
+        if (a.alertType == "candle_close" && a.interval) {
+            interval = *a.interval;
+        } else if (a.alertType == "prev_day_level") {
+            const std::string trig = a.dolTrigger.value_or("sweep");
+            if (trig != "displacement" && trig != "reversal") continue;
+            interval = "1d";
+        } else {
+            continue;
+        }
         auto symId = registry_->idForCanonical(a.pair);
         if (!symId) continue;
-        int period = util::intervalToTrendbarPeriod(*a.interval);
-        int ivSec = util::intervalToSeconds(*a.interval);
+        int period = util::intervalToTrendbarPeriod(interval);
+        int ivSec = util::intervalToSeconds(interval);
         if (period == 0 || ivSec == 0) continue;
         SubKey key{*symId, period};
         if (seen.count(key)) continue;
         seen.insert(key);
 
         std::string canon = a.pair;
-        std::string ivStr = *a.interval;
+        std::string ivStr = interval;
         ctrader_->getTrendbars(
             *symId, period, 0, static_cast<int64_t>(std::time(nullptr)) * 1000, 3,
             [this, canon, ivStr, ivSec](ctrader::TrendbarsResult res) {

@@ -3,6 +3,8 @@
 #include <ctime>
 #include <future>
 #include <memory>
+#include <set>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -21,6 +23,7 @@
 #include "ctrader/CTraderTokenStore.h"
 #include "ctrader/SymbolRegistry.h"
 #include "market/MarketHub.h"
+#include "market/PrevDayLevelProvider.h"
 #include "market/SymbolSubscriptionPlanner.h"
 #include "services/NotificationQueue.h"
 #include "services/Notifier.h"
@@ -45,6 +48,7 @@ int main() {
     static services::PostgresService postgres(cfg);
     static services::RedisService redis(cfg);
     static market::SymbolSubscriptionPlanner subscriptionPlanner(cfg, registry, alertManager);
+    static market::PrevDayLevelProvider prevDayLevels;
     static services::NotificationQueue notificationQueue;
 
     static trantor::EventLoopThread workerThread;
@@ -79,7 +83,9 @@ int main() {
     }
 
     subscriptionPlanner.setPostgres(pgPtr);
+    prevDayLevels.configure(&ctrader, &registry);
     alertManager.configure(pgPtr, redisPtr, dbExec, cfg.redisAlertQueueKey);
+    alertManager.setPrevDayLevelProvider(&prevDayLevels);
 
     notificationQueue.configure(cfg, &notifier, redisPtr, workerLoop);
     notificationQueue.startDlqRetryLoop();
@@ -225,6 +231,18 @@ int main() {
         workerLoop->runEvery(5.0, [&]() {
             if (ctrader.isReady() && util::isForexMarketOpen())
                 candleMonitor.syncSubscriptions();
+        });
+        workerLoop->runEvery(20.0, [&]() {
+            if (!ctrader.isReady()) return;
+            std::set<std::string> dolPairs;
+            for (const auto &a : alertManager.getActiveAlerts()) {
+                if (a.alertType == "prev_day_level") {
+                    std::string canon = util::canonicalPair(a.pair);
+                    if (!canon.empty()) dolPairs.insert(canon);
+                }
+            }
+            prevDayLevels.setTrackedPairs(dolPairs);
+            prevDayLevels.refreshDue();
         });
     }
 

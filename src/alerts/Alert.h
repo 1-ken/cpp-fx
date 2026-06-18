@@ -16,7 +16,7 @@ struct Alert {
     std::string pair;
     std::string status = "active";  // active, triggered, disabled
     std::string createdAt;
-    std::string alertType = "price";  // price | candle_close
+    std::string alertType = "price";  // price | candle_close | prev_day_level
     std::string channel = "email";    // primary / legacy single channel
     std::vector<std::string> channels;  // email | sms | call | sound
     std::string email;
@@ -35,6 +35,11 @@ struct Alert {
     std::optional<std::string> direction;  // above | below
     std::optional<double> threshold;
     std::optional<std::string> lastEvaluatedCandleTime;
+
+    // prev_day_level (draw on liquidity) alert
+    std::optional<std::string> levelRef;    // high | low | both
+    std::optional<std::string> dolTrigger;  // sweep | displacement | reversal | draw_met
+    std::optional<std::string> batchId;     // groups a multi-pair create
 
     void normalizeChannels() {
         if (channels.empty() && !channel.empty()) channels.push_back(channel);
@@ -75,6 +80,9 @@ struct Alert {
         v["last_evaluated_candle_time"] =
             lastEvaluatedCandleTime ? Json::Value(*lastEvaluatedCandleTime)
                                     : Json::Value::null;
+        v["level_ref"] = levelRef ? Json::Value(*levelRef) : Json::Value::null;
+        v["dol_trigger"] = dolTrigger ? Json::Value(*dolTrigger) : Json::Value::null;
+        v["batch_id"] = batchId ? Json::Value(*batchId) : Json::Value::null;
         return v;
     }
 
@@ -115,6 +123,9 @@ struct Alert {
         a.direction = optStr("direction");
         a.threshold = optNum("threshold");
         a.lastEvaluatedCandleTime = optStr("last_evaluated_candle_time");
+        a.levelRef = optStr("level_ref");
+        a.dolTrigger = optStr("dol_trigger");
+        a.batchId = optStr("batch_id");
         return a;
     }
 };

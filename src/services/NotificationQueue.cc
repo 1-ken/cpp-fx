@@ -29,6 +29,18 @@ void dispatchOneChannel(Notifier &notifier, const alerts::TriggeredAlert &t,
                                                   : a.targetPrice.value_or(0);
     std::string cond = a.alertType == "candle_close" ? a.direction.value_or("")
                                                      : a.condition.value_or("");
+    if (a.alertType == "prev_day_level") {
+        target = copy.currentPrice;
+        const std::string ref = a.levelRef.value_or("both");
+        const std::string trig = a.dolTrigger.value_or("sweep");
+        const std::string refTxt = ref == "high" ? "PDH" : ref == "low" ? "PDL" : "PDH/PDL";
+        const std::string trigTxt = trig == "sweep"          ? "swept"
+                                    : trig == "displacement" ? "displaced beyond"
+                                    : trig == "reversal"     ? "reversal at"
+                                    : trig == "draw_met"     ? "draw reached"
+                                                             : trig;
+        cond = trigTxt + " " + refTxt + " @";
+    }
     std::string triggeredAt = a.triggeredAt.value_or(util::nowIso8601());
 
     if (channel == "sound") {
@@ -207,6 +219,8 @@ void NotificationQueue::startDlqRetryLoop() {
                 t.currentPrice = t.alert.lastCheckedPrice.value_or(0);
                 if (t.alert.alertType == "candle_close")
                     t.timeframe = t.alert.interval.value_or("");
+                else if (t.alert.alertType == "prev_day_level")
+                    t.timeframe = "1d";
                 enqueue(std::move(t));
             }
             if (!failed.empty() && redis_) redis_->requeueJsonBatch(dlqKey, failed);

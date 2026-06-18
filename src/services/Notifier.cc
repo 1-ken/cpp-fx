@@ -35,6 +35,8 @@ std::string escapeXml(const std::string &s) {
 }
 
 std::string upperTypeLabel(const std::string &alertType) {
+    if (alertType == "prev_day_level") return "DRAW ON LIQUIDITY";
+    if (alertType == "candle_close") return "CANDLE CLOSE";
     std::string label = alertType.empty() ? "price" : alertType;
     std::transform(label.begin(), label.end(), label.begin(),
                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });

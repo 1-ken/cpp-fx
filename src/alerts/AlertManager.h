@@ -17,6 +17,7 @@ class RedisService;
 }
 namespace ctraderplus::market {
 struct FlatPair;
+class PrevDayLevelProvider;
 }
 
 namespace ctraderplus::alerts {
@@ -41,6 +42,9 @@ class AlertManager {
     void setTriggerHandler(std::function<void(const TriggeredAlert &)> cb) {
         onTriggered_ = std::move(cb);
     }
+    void setPrevDayLevelProvider(market::PrevDayLevelProvider *provider) {
+        dolProvider_ = provider;
+    }
     void loadAlerts();
     bool dbPersistenceEnabled() const { return postgres_ != nullptr; }
 
@@ -56,6 +60,12 @@ class AlertManager {
                             const std::string &userId, const std::string &email,
                             const std::vector<std::string> &channels,
                             const std::string &phone, const std::string &customMessage);
+    Alert createDrawAlert(const std::string &pair, const std::string &levelRef,
+                          const std::string &dolTrigger, const std::string &userId,
+                          const std::string &email,
+                          const std::vector<std::string> &channels,
+                          const std::string &phone, const std::string &customMessage,
+                          const std::optional<std::string> &batchId);
 
     std::optional<Alert> getAlert(const std::string &id) const;
     std::vector<Alert> getAllAlerts() const;
@@ -97,6 +107,7 @@ class AlertManager {
     std::unordered_map<std::string, Alert> alerts_;
     std::unordered_map<std::string, std::vector<std::string>> activePriceIndex_;
     std::unordered_map<std::string, std::vector<std::string>> activeCandleIndex_;
+    std::unordered_map<std::string, std::vector<std::string>> activeDolIndex_;
     std::unordered_map<std::string, uint64_t> userAlertsRevision_;
 
     std::function<void()> onSubscriptionChange_;
@@ -104,6 +115,7 @@ class AlertManager {
 
     services::PostgresService *postgres_ = nullptr;
     services::RedisService *redis_ = nullptr;
+    market::PrevDayLevelProvider *dolProvider_ = nullptr;
     std::function<void(std::function<void()>)> dbExecutor_;
     std::string redisAlertQueueKey_ = "fx:alerts:events";
 };

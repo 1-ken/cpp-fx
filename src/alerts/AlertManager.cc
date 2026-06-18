@@ -10,6 +10,7 @@
 #include <trantor/utils/Logger.h>
 
 #include "market/MarketHub.h"
+#include "market/PrevDayLevelProvider.h"
 #include "services/PostgresService.h"
 #include "services/RedisService.h"
 #include "util/PairNormalizer.h"
@@ -47,6 +48,38 @@ std::optional<std::time_t> parseCandleTs(const Json::Value &ts) {
     if (ts.isNumeric()) return static_cast<std::time_t>(ts.asInt64());
     if (ts.isString()) return util::parseIso8601(ts.asString());
     return std::nullopt;
+}
+
+bool dolPriceTriggered(const Alert &a, const market::DayLevels &lv, double price) {
+    const std::string ref = a.levelRef.value_or("both");
+    const std::string trig = a.dolTrigger.value_or("sweep");
+    if (trig == "draw_met") {
+        if (lv.draw == "high") return price >= lv.pdh;
+        if (lv.draw == "low") return price <= lv.pdl;
+        return false;
+    }
+    // sweep
+    const bool hitHigh = price >= lv.pdh;
+    const bool hitLow = price <= lv.pdl;
+    if (ref == "high") return hitHigh;
+    if (ref == "low") return hitLow;
+    return hitHigh || hitLow;
+}
+
+bool dolCloseTriggered(const Alert &a, const std::string &outcome) {
+    const std::string ref = a.levelRef.value_or("both");
+    const std::string trig = a.dolTrigger.value_or("displacement");
+    if (trig == "displacement") {
+        if (outcome == "displaced_up") return ref == "high" || ref == "both";
+        if (outcome == "displaced_down") return ref == "low" || ref == "both";
+        return false;
+    }
+    if (trig == "reversal") {
+        if (outcome == "reversal_from_high") return ref == "high" || ref == "both";
+        if (outcome == "reversal_from_low") return ref == "low" || ref == "both";
+        return false;
+    }
+    return false;
 }
 }  // namespace
 
@@ -114,6 +147,7 @@ uint64_t AlertManager::userAlertsRevision(const std::string &userId) const {
 void AlertManager::rebuildIndexes() {
     activePriceIndex_.clear();
     activeCandleIndex_.clear();
+    activeDolIndex_.clear();
     for (const auto &kv : alerts_) {
         const Alert &a = kv.second;
         if (a.status != "active") continue;
@@ -125,6 +159,15 @@ void AlertManager::rebuildIndexes() {
             std::string iv = *a.interval;
             std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
             activeCandleIndex_[candleIndexKey(key, iv)].push_back(a.id);
+        } else if (a.alertType == "prev_day_level") {
+            const std::string trig = a.dolTrigger.value_or("sweep");
+            if (trig == "displacement" || trig == "reversal") {
+                // Evaluated on the daily (1d) close.
+                activeCandleIndex_[candleIndexKey(key, "1d")].push_back(a.id);
+            } else {
+                // sweep / draw_met evaluated against the live price.
+                activeDolIndex_[key].push_back(a.id);
+            }
         }
     }
 }
@@ -281,6 +324,56 @@ Alert AlertManager::createCandleAlert(const std::string &pair, const std::string
     notifySubscriptionChange();
     LOG_INFO << "Created candle alert " << a.id << " " << a.pair << " " << iv << " "
              << direction << " " << threshold;
+    return a;
+}
+
+Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &levelRef,
+                                    const std::string &dolTrigger, const std::string &userId,
+                                    const std::string &email,
+                                    const std::vector<std::string> &channels,
+                                    const std::string &phone,
+                                    const std::string &customMessage,
+                                    const std::optional<std::string> &batchId) {
+    if (!postgres_) throw std::runtime_error("Database unavailable");
+    if (levelRef != "high" && levelRef != "low" && levelRef != "both")
+        throw std::invalid_argument("level_ref must be one of: high, low, both");
+    if (dolTrigger != "sweep" && dolTrigger != "displacement" && dolTrigger != "reversal" &&
+        dolTrigger != "draw_met")
+        throw std::invalid_argument(
+            "dol_trigger must be one of: sweep, displacement, reversal, draw_met");
+
+    Alert a;
+    a.id = newUuid();
+    a.userId = userId;
+    std::string canon = util::canonicalPair(pair);
+    a.pair = canon.empty() ? pair : canon;
+    a.alertType = "prev_day_level";
+    a.levelRef = levelRef;
+    a.dolTrigger = dolTrigger;
+    a.batchId = batchId;
+    a.email = email;
+    a.channels = channels;
+    a.normalizeChannels();
+    a.phone = phone;
+    a.customMessage = customMessage;
+    a.status = "active";
+    a.createdAt = util::nowIso8601();
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_[a.id] = a;
+        rebuildIndexes();
+    }
+    if (!persistAlertSync(a)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.erase(a.id);
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
+    }
+    if (dolProvider_) dolProvider_->track(a.pair);
+    bumpUserRevision(a.userId);
+    notifySubscriptionChange();
+    LOG_INFO << "Created draw-on-liquidity alert " << a.id << " " << a.pair << " "
+             << levelRef << " " << dolTrigger;
     return a;
 }
 
@@ -541,6 +634,34 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                          << " target=" << a.targetPrice.value_or(0);
             }
         }
+        if (dolProvider_) {
+            for (const auto &pr : prices) {
+                auto dIt = activeDolIndex_.find(pr.first);
+                if (dIt == activeDolIndex_.end()) continue;
+                auto levels = dolProvider_->currentLevels(pr.first);
+                if (!levels.valid) continue;
+                double current = pr.second;
+                for (const auto &alertId : dIt->second) {
+                    auto it = alerts_.find(alertId);
+                    if (it == alerts_.end()) continue;
+                    Alert &a = it->second;
+                    if (a.status != "active" || a.alertType != "prev_day_level") continue;
+                    a.lastCheckedPrice = current;
+                    if (!dolPriceTriggered(a, levels, current)) continue;
+                    Alert before = a;
+                    triggerAlert(a, current);
+                    TriggeredAlert t;
+                    t.alert = a;
+                    t.currentPrice = current;
+                    t.alertTypeLabel = "prev_day_level";
+                    t.timeframe = "1d";
+                    triggered.push_back(t);
+                    toPersist.push_back({before, a});
+                    LOG_INFO << "Triggered draw alert " << a.id << " " << a.pair
+                             << " trigger=" << a.dolTrigger.value_or("") << " price=" << current;
+                }
+            }
+        }
         if (!triggered.empty()) rebuildIndexes();
     }
     std::vector<TriggeredAlert> notified;
@@ -602,8 +723,11 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
             auto it = alerts_.find(alertId);
             if (it == alerts_.end()) continue;
             Alert &a = it->second;
-            if (a.status != "active" || a.alertType != "candle_close") continue;
-            std::string iv = a.interval.value_or("");
+            if (a.status != "active") continue;
+            const bool isCandleClose = a.alertType == "candle_close";
+            const bool isDol = a.alertType == "prev_day_level";
+            if (!isCandleClose && !isDol) continue;
+            std::string iv = isCandleClose ? a.interval.value_or("") : std::string("1d");
             std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
             if (util::canonicalPair(a.pair) != k.pair || iv != k.interval) continue;
 
@@ -628,12 +752,29 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                 continue;
 
             bool should = false;
-            std::string dir = a.direction.value_or("");
-            double thr = a.threshold.value_or(0);
-            if (dir == "above" && close >= thr)
-                should = true;
-            else if (dir == "below" && close <= thr)
-                should = true;
+            const char *typeLabel = "candle_close";
+            if (isCandleClose) {
+                std::string dir = a.direction.value_or("");
+                double thr = a.threshold.value_or(0);
+                if (dir == "above" && close >= thr)
+                    should = true;
+                else if (dir == "below" && close <= thr)
+                    should = true;
+            } else {
+                typeLabel = "prev_day_level";
+                if (!dolProvider_ || !candleStart) continue;
+                double high = candle.get("high", close).asDouble();
+                double low = candle.get("low", close).asDouble();
+                auto cls = dolProvider_->classifyClose(k.pair, *candleStart, high, low, close);
+                if (!cls.valid) continue;  // levels not warm yet; retry on next emit
+                should = dolCloseTriggered(a, cls.outcome);
+                if (!should) {
+                    Alert before = a;
+                    a.lastEvaluatedCandleTime = candleTsStr;
+                    toPersist.push_back({before, a, false});
+                    continue;
+                }
+            }
             if (should) {
                 Alert before = a;
                 a.status = "triggered";
@@ -644,11 +785,11 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                 TriggeredAlert t;
                 t.alert = a;
                 t.currentPrice = close;
-                t.alertTypeLabel = "candle_close";
+                t.alertTypeLabel = typeLabel;
                 t.timeframe = iv;
                 triggered.push_back(t);
                 toPersist.push_back({before, a, true});
-                LOG_INFO << "Triggered candle alert " << a.id << " " << a.pair
+                LOG_INFO << "Triggered " << typeLabel << " alert " << a.id << " " << a.pair
                          << " channel=" << a.channel << " close=" << close;
             }
             }

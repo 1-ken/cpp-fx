@@ -11,13 +11,17 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpResponse.h>
+#include <drogon/utils/Utilities.h>
 #include <json/json.h>
 
 #include "alerts/AlertManager.h"
@@ -57,6 +61,48 @@ HttpResponsePtr errResp(const std::string &detailKey, const std::string &msg, in
     Json::Value v;
     v[detailKey] = msg;
     return jsonResp(v, code);
+}
+
+// ---- Historical OHLC cache --------------------------------------------------
+// cTrader rate-limits historical trendbar requests. Each pair view fans out
+// several historical fetches at once, which trips the limit and surfaces as 502s
+// (fast error responses or a lost response that hits the request timeout). A
+// short-TTL response cache collapses bursts of identical requests into a single
+// upstream call, and serving the last cached payload on upstream failure keeps
+// transient drops from reaching the client.
+struct OhlcCacheEntry {
+    std::shared_ptr<Json::Value> body;
+    std::time_t fetchedAt = 0;
+};
+
+std::mutex gOhlcCacheMu;
+std::unordered_map<std::string, OhlcCacheEntry> gOhlcCache;
+
+int ohlcCacheTtlSeconds(const std::string &interval) {
+    // Daily data changes slowly; intraday gets a short TTL so the forming candle
+    // stays reasonably fresh (the WS stream still pushes live ticks separately).
+    return interval == "1d" ? 120 : 10;
+}
+
+std::shared_ptr<Json::Value> ohlcCacheGet(const std::string &key, int ttlSeconds,
+                                          bool allowStale) {
+    std::lock_guard<std::mutex> lk(gOhlcCacheMu);
+    auto it = gOhlcCache.find(key);
+    if (it == gOhlcCache.end() || !it->second.body) {
+        return nullptr;
+    }
+    if (allowStale) {
+        return it->second.body;
+    }
+    if (std::time(nullptr) - it->second.fetchedAt <= ttlSeconds) {
+        return it->second.body;
+    }
+    return nullptr;
+}
+
+void ohlcCachePut(const std::string &key, std::shared_ptr<Json::Value> body) {
+    std::lock_guard<std::mutex> lk(gOhlcCacheMu);
+    gOhlcCache[key] = OhlcCacheEntry{std::move(body), std::time(nullptr)};
 }
 
 HttpResponsePtr subscriptionErrResp(const services::SubscriptionCheckResult &check) {
@@ -746,13 +792,39 @@ void historicalOhlc(const HttpRequestPtr &req,
         fromMs = fromSec * 1000;
     }
 
+    // When an explicit start is supplied (e.g. backtest date range), do NOT send
+    // a `count` to cTrader: ProtoOAGetTrendbarsReq counts `count` bars back from
+    // toTimestamp and ignores fromTimestamp when count is set, which would return
+    // far more history than the requested window. Let from/to bound the range
+    // instead. The plain lookback path keeps using count = limit.
+    uint32_t reqCount = startOpt ? 0u : static_cast<uint32_t>(limit);
+    const long long fromMinuteClip = fromMs / 60000;
+    const long long toMinuteClip = toMs / 60000;
+
+    // Response cache: collapse bursts of identical historical requests and serve
+    // stale-on-error to ride out cTrader rate limits / dropped responses.
+    const std::string cacheKey = canon + "|" + interval + "|" + std::to_string(limit) +
+                                 "|" + req->getParameter("start") + "|" +
+                                 req->getParameter("end") + "|" +
+                                 (withForming ? "f" : "c");
+    const int cacheTtl = ohlcCacheTtlSeconds(interval);
+    if (auto fresh = ohlcCacheGet(cacheKey, cacheTtl, false)) {
+        cb(jsonResp(*fresh));
+        return;
+    }
+
     auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
     std::string pairOut = pair;
     app.ctrader->getTrendbars(
-        *symId, period, fromMs, toMs, static_cast<uint32_t>(limit),
+        *symId, period, fromMs, toMs, reqCount,
         [callback, ivSec, interval, pairOut, canon, withForming, startOpt, endOpt,
-         &app](ctrader::TrendbarsResult res) {
+         fromMinuteClip, toMinuteClip, cacheKey, &app](ctrader::TrendbarsResult res) {
             if (!res.ok) {
+                // Serve the last cached payload (if any) instead of failing.
+                if (auto stale = ohlcCacheGet(cacheKey, 0, true)) {
+                    (*callback)(jsonResp(*stale));
+                    return;
+                }
                 (*callback)(errResp("error", "Failed to query OHLC: " + res.error, 502));
                 return;
             }
@@ -764,6 +836,10 @@ void historicalOhlc(const HttpRequestPtr &req,
             Json::Value candles(Json::arrayValue);
             const ctrader::TrendbarData *inBucketBar = nullptr;
             for (const auto &b : res.bars) {
+                if (b.utcTimestampMinutes < fromMinuteClip ||
+                    b.utcTimestampMinutes > toMinuteClip) {
+                    continue;
+                }
                 if (!withForming && b.utcTimestampMinutes >= bucketMinuteForFilter) {
                     inBucketBar = &b;
                     continue;
@@ -790,7 +866,9 @@ void historicalOhlc(const HttpRequestPtr &req,
                 }
                 out["count"] = (int)candles.size();
                 out["candles"] = candles;
-                (*callback)(jsonResp(out));
+                auto body = std::make_shared<Json::Value>(out);
+                ohlcCachePut(cacheKey, body);
+                (*callback)(jsonResp(*body));
                 return;
             }
 
@@ -801,6 +879,10 @@ void historicalOhlc(const HttpRequestPtr &req,
             const ctrader::TrendbarData *lastBar = nullptr;
             const long long bucketMinute = bucket / 60;
             for (const auto &b : res.bars) {
+                if (b.utcTimestampMinutes < fromMinuteClip ||
+                    b.utcTimestampMinutes > toMinuteClip) {
+                    continue;
+                }
                 if (b.utcTimestampMinutes >= bucketMinute) {
                     lastBar = &b;
                     continue;
@@ -838,7 +920,9 @@ void historicalOhlc(const HttpRequestPtr &req,
             out["forming_candle"] = formingCandle;
             out["last_update"] = app.hub ? app.hub->lastSnapshotTs() : util::nowIso8601();
             out["candles"] = closedOnly;
-            (*callback)(jsonResp(out));
+            auto body = std::make_shared<Json::Value>(out);
+            ohlcCachePut(cacheKey, body);
+            (*callback)(jsonResp(*body));
         });
 }
 
@@ -869,6 +953,102 @@ void maybeSaveUserPhoneFromAlert(const std::string &uid, const std::string &phon
     });
 }
 
+// Draw-on-liquidity (prev_day_level) alert create, supporting multi-pair fan-out.
+void createDrawAlertBatch(const HttpRequestPtr &req,
+                          std::function<void(const HttpResponsePtr &)> &cb, AppContext &app,
+                          const std::string &uid, const Json::Value &b) {
+    std::string parseErr;
+    auto channels = parseChannels(b, parseErr);
+    if (channels.empty()) {
+        cb(errResp("detail", parseErr.empty() ? "Invalid channels" : parseErr, 400));
+        return;
+    }
+    std::string email = b.get("email", "").asString();
+    std::string phone = b.get("phone", "").asString();
+    std::string customMessage = trimStr(b.get("custom_message", "").asString());
+    if (channelsRequireEmail(channels) && email.empty()) {
+        cb(errResp("detail", "Email is required for email alerts", 400));
+        return;
+    }
+    if (channelsRequirePhone(channels) && phone.empty()) {
+        cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
+        return;
+    }
+    if (channelsRequireCustomMessage(channels, customMessage)) {
+        cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
+        return;
+    }
+
+    const std::string levelRef = b.get("level_ref", "both").asString();
+    const std::string dolTrigger = b.get("dol_trigger", "sweep").asString();
+
+    std::vector<std::string> pairs;
+    if (b.isMember("pairs") && b["pairs"].isArray()) {
+        for (const auto &p : b["pairs"]) {
+            if (!p.isString()) continue;
+            std::string v = trimStr(p.asString());
+            if (!v.empty() && std::find(pairs.begin(), pairs.end(), v) == pairs.end())
+                pairs.push_back(v);
+        }
+    }
+    if (pairs.empty()) {
+        std::string v = trimStr(b.get("pair", "").asString());
+        if (!v.empty()) pairs.push_back(v);
+    }
+    if (pairs.empty()) {
+        cb(errResp("detail", "At least one pair is required", 400));
+        return;
+    }
+
+    if (app.postgres && app.postgres->available()) {
+        services::SubscriptionService sub(*app.postgres);
+        int activeCount =
+            app.alerts ? static_cast<int>(app.alerts->getActiveAlertsForUser(uid).size()) : 0;
+        for (size_t i = 0; i < pairs.size(); ++i) {
+            auto check = sub.canCreateAlert(uid, channels, activeCount + static_cast<int>(i));
+            if (!check.allowed) {
+                cb(subscriptionErrResp(check));
+                return;
+            }
+        }
+    }
+
+    std::optional<std::string> batchId;
+    if (pairs.size() > 1) batchId = drogon::utils::getUuid();
+
+    Json::Value created(Json::arrayValue);
+    try {
+        for (const auto &p : pairs) {
+            auto a = app.alerts->createDrawAlert(p, levelRef, dolTrigger, uid, email, channels,
+                                                 phone, customMessage, batchId);
+            created.append(a.toJson());
+            Json::Value meta;
+            meta["pair"] = a.pair;
+            meta["alert_id"] = a.id;
+            meta["type"] = "prev_day_level";
+            logActivityAsync(uid, "alert_create", clientIp(req), clientUserAgent(req), meta);
+        }
+    } catch (const std::invalid_argument &e) {
+        cb(errResp("detail", e.what(), 400));
+        return;
+    } catch (const std::runtime_error &e) {
+        const std::string msg = e.what();
+        if (msg == "Alert not persisted" || msg == "Database unavailable")
+            cb(errResp("detail", msg, 503));
+        else
+            cb(errResp("detail", msg, 400));
+        return;
+    }
+    maybeSaveUserPhoneFromAlert(uid, phone, channels);
+    core::logApiOutcome("alerts", "create", true, 200,
+                        "prev_day_level pairs=" + std::to_string(pairs.size()), uid);
+    Json::Value v;
+    v["success"] = true;
+    v["alerts"] = created;
+    if (!created.empty()) v["alert"] = created[0];
+    cb(jsonResp(v));
+}
+
 void createAlert(const HttpRequestPtr &req,
                  std::function<void(const HttpResponsePtr &)> &&cb) {
     auto &app = AppContext::instance();
@@ -881,6 +1061,10 @@ void createAlert(const HttpRequestPtr &req,
         return;
     }
     const Json::Value &b = *body;
+    if (b.get("alert_type", "").asString() == "prev_day_level") {
+        createDrawAlertBatch(req, cb, app, uid, b);
+        return;
+    }
     std::string pair = b.get("pair", "").asString();
     // trim
     auto trim = [](std::string s) {
