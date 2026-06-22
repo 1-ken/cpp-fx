@@ -903,12 +903,8 @@ void historicalOhlc(const HttpRequestPtr &req,
             Json::Value formingCandle(Json::nullValue);
             double livePrice = 0;
             if (app.hub && app.hub->latestPrice(canon, livePrice)) {
-                const ctrader::TrendbarData *prevClosed = nullptr;
-                if (!lastBar && !res.bars.empty()) {
-                    prevClosed = &res.bars.back();
-                }
                 formingCandle = util::buildFormingCandleMerged(
-                    livePrice, interval, lastBar, prevClosed);
+                    livePrice, interval, lastBar, nullptr);
                 if (lastBar && app.hub) {
                     app.hub->cacheTrendbar(canon, interval, *lastBar);
                 }

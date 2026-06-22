@@ -50,7 +50,7 @@ Json::Value buildFormingCandleFromSpot(double price, const std::string &interval
 Json::Value buildFormingCandleMerged(double livePrice,
                                      const std::string &interval,
                                      const ctrader::TrendbarData *lastBar,
-                                     const ctrader::TrendbarData *prevClosedBar) {
+                                     const ctrader::TrendbarData * /*prevClosedBar*/) {
     int ivSec = intervalToSeconds(interval);
     if (ivSec == 0) ivSec = 60;
     std::time_t now = std::time(nullptr);
@@ -67,12 +67,9 @@ Json::Value buildFormingCandleMerged(double livePrice,
         high = std::max({lastBar->high, livePrice});
         low = std::min({lastBar->low, livePrice});
         close = livePrice;
-    } else if (prevClosedBar) {
-        open = prevClosedBar->close;
-        high = std::max({prevClosedBar->high, livePrice});
-        low = std::min({prevClosedBar->low, livePrice});
-        close = livePrice;
     }
+    // When lastBar is missing, use spot-only OHLC. Never seed today's high/low
+    // from a prior closed bar — that falsely marks PDH/PDL as already swept.
 
     std::time_t formingTs = static_cast<std::time_t>(bucketMinute * 60);
     if (formingTs < bucket) formingTs = static_cast<std::time_t>(bucket);

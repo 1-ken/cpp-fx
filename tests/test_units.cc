@@ -9,7 +9,9 @@
 #include "services/Notifier.h"
 #include "util/ForexMarketHours.h"
 #include "util/PairNormalizer.h"
+#include "util/FormingCandle.h"
 #include "util/TimeUtil.h"
+#include "ctrader/Types.h"
 
 using namespace ctraderplus;
 
@@ -119,6 +121,38 @@ static void testAlertNotificationFormat() {
     CHECK(subject == "PRICE ALERT: EURUSD");
 }
 
+static void testFormingCandleMergedWithoutLastBar() {
+    Json::Value fc = util::buildFormingCandleMerged(1.2345, "1d", nullptr, nullptr);
+    CHECK(fc["open"].asDouble() == 1.2345);
+    CHECK(fc["high"].asDouble() == 1.2345);
+    CHECK(fc["low"].asDouble() == 1.2345);
+    CHECK(fc["close"].asDouble() == 1.2345);
+}
+
+static void testFormingCandleMergedWithLastBar() {
+    ctrader::TrendbarData bar{};
+    bar.open = 1.10;
+    bar.high = 1.15;
+    bar.low = 1.08;
+    bar.close = 1.12;
+    Json::Value fc = util::buildFormingCandleMerged(1.13, "1d", &bar, nullptr);
+    CHECK(fc["open"].asDouble() == 1.10);
+    CHECK(fc["high"].asDouble() == 1.15);
+    CHECK(fc["low"].asDouble() == 1.08);
+    CHECK(fc["close"].asDouble() == 1.13);
+}
+
+static void testFormingCandleMergedDoesNotInheritPrevClosed() {
+    ctrader::TrendbarData prev{};
+    prev.open = 1.10;
+    prev.high = 1.20;
+    prev.low = 1.05;
+    prev.close = 1.12;
+    Json::Value fc = util::buildFormingCandleMerged(1.11, "1d", nullptr, &prev);
+    CHECK(fc["high"].asDouble() == 1.11);
+    CHECK(fc["low"].asDouble() == 1.11);
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -128,6 +162,9 @@ int main() {
     testSymbolClassification();
     testAllowedPairs();
     testAlertNotificationFormat();
+    testFormingCandleMergedWithoutLastBar();
+    testFormingCandleMergedWithLastBar();
+    testFormingCandleMergedDoesNotInheritPrevClosed();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;
