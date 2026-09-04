@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <sys/stat.h>
 
 #include <json/json.h>
 
@@ -19,6 +20,19 @@ std::string trim(const std::string &s) {
     if (a == std::string::npos) return "";
     size_t b = s.find_last_not_of(" \t\r\n");
     return s.substr(a, b - a + 1);
+}
+
+bool fileExists(const std::string &path) {
+    struct stat st {};
+    return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+// Prefer cwd; if missing (e.g. launched from build/), try parent directory.
+std::string resolveConfigPath(const std::string &path) {
+    if (fileExists(path)) return path;
+    const std::string parent = "../" + path;
+    if (fileExists(parent)) return parent;
+    return path;
 }
 
 void loadDotEnv(const std::string &path) {
@@ -85,8 +99,10 @@ std::string jstr(const Json::Value &v, const char *key, const std::string &def) 
 }
 
 void build(Config &c, const std::string &configPath, const std::string &envPath) {
-    loadDotEnv(envPath);
-    Json::Value root = loadJsonFile(configPath);
+    const std::string resolvedEnv = resolveConfigPath(envPath);
+    const std::string resolvedConfig = resolveConfigPath(configPath);
+    loadDotEnv(resolvedEnv);
+    Json::Value root = loadJsonFile(resolvedConfig);
 
     // ---- cTrader (json then env override) ----
     Json::Value ct = root["ctrader"];
