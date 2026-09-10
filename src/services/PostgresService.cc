@@ -590,12 +590,28 @@ bool PostgresService::incrementDailySms(const std::string &userId) {
 bool PostgresService::incrementDailyCall(const std::string &userId) {
     if (!client_) return false;
     try {
+        auto state = getUserStateFull(userId);
+        const std::string tier =
+            state.subscriptionTier.empty() ? "none" : state.subscriptionTier;
+        const bool trialCap = tier == "trial";
+
+        if (trialCap) {
+            auto r = client_->execSqlSync(
+                "INSERT INTO user_daily_usage(user_id, usage_date, sms_sent, calls_made) "
+                "VALUES($1, CURRENT_DATE, 0, 1) "
+                "ON CONFLICT (user_id, usage_date) DO UPDATE SET "
+                "calls_made = user_daily_usage.calls_made + 1 "
+                "WHERE user_daily_usage.calls_made < 5 "
+                "RETURNING calls_made",
+                userId);
+            return r.size() > 0;
+        }
+
         auto r = client_->execSqlSync(
             "INSERT INTO user_daily_usage(user_id, usage_date, sms_sent, calls_made) "
             "VALUES($1, CURRENT_DATE, 0, 1) "
             "ON CONFLICT (user_id, usage_date) DO UPDATE SET "
             "calls_made = user_daily_usage.calls_made + 1 "
-            "WHERE user_daily_usage.calls_made < 5 "
             "RETURNING calls_made",
             userId);
         return r.size() > 0;

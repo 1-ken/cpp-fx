@@ -226,7 +226,11 @@ Json::Value SubscriptionService::toBootstrapJson(const SubscriptionState &state)
     daily["sms"] = state.dailySms;
     daily["smsLimit"] = state.trialSmsLimit;
     daily["calls"] = state.dailyCalls;
-    daily["callsLimit"] = state.trialCallsLimit;
+    if (state.tier == "pro") {
+        daily["callsLimit"] = Json::Value::null;
+    } else {
+        daily["callsLimit"] = state.trialCallsLimit;
+    }
     v["dailyUsage"] = daily;
 
     Json::Value freeLimits;
