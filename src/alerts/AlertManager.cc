@@ -121,6 +121,29 @@ std::optional<std::pair<double, std::time_t>> firstSweepTouchToday(
 void invokeComplete(const std::function<void()> &onComplete) {
     if (onComplete) onComplete();
 }
+
+struct UtcYmd {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    bool operator<(const UtcYmd &o) const {
+        if (year != o.year) return year < o.year;
+        if (month != o.month) return month < o.month;
+        return day < o.day;
+    }
+};
+
+UtcYmd utcYmdFromEpoch(std::time_t t) {
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    return UtcYmd{tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday};
+}
+
+std::optional<UtcYmd> utcYmdFromIso(const std::string &iso) {
+    auto ts = util::parseIso8601(iso);
+    if (!ts) return std::nullopt;
+    return utcYmdFromEpoch(*ts);
+}
 }  // namespace
 
 void AlertManager::configure(services::PostgresService *pg, services::RedisService *redis,
@@ -879,6 +902,48 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
         if (onTriggered_) onTriggered_(t);
     }
     return notified;
+}
+
+int AlertManager::expireStalePrevDayAlerts() {
+    if (!postgres_) return 0;
+    const UtcYmd today = utcYmdFromEpoch(std::time(nullptr));
+
+    struct PersistBatch {
+        Alert before;
+        Alert after;
+    };
+    std::vector<PersistBatch> toPersist;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto &kv : alerts_) {
+            Alert &a = kv.second;
+            if (a.status != "active" || a.alertType != "prev_day_level") continue;
+            auto createdDay = utcYmdFromIso(a.createdAt);
+            if (!createdDay || !(*createdDay < today)) continue;
+            Alert before = a;
+            a.status = "expired";
+            sweepLookbackPending_.erase(a.id);
+            toPersist.push_back({before, a});
+            LOG_INFO << "Expired prev-day alert " << a.id << " " << a.pair
+                     << " (created " << a.createdAt << ")";
+        }
+        if (!toPersist.empty()) rebuildIndexes();
+    }
+
+    int expired = 0;
+    for (const auto &batch : toPersist) {
+        if (!persistAlertSync(batch.after)) {
+            std::lock_guard<std::mutex> lk(mu_);
+            alerts_[batch.after.id] = batch.before;
+            rebuildIndexes();
+            LOG_ERROR << "Failed to persist expired prev-day alert " << batch.after.id;
+            continue;
+        }
+        bumpUserRevision(batch.after.userId);
+        ++expired;
+    }
+    if (expired > 0) notifySubscriptionChange();
+    return expired;
 }
 
 int AlertManager::flushPersistenceEvents(int batchSize) {

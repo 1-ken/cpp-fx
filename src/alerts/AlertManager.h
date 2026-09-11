@@ -92,6 +92,10 @@ class AlertManager {
     // candles: list of {pair, interval, timestamp(iso or epoch sec), close}
     std::vector<TriggeredAlert> checkCandleAlerts(const std::vector<Json::Value> &candles);
 
+    // Expire active prev_day_level alerts whose create UTC day is before today.
+    // Silent (no notification). Returns how many were expired.
+    int expireStalePrevDayAlerts();
+
     int flushPersistenceEvents(int batchSize);
 
   private:

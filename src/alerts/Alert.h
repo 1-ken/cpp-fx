@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <vector>
@@ -14,7 +15,7 @@ struct Alert {
     std::string id;
     std::string userId = "legacy-unassigned";
     std::string pair;
-    std::string status = "active";  // active, triggered, disabled
+    std::string status = "active";  // active, triggered, disabled, expired
     std::string createdAt;
     std::string alertType = "price";  // price | candle_close | prev_day_level
     std::string channel = "email";    // primary / legacy single channel
@@ -41,15 +42,29 @@ struct Alert {
     std::optional<std::string> dolTrigger;  // sweep | displacement | reversal | draw_met
     std::optional<std::string> batchId;     // groups a multi-pair create
 
+    // In-app sound is always delivered alongside any chosen channel.
+    void ensureSoundChannel() {
+        if (std::find(channels.begin(), channels.end(), "sound") == channels.end()) {
+            channels.push_back("sound");
+        }
+    }
+
     void normalizeChannels() {
         if (channels.empty() && !channel.empty()) channels.push_back(channel);
-        if (!channels.empty()) channel = channels.front();
+        if (channels.empty()) channels.push_back("sound");
+        ensureSoundChannel();
+        channel = channels.front();
     }
 
     std::vector<std::string> effectiveChannels() const {
-        if (!channels.empty()) return channels;
-        if (!channel.empty()) return {channel};
-        return {};
+        std::vector<std::string> out;
+        if (!channels.empty())
+            out = channels;
+        else if (!channel.empty())
+            out = {channel};
+        if (std::find(out.begin(), out.end(), "sound") == out.end()) out.push_back("sound");
+        if (out.empty()) out.push_back("sound");
+        return out;
     }
 
     Json::Value toJson() const {

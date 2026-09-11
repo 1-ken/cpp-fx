@@ -254,11 +254,14 @@ std::vector<std::string> parseChannels(const Json::Value &body, std::string &err
         }
         channels.push_back(ch);
     } else {
-        channels.push_back("email");
+        channels.push_back("sound");
     }
     if (channels.empty()) {
         err = "At least one notification channel is required";
         return {};
+    }
+    if (std::find(channels.begin(), channels.end(), "sound") == channels.end()) {
+        channels.push_back("sound");
     }
     return channels;
 }
@@ -1192,20 +1195,24 @@ void listAlerts(const HttpRequestPtr &req,
     if (!authOrReject(req, cb, uid)) return;
     if (rejectAlertsWithoutDb(cb)) return;
     auto all = app.alerts->getAllAlertsForUser(uid);
-    Json::Value active(Json::arrayValue), triggered(Json::arrayValue), allArr(Json::arrayValue);
+    Json::Value active(Json::arrayValue), triggered(Json::arrayValue), expired(Json::arrayValue),
+        allArr(Json::arrayValue);
     for (const auto &a : app.alerts->getActiveAlertsSortedForUser(uid)) active.append(a.toJson());
     for (const auto &a : all) {
         allArr.append(a.toJson());
         if (a.status == "triggered") triggered.append(a.toJson());
+        else if (a.status == "expired") expired.append(a.toJson());
     }
     core::logApiOutcome("alerts", "list", true, 200,
                         "active=" + std::to_string(active.size()) + " triggered=" +
-                            std::to_string(triggered.size()),
+                            std::to_string(triggered.size()) +
+                            " expired=" + std::to_string(expired.size()),
                         uid);
     Json::Value v;
     v["total"] = (int)all.size();
     v["active"] = active;
     v["triggered"] = triggered;
+    v["expired"] = expired;
     v["all"] = allArr;
     cb(jsonResp(v));
 }
