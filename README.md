@@ -141,6 +141,18 @@ first successful refresh the server persists tokens to Redis key
 `fx:ctrader:tokens` (override via `redisCtraderTokenKey` in config); Redis wins
 over env on restart so production keeps working across redeploys.
 
+If you paste **new** playground tokens into `.env` while Redis still holds an
+older (rotated) refresh token, Redis will keep winning and auth can fail with
+`CH_ACCESS_TOKEN_INVALID`. Fix either:
+
+1. Set `CTRADER_PREFER_ENV_TOKENS=1`, restart once (env overwrites Redis), then
+   clear the flag so Redis stays the live source of truth; or
+2. Let the server fall back automatically: when Redis tokens fail refresh/auth
+   and `.env` holds a different pair, it applies env once and writes Redis.
+
+You can also delete the Redis key (`DEL fx:ctrader:tokens`) and restart with
+fresh env tokens.
+
 **Admin OTP:** set `ADMIN_PHONE` (backend) and `NEXT_PUBLIC_ADMIN_PHONE` (frontend,
 same E.164 value). SMS delivery requires `SMS_GATE_USERNAME` and
 `SMS_GATE_PASSWORD`; without them `/api/v1/admin/otp/request` returns 500.

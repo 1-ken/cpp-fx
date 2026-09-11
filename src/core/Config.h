@@ -63,6 +63,8 @@ struct Config {
     std::string redisAlertQueueKey = "fx:alerts:events";
     std::string redisCtraderTokenKey = "fx:ctrader:tokens";
     bool redisPubsubEnabled = false;
+    // When true, skip Redis token merge and seed Redis from CTRADER_* env tokens.
+    bool preferEnvCtraderTokens = false;
     std::string notificationDlqKey = "fx:alerts:notifications:dlq";
 
     // Postgres

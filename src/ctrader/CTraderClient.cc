@@ -397,6 +397,26 @@ void CTraderClient::applyTokens(const std::string &accessToken,
     if (onTokensRefreshed_) onTokensRefreshed_(cfg_.accessToken, cfg_.refreshToken);
 }
 
+void CTraderClient::setEnvFallbackTokens(const std::string &accessToken,
+                                         const std::string &refreshToken) {
+    envFallbackAccess_ = accessToken;
+    envFallbackRefresh_ = refreshToken;
+    envFallbackUsed_ = false;
+}
+
+bool CTraderClient::tryEnvTokenFallback() {
+    if (envFallbackUsed_) return false;
+    if (envFallbackAccess_.empty() && envFallbackRefresh_.empty()) return false;
+    if (cfg_.accessToken == envFallbackAccess_ &&
+        cfg_.refreshToken == envFallbackRefresh_) {
+        return false;
+    }
+    envFallbackUsed_ = true;
+    LOG_WARN << "cTrader tokens: Redis auth failed; falling back to env";
+    applyTokens(envFallbackAccess_, envFallbackRefresh_);
+    return true;
+}
+
 void CTraderClient::enterTokenDegraded(const char *reason) {
     tokenDegraded_ = true;
     tokenDegradedUntil_ = monotonicSeconds() + 600.0;
@@ -433,6 +453,20 @@ void CTraderClient::afterApplicationAuth() {
         if (ok) {
             state_ = State::AccountAuth;
             sendAccountAuth();
+            return;
+        }
+        if (tryEnvTokenFallback()) {
+            tryHttpTokenRefresh([this](bool ok2) {
+                if (ok2) {
+                    state_ = State::AccountAuth;
+                    sendAccountAuth();
+                    return;
+                }
+                LOG_WARN << "cTrader: HTTP token refresh failed after env fallback; "
+                            "trying proto refresh";
+                state_ = State::RefreshingToken;
+                sendRefreshToken();
+            });
             return;
         }
         LOG_WARN << "cTrader: HTTP token refresh failed; trying proto refresh";
@@ -632,9 +666,25 @@ void CTraderClient::handleOaError(const std::string &code, const std::string &de
                     sendAccountAuth();
                     return;
                 }
+                if (tryEnvTokenFallback()) {
+                    tryHttpTokenRefresh([this](bool ok2) {
+                        if (ok2) {
+                            state_ = State::AccountAuth;
+                            sendAccountAuth();
+                            return;
+                        }
+                        state_ = State::AccountAuth;
+                        sendAccountAuth();
+                    });
+                    return;
+                }
                 enterTokenDegraded("token_refresh_failed");
                 forceDisconnectAndReconnect(2.0);
             });
+            return;
+        }
+        if (tryEnvTokenFallback()) {
+            forceDisconnectAndReconnect(1.0);
             return;
         }
         enterTokenDegraded("token_invalid");

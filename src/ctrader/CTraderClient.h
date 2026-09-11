@@ -48,6 +48,8 @@ class CTraderClient {
     void setOnTokensRefreshed(TokensRefreshedCallback cb) {
         onTokensRefreshed_ = std::move(cb);
     }
+    // Boot-time .env token pair for one-shot recovery when Redis tokens fail auth.
+    void setEnvFallbackTokens(const std::string &accessToken, const std::string &refreshToken);
 
     void start();
     void stop();
@@ -97,6 +99,7 @@ class CTraderClient {
     void applyTokens(const std::string &accessToken, const std::string &refreshToken);
     void enterTokenDegraded(const char *reason);
     void tryHttpTokenRefresh(std::function<void(bool ok)> done);
+    bool tryEnvTokenFallback();
     void sendSymbolsListReq();
     void subscribeSpotsBatched(const std::vector<int64_t> &ids);
     void unsubscribeSpotsBatched(const std::vector<int64_t> &ids);
@@ -144,6 +147,9 @@ class CTraderClient {
     bool tokenDegraded_ = false;
     double tokenDegradedUntil_ = 0;
     int tokenRefreshFailures_ = 0;
+    std::string envFallbackAccess_;
+    std::string envFallbackRefresh_;
+    bool envFallbackUsed_ = false;
 
     std::vector<int64_t> pendingSpotIds_;
     std::vector<int64_t> subscribedSpotIds_;

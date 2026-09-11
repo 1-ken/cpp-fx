@@ -67,11 +67,25 @@ int main() {
     services::PostgresService *pgPtr = pgOk ? &postgres : nullptr;
 
     core::CTraderConfig ctraderCfg = cfg.ctrader;
+    const std::string envAccessToken = cfg.ctrader.accessToken;
+    const std::string envRefreshToken = cfg.ctrader.refreshToken;
     if (redisOk) {
-        ctrader::CTraderTokenStore::mergeFromRedis(redisPtr, cfg.redisCtraderTokenKey,
-                                                   ctraderCfg);
+        if (cfg.preferEnvCtraderTokens) {
+            if (!envAccessToken.empty() || !envRefreshToken.empty()) {
+                ctrader::CTraderTokenStore::save(redisPtr, cfg.redisCtraderTokenKey,
+                                                 {envAccessToken, envRefreshToken});
+                LOG_INFO << "cTrader tokens: prefer-env; overwrote Redis ("
+                         << cfg.redisCtraderTokenKey << ")";
+            } else {
+                LOG_WARN << "cTrader tokens: CTRADER_PREFER_ENV_TOKENS set but env tokens empty";
+            }
+        } else {
+            ctrader::CTraderTokenStore::mergeFromRedis(redisPtr, cfg.redisCtraderTokenKey,
+                                                       ctraderCfg);
+        }
     }
     static ctrader::CTraderClient ctrader(ctraderCfg);
+    ctrader.setEnvFallbackTokens(envAccessToken, envRefreshToken);
     if (redisOk) {
         ctrader.setOnTokensRefreshed([&](const std::string &access,
                                          const std::string &refresh) {

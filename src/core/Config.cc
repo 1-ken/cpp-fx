@@ -187,6 +187,7 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
     c.redisCtraderTokenKey = jstr(root, "redisCtraderTokenKey", c.redisCtraderTokenKey);
     c.redisPubsubEnabled =
         envBool("REDIS_PUBSUB_ENABLED", jbool(root, "redisPubsubEnabled", c.redisPubsubEnabled));
+    c.preferEnvCtraderTokens = envBool("CTRADER_PREFER_ENV_TOKENS", false);
     c.notificationDlqKey = jstr(root, "notificationDlqKey", c.notificationDlqKey);
 
     // ---- Postgres ----
