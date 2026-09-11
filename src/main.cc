@@ -100,6 +100,8 @@ int main() {
     prevDayLevels.configure(&ctrader, &registry);
     alertManager.configure(pgPtr, redisPtr, dbExec, cfg.redisAlertQueueKey);
     alertManager.setPrevDayLevelProvider(&prevDayLevels);
+    alertManager.setCTraderClient(&ctrader);
+    alertManager.setSymbolRegistry(&registry);
 
     notificationQueue.configure(cfg, &notifier, redisPtr, workerLoop);
     notificationQueue.startDlqRetryLoop();

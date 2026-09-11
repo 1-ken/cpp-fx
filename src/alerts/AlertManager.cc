@@ -1,14 +1,19 @@
 #include "alerts/AlertManager.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 #include <future>
 #include <memory>
 #include <random>
+#include <thread>
 
 #include <trantor/utils/Logger.h>
 
+#include "ctrader/CTraderClient.h"
+#include "ctrader/SymbolRegistry.h"
 #include "market/MarketHub.h"
 #include "market/PrevDayLevelProvider.h"
 #include "services/PostgresService.h"
@@ -80,6 +85,41 @@ bool dolCloseTriggered(const Alert &a, const std::string &outcome) {
         return false;
     }
     return false;
+}
+
+// First same-UTC-day 1m bar that traded through PDH and/or PDL per level_ref.
+std::optional<std::pair<double, std::time_t>> firstSweepTouchToday(
+    const Alert &a, const market::DayLevels &lv,
+    const std::vector<ctrader::TrendbarData> &bars, int64_t dayStartMinutes) {
+    const std::string ref = a.levelRef.value_or("both");
+    std::vector<ctrader::TrendbarData> ordered = bars;
+    std::sort(ordered.begin(), ordered.end(),
+              [](const ctrader::TrendbarData &x, const ctrader::TrendbarData &y) {
+                  return x.utcTimestampMinutes < y.utcTimestampMinutes;
+              });
+    for (const auto &b : ordered) {
+        if (b.utcTimestampMinutes < dayStartMinutes) continue;
+        const bool hitHigh = b.high >= lv.pdh;
+        const bool hitLow = b.low <= lv.pdl;
+        if (ref == "high") {
+            if (!hitHigh) continue;
+            return std::make_pair(lv.pdh, static_cast<std::time_t>(b.utcTimestampMinutes * 60));
+        }
+        if (ref == "low") {
+            if (!hitLow) continue;
+            return std::make_pair(lv.pdl, static_cast<std::time_t>(b.utcTimestampMinutes * 60));
+        }
+        // both: first bar that hit either; prefer PDH if same bar hits both
+        if (hitHigh)
+            return std::make_pair(lv.pdh, static_cast<std::time_t>(b.utcTimestampMinutes * 60));
+        if (hitLow)
+            return std::make_pair(lv.pdl, static_cast<std::time_t>(b.utcTimestampMinutes * 60));
+    }
+    return std::nullopt;
+}
+
+void invokeComplete(const std::function<void()> &onComplete) {
+    if (onComplete) onComplete();
 }
 }  // namespace
 
@@ -374,6 +414,24 @@ Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &
     notifySubscriptionChange();
     LOG_INFO << "Created draw-on-liquidity alert " << a.id << " " << a.pair << " "
              << levelRef << " " << dolTrigger;
+
+    // Sweep: if PDH/PDL already traded through earlier today, notify with that time.
+    if (dolTrigger == "sweep") {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            sweepLookbackPending_[a.id] = true;
+        }
+        auto fence = std::make_shared<std::promise<void>>();
+        auto fut = fence->get_future();
+        scheduleSweepLookback(a.id, 0, [fence]() {
+            try {
+                fence->set_value();
+            } catch (...) {
+            }
+        });
+        fut.wait_for(std::chrono::milliseconds(2500));
+        if (auto latest = getAlert(a.id)) return *latest;
+    }
     return a;
 }
 
@@ -538,9 +596,10 @@ std::optional<Alert> AlertManager::updateAlert(const std::string &id,
     return updated;
 }
 
-void AlertManager::triggerAlert(Alert &a, double price) {
+void AlertManager::triggerAlert(Alert &a, double price,
+                                const std::optional<std::string> &triggeredAtIso) {
     a.status = "triggered";
-    a.triggeredAt = util::nowIso8601();
+    a.triggeredAt = triggeredAtIso.value_or(util::nowIso8601());
     a.lastCheckedPrice = price;
     a.closePrice = price;
 }
@@ -646,6 +705,7 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                     if (it == alerts_.end()) continue;
                     Alert &a = it->second;
                     if (a.status != "active" || a.alertType != "prev_day_level") continue;
+                    if (sweepLookbackPending_.count(a.id)) continue;
                     a.lastCheckedPrice = current;
                     if (!dolPriceTriggered(a, levels, current)) continue;
                     Alert before = a;
@@ -842,6 +902,168 @@ int AlertManager::flushPersistenceEvents(int batchSize) {
             }
         });
     return applied;
+}
+
+void AlertManager::clearSweepLookbackPending(const std::string &alertId) {
+    std::lock_guard<std::mutex> lk(mu_);
+    sweepLookbackPending_.erase(alertId);
+}
+
+void AlertManager::scheduleSweepLookback(const std::string &alertId, int attempt,
+                                         std::function<void()> onComplete) {
+    static std::atomic<int> stagger{0};
+    int delayMs = 0;
+    if (attempt == 0) {
+        delayMs = (stagger.fetch_add(1) % 30) * 40;  // 0–1160ms stagger for batch creates
+    } else {
+        delayMs = 2000;
+    }
+    std::thread([this, alertId, attempt, onComplete = std::move(onComplete), delayMs]() mutable {
+        if (delayMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        auto run = [this, alertId, attempt, onComplete = std::move(onComplete)]() mutable {
+            runSweepLookback(alertId, attempt, std::move(onComplete));
+        };
+        if (dbExecutor_)
+            dbExecutor_(std::move(run));
+        else
+            run();
+    }).detach();
+}
+
+void AlertManager::runSweepLookback(const std::string &alertId, int attempt,
+                                    std::function<void()> onComplete) {
+    constexpr int kMaxAttempts = 15;
+
+    auto finish = [this, alertId, onComplete]() {
+        clearSweepLookbackPending(alertId);
+        invokeComplete(onComplete);
+    };
+
+    Alert snapshot;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = alerts_.find(alertId);
+        if (it == alerts_.end() || it->second.status != "active" ||
+            it->second.alertType != "prev_day_level") {
+            sweepLookbackPending_.erase(alertId);
+            invokeComplete(onComplete);
+            return;
+        }
+        if (it->second.dolTrigger.value_or("sweep") != "sweep") {
+            sweepLookbackPending_.erase(alertId);
+            invokeComplete(onComplete);
+            return;
+        }
+        snapshot = it->second;
+    }
+
+    if (!ctrader_ || !ctrader_->isReady() || !registry_ || !dolProvider_) {
+        if (dolProvider_) dolProvider_->refreshDue();
+        if (attempt + 1 >= kMaxAttempts) {
+            finish();
+            return;
+        }
+        scheduleSweepLookback(alertId, attempt + 1, std::move(onComplete));
+        return;
+    }
+
+    auto levels = dolProvider_->currentLevels(snapshot.pair);
+    if (!levels.valid) {
+        dolProvider_->track(snapshot.pair);
+        dolProvider_->refreshDue();
+        if (attempt + 1 >= kMaxAttempts) {
+            finish();
+            return;
+        }
+        scheduleSweepLookback(alertId, attempt + 1, std::move(onComplete));
+        return;
+    }
+
+    auto symId = registry_->idForCanonical(snapshot.pair);
+    if (!symId) symId = registry_->resolveId(snapshot.pair);
+    if (!symId) {
+        LOG_WARN << "Sweep lookback: no symbol id for " << snapshot.pair;
+        finish();
+        return;
+    }
+
+    std::time_t now = std::time(nullptr);
+    std::tm tm{};
+    gmtime_r(&now, &tm);
+    tm.tm_hour = 0;
+    tm.tm_min = 0;
+    tm.tm_sec = 0;
+    std::time_t dayStart = timegm(&tm);
+    const int64_t dayStartMinutes = static_cast<int64_t>(dayStart) / 60;
+    const int64_t fromMs = static_cast<int64_t>(dayStart) * 1000;
+    const int64_t toMs = static_cast<int64_t>(now) * 1000;
+    const int period = util::intervalToTrendbarPeriod("1m");
+
+    ctrader_->getTrendbars(
+        *symId, period, fromMs, toMs, 1500,
+        [this, alertId, attempt, onComplete = std::move(onComplete), levels, snapshot,
+         dayStartMinutes](ctrader::TrendbarsResult res) mutable {
+            if (!res.ok) {
+                LOG_DEBUG << "Sweep lookback fetch failed for " << snapshot.pair << ": "
+                          << res.error;
+                if (attempt + 1 >= kMaxAttempts) {
+                    clearSweepLookbackPending(alertId);
+                    invokeComplete(onComplete);
+                    return;
+                }
+                scheduleSweepLookback(alertId, attempt + 1, std::move(onComplete));
+                return;
+            }
+
+            auto touch = firstSweepTouchToday(snapshot, levels, res.bars, dayStartMinutes);
+            if (touch) {
+                const std::string touchedAt = util::toIso8601(touch->second);
+                if (finalizeSweepLookbackTrigger(alertId, touch->first, touchedAt)) {
+                    LOG_INFO << "Sweep lookback triggered " << alertId << " " << snapshot.pair
+                             << " at " << touchedAt << " price=" << touch->first;
+                }
+            } else {
+                LOG_DEBUG << "Sweep lookback: no same-day touch yet for " << alertId << " "
+                          << snapshot.pair;
+            }
+            clearSweepLookbackPending(alertId);
+            invokeComplete(onComplete);
+        });
+}
+
+bool AlertManager::finalizeSweepLookbackTrigger(const std::string &alertId, double touchPrice,
+                                                const std::string &touchedAtIso) {
+    if (!postgres_) return false;
+    std::optional<TriggeredAlert> result;
+    Alert persisted;
+    Alert previous;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = alerts_.find(alertId);
+        if (it == alerts_.end()) return false;
+        Alert &a = it->second;
+        if (a.status != "active" || a.alertType != "prev_day_level") return false;
+        previous = a;
+        triggerAlert(a, touchPrice, touchedAtIso);
+        TriggeredAlert t;
+        t.alert = a;
+        t.currentPrice = touchPrice;
+        t.alertTypeLabel = "prev_day_level";
+        t.timeframe = "1m";
+        result = t;
+        persisted = a;
+        rebuildIndexes();
+    }
+    if (!persistAlertSync(persisted)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_[alertId] = previous;
+        rebuildIndexes();
+        LOG_ERROR << "Failed to persist lookback-triggered draw alert " << alertId;
+        return false;
+    }
+    bumpUserRevision(persisted.userId);
+    if (onTriggered_ && result) onTriggered_(*result);
+    return true;
 }
 
 }  // namespace ctraderplus::alerts

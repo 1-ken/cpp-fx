@@ -19,6 +19,10 @@ namespace ctraderplus::market {
 struct FlatPair;
 class PrevDayLevelProvider;
 }
+namespace ctraderplus::ctrader {
+class CTraderClient;
+class SymbolRegistry;
+}
 
 namespace ctraderplus::alerts {
 
@@ -45,6 +49,8 @@ class AlertManager {
     void setPrevDayLevelProvider(market::PrevDayLevelProvider *provider) {
         dolProvider_ = provider;
     }
+    void setCTraderClient(ctrader::CTraderClient *client) { ctrader_ = client; }
+    void setSymbolRegistry(ctrader::SymbolRegistry *registry) { registry_ = registry; }
     void loadAlerts();
     bool dbPersistenceEnabled() const { return postgres_ != nullptr; }
 
@@ -94,13 +100,23 @@ class AlertManager {
     bool persistAlertSync(const Alert &a);
     bool persistDeleteSync(const std::string &id);
     void persistDelete(const std::string &id);
-    void triggerAlert(Alert &a, double price);
+    void triggerAlert(Alert &a, double price,
+                      const std::optional<std::string> &triggeredAtIso = std::nullopt);
     static bool priceConditionMet(const Alert &a, double current);
     void bumpUserRevision(const std::string &userId);
     void notifySubscriptionChange();
     static std::string candleIndexKey(const std::string &pair, const std::string &interval);
 
     static int intervalSeconds(const std::string &interval);
+
+    // Same-day 1m lookback: if PDH/PDL already touched today, fire with that time.
+    void scheduleSweepLookback(const std::string &alertId, int attempt,
+                               std::function<void()> onComplete = {});
+    void runSweepLookback(const std::string &alertId, int attempt,
+                          std::function<void()> onComplete);
+    bool finalizeSweepLookbackTrigger(const std::string &alertId, double touchPrice,
+                                      const std::string &touchedAtIso);
+    void clearSweepLookbackPending(const std::string &alertId);
 
     mutable std::mutex mu_;
     mutable std::mutex revMu_;
@@ -109,6 +125,7 @@ class AlertManager {
     std::unordered_map<std::string, std::vector<std::string>> activeCandleIndex_;
     std::unordered_map<std::string, std::vector<std::string>> activeDolIndex_;
     std::unordered_map<std::string, uint64_t> userAlertsRevision_;
+    std::unordered_map<std::string, bool> sweepLookbackPending_;
 
     std::function<void()> onSubscriptionChange_;
     std::function<void(const TriggeredAlert &)> onTriggered_;
@@ -116,6 +133,8 @@ class AlertManager {
     services::PostgresService *postgres_ = nullptr;
     services::RedisService *redis_ = nullptr;
     market::PrevDayLevelProvider *dolProvider_ = nullptr;
+    ctrader::CTraderClient *ctrader_ = nullptr;
+    ctrader::SymbolRegistry *registry_ = nullptr;
     std::function<void(std::function<void()>)> dbExecutor_;
     std::string redisAlertQueueKey_ = "fx:alerts:events";
 };
