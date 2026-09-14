@@ -18,6 +18,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include <drogon/HttpAppFramework.h>
@@ -443,15 +444,18 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
         return;
     }
 
-    // Run DB off the HTTP thread; fail fast if Postgres stalls (avoids CF 524).
-    constexpr double kMeDbTimeoutSec = 4.0;
+    // Bootstrap DB on a dedicated thread so it is not stuck behind alert-expire /
+    // persist work on the single dbExec worker loop. Timeout stays under Cloudflare's
+    // ~100s origin limit but is generous enough for remote Postgres on Dokploy.
+    constexpr double kMeDbTimeoutSec = 20.0;
     auto replied = std::make_shared<std::atomic<bool>>(false);
     auto cbShared =
         std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
 
     auto finish = [replied, cbShared](const HttpResponsePtr &resp) {
         if (replied->exchange(true)) return;
-        (*cbShared)(resp);
+        // Response must run on the Drogon loop, not the detached worker thread.
+        drogon::app().getLoop()->queueInLoop([cbShared, resp]() { (*cbShared)(resp); });
     };
 
     drogon::app().getLoop()->runAfter(kMeDbTimeoutSec, [replied, finish, uid]() {
@@ -478,11 +482,8 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
         }
     };
 
-    if (app.dbExec) {
-        app.dbExec(std::move(task));
-    } else {
-        task();
-    }
+    // Detach so /me never waits behind expireStalePrevDayAlerts / persistAlertSync.
+    std::thread(std::move(task)).detach();
 }
 
 void onboardingComplete(const HttpRequestPtr &req,
