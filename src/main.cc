@@ -267,8 +267,7 @@ int main() {
     ctrader.start();
     drogon::app().getLoop()->queueInLoop([&]() { hub.start(drogon::app().getLoop()); });
 
-    int threads = cfg.threadNum > 0 ? cfg.threadNum
-                                    : std::max(1u, std::thread::hardware_concurrency());
+    int threads = cfg.threadNum > 0 ? cfg.threadNum : 4;
     LOG_INFO << "HTTP listening on " << cfg.listenAddress << ":" << cfg.httpPort
              << " (threads=" << threads << ")";
     drogon::app()

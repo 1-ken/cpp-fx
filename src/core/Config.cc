@@ -1,10 +1,12 @@
 #include "core/Config.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <thread>
 #include <sys/stat.h>
 
 #include <json/json.h>
@@ -162,6 +164,22 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
             } catch (...) {
             }
         }
+    }
+    {
+        std::string t = envStr("HTTP_THREADS");
+        if (t.empty()) t = envStr("THREAD_NUM");
+        if (!t.empty()) {
+            try {
+                c.threadNum = std::stoi(t);
+            } catch (...) {
+            }
+        }
+    }
+    // Prefer at least 4 threads in production when unset (0 = hardware concurrency
+    // can report 1–2 in small VMs and starve sync DB handlers).
+    if (c.threadNum == 0) {
+        unsigned hw = std::thread::hardware_concurrency();
+        c.threadNum = static_cast<int>(std::max(4u, hw ? hw : 4u));
     }
     c.wsUrl = envStr("WS_URL");
     c.apiBaseUrl = envStr("API_BASE_URL");

@@ -7,6 +7,7 @@
 #include "controllers/FavoritesRoutes.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -426,9 +427,8 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
         v["onboardingCompletedAt"] =
             completedAt ? Json::Value(util::toIso8601(*completedAt)) : Json::Value::null;
         v["authRequired"] = !app.config->authDisabled;
+        // Public WS endpoint only — do not expose API_BASE_URL to clients.
         v["wsUrl"] = app.config->wsUrl;
-        v["apiBaseUrl"] =
-            app.config->apiBaseUrl.empty() ? Json::Value::null : Json::Value(app.config->apiBaseUrl);
         if (phone) {
             v["phone"] = *phone;
         } else {
@@ -442,20 +442,46 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
         cb(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt)));
         return;
     }
-    if (!core::withPostgres([&](services::PostgresService &pg) {
-            try {
-                auto st = pg.getOrCreateUserState(uid);
-                bool firstTime = !st.onboardingCompletedAt.has_value();
-                auto phone = pg.getUserPhone(uid);
-                core::logApiOutcome("user", "me", true, 200,
-                                    firstTime ? "first_time" : "returning", uid);
-                cb(jsonResp(buildBootstrap(firstTime, st.onboardingCompletedAt, phone)));
-            } catch (const std::exception &e) {
-                core::logApiOutcome("user", "me", false, 500, e.what(), uid);
-                cb(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt)));
+
+    // Run DB off the HTTP thread; fail fast if Postgres stalls (avoids CF 524).
+    constexpr double kMeDbTimeoutSec = 4.0;
+    auto replied = std::make_shared<std::atomic<bool>>(false);
+    auto cbShared =
+        std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+
+    auto finish = [replied, cbShared](const HttpResponsePtr &resp) {
+        if (replied->exchange(true)) return;
+        (*cbShared)(resp);
+    };
+
+    drogon::app().getLoop()->runAfter(kMeDbTimeoutSec, [replied, finish, uid]() {
+        if (replied->load()) return;
+        core::logApiOutcome("user", "me", false, 503, "database_timeout", uid);
+        finish(errResp("detail", "Database timeout", 503));
+    });
+
+    auto task = [&app, uid, buildBootstrap, finish]() {
+        try {
+            if (!app.postgres || !app.postgres->available()) {
+                finish(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt)));
+                return;
             }
-        })) {
-        cb(errResp("detail", "Database not ready", 503));
+            auto st = app.postgres->getOrCreateUserState(uid);
+            bool firstTime = !st.onboardingCompletedAt.has_value();
+            auto phone = app.postgres->getUserPhone(uid);
+            core::logApiOutcome("user", "me", true, 200,
+                                firstTime ? "first_time" : "returning", uid);
+            finish(jsonResp(buildBootstrap(firstTime, st.onboardingCompletedAt, phone)));
+        } catch (const std::exception &e) {
+            core::logApiOutcome("user", "me", false, 500, e.what(), uid);
+            finish(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt)));
+        }
+    };
+
+    if (app.dbExec) {
+        app.dbExec(std::move(task));
+    } else {
+        task();
     }
 }
 
