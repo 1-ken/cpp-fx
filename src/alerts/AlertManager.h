@@ -62,20 +62,23 @@ class AlertManager {
                            const std::string &email,
                            const std::vector<std::string> &channels,
                            const std::string &phone, const std::string &customMessage,
-                           const std::string &expiresAt);
+                           const std::string &expiresAt,
+                           std::optional<std::string> dependsOnAlertId = std::nullopt);
     Alert createCandleAlert(const std::string &pair, const std::string &interval,
                             const std::string &direction, double threshold,
                             const std::string &userId, const std::string &email,
                             const std::vector<std::string> &channels,
                             const std::string &phone, const std::string &customMessage,
-                            const std::string &expiresAt);
+                            const std::string &expiresAt,
+                            std::optional<std::string> dependsOnAlertId = std::nullopt);
     Alert createDrawAlert(const std::string &pair, const std::string &levelRef,
                           const std::string &dolTrigger, const std::string &userId,
                           const std::string &email,
                           const std::vector<std::string> &channels,
                           const std::string &phone, const std::string &customMessage,
                           const std::optional<std::string> &batchId,
-                          const std::string &expiresAt);
+                          const std::string &expiresAt,
+                          std::optional<std::string> dependsOnAlertId = std::nullopt);
     Alert createStructureAlert(const std::string &pair, const std::string &interval,
                                const std::string &structureEvent,
                                const std::string &structureDirection,
@@ -84,7 +87,8 @@ class AlertManager {
                                const std::string &phone, const std::string &customMessage,
                                const std::string &expiresAt,
                                std::optional<double> minSwingAtr = std::nullopt,
-                               std::optional<double> breakK = std::nullopt);
+                               std::optional<double> breakK = std::nullopt,
+                               std::optional<std::string> dependsOnAlertId = std::nullopt);
 
     void ingestStructureHistory(const std::string &pair, const std::string &interval,
                                 const std::vector<Json::Value> &candles);
@@ -124,6 +128,16 @@ class AlertManager {
     void persistDelete(const std::string &id);
     void triggerAlert(Alert &a, double price,
                       const std::optional<std::string> &triggeredAtIso = std::nullopt);
+    // Link a new alert into a same-pair queue. Caller must hold mu_.
+    // Returns parent snapshot to persist when chain_id was backfilled.
+    std::optional<Alert> applyDependsOnLocked(Alert &a, const std::string &userId,
+                                              const std::optional<std::string> &dependsOnAlertId);
+    // Arm waiting children of parentId. Caller must hold mu_. Returns before/after pairs.
+    std::vector<std::pair<Alert, Alert>> armDependentsLocked(
+        const std::string &parentId, const std::optional<std::string> &skipCandleTs);
+    // Persist armed dependents (acquires lock).
+    void armDependentAlerts(const std::string &parentId,
+                            const std::optional<std::string> &skipCandleTs = std::nullopt);
     static bool priceConditionMet(const Alert &a, double current);
     void bumpUserRevision(const std::string &userId);
     void notifySubscriptionChange();

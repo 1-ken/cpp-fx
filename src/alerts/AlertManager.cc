@@ -322,7 +322,8 @@ Alert AlertManager::createPriceAlert(const std::string &pair, double targetPrice
                                      const std::vector<std::string> &channels,
                                      const std::string &phone,
                                      const std::string &customMessage,
-                                     const std::string &expiresAt) {
+                                     const std::string &expiresAt,
+                                     std::optional<std::string> dependsOnAlertId) {
     if (!postgres_) throw std::runtime_error("Database unavailable");
     Alert a;
     a.id = newUuid();
@@ -338,12 +339,21 @@ Alert AlertManager::createPriceAlert(const std::string &pair, double targetPrice
     a.phone = phone;
     a.customMessage = customMessage;
     a.expiresAt = expiresAt;
-    a.status = "active";
     a.createdAt = util::nowIso8601();
+
+    std::optional<Alert> parentPatch;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        parentPatch = applyDependsOnLocked(a, userId, dependsOnAlertId);
+        if (parentPatch) alerts_[parentPatch->id] = *parentPatch;
         alerts_[a.id] = a;
         rebuildIndexes();
+    }
+    if (parentPatch && !persistAlertSync(*parentPatch)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.erase(a.id);
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
     }
     if (!persistAlertSync(a)) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -353,7 +363,8 @@ Alert AlertManager::createPriceAlert(const std::string &pair, double targetPrice
     }
     bumpUserRevision(a.userId);
     notifySubscriptionChange();
-    LOG_INFO << "Created price alert " << a.id << " " << a.pair << " @ " << targetPrice;
+    LOG_INFO << "Created price alert " << a.id << " " << a.pair << " @ " << targetPrice
+             << " status=" << a.status;
     return a;
 }
 
@@ -363,7 +374,8 @@ Alert AlertManager::createCandleAlert(const std::string &pair, const std::string
                                       const std::vector<std::string> &channels,
                                       const std::string &phone,
                                       const std::string &customMessage,
-                                      const std::string &expiresAt) {
+                                      const std::string &expiresAt,
+                                      std::optional<std::string> dependsOnAlertId) {
     if (!postgres_) throw std::runtime_error("Database unavailable");
     std::string iv = interval;
     std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
@@ -385,12 +397,21 @@ Alert AlertManager::createCandleAlert(const std::string &pair, const std::string
     a.phone = phone;
     a.customMessage = customMessage;
     a.expiresAt = expiresAt;
-    a.status = "active";
     a.createdAt = util::nowIso8601();
+
+    std::optional<Alert> parentPatch;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        parentPatch = applyDependsOnLocked(a, userId, dependsOnAlertId);
+        if (parentPatch) alerts_[parentPatch->id] = *parentPatch;
         alerts_[a.id] = a;
         rebuildIndexes();
+    }
+    if (parentPatch && !persistAlertSync(*parentPatch)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.erase(a.id);
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
     }
     if (!persistAlertSync(a)) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -401,7 +422,7 @@ Alert AlertManager::createCandleAlert(const std::string &pair, const std::string
     bumpUserRevision(a.userId);
     notifySubscriptionChange();
     LOG_INFO << "Created candle alert " << a.id << " " << a.pair << " " << iv << " "
-             << direction << " " << threshold;
+             << direction << " " << threshold << " status=" << a.status;
     return a;
 }
 
@@ -412,7 +433,8 @@ Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &
                                     const std::string &phone,
                                     const std::string &customMessage,
                                     const std::optional<std::string> &batchId,
-                                    const std::string &expiresAt) {
+                                    const std::string &expiresAt,
+                                    std::optional<std::string> dependsOnAlertId) {
     if (!postgres_) throw std::runtime_error("Database unavailable");
     if (levelRef != "high" && levelRef != "low" && levelRef != "both")
         throw std::invalid_argument("level_ref must be one of: high, low, both");
@@ -436,12 +458,21 @@ Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &
     a.phone = phone;
     a.customMessage = customMessage;
     a.expiresAt = expiresAt;
-    a.status = "active";
     a.createdAt = util::nowIso8601();
+
+    std::optional<Alert> parentPatch;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        parentPatch = applyDependsOnLocked(a, userId, dependsOnAlertId);
+        if (parentPatch) alerts_[parentPatch->id] = *parentPatch;
         alerts_[a.id] = a;
         rebuildIndexes();
+    }
+    if (parentPatch && !persistAlertSync(*parentPatch)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.erase(a.id);
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
     }
     if (!persistAlertSync(a)) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -453,10 +484,10 @@ Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &
     bumpUserRevision(a.userId);
     notifySubscriptionChange();
     LOG_INFO << "Created draw-on-liquidity alert " << a.id << " " << a.pair << " "
-             << levelRef << " " << dolTrigger;
+             << levelRef << " " << dolTrigger << " status=" << a.status;
 
-    // Sweep: if PDH/PDL already traded through earlier today, notify with that time.
-    if (dolTrigger == "sweep") {
+    // Sweep lookback only when the alert is immediately active.
+    if (a.status == "active" && dolTrigger == "sweep") {
         {
             std::lock_guard<std::mutex> lk(mu_);
             sweepLookbackPending_[a.id] = true;
@@ -484,7 +515,8 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
                                          const std::string &customMessage,
                                          const std::string &expiresAt,
                                          std::optional<double> minSwingAtr,
-                                         std::optional<double> breakK) {
+                                         std::optional<double> breakK,
+                                         std::optional<std::string> dependsOnAlertId) {
     if (!postgres_) throw std::runtime_error("Database unavailable");
     std::string iv = interval;
     std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
@@ -516,12 +548,21 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
     a.phone = phone;
     a.customMessage = customMessage;
     a.expiresAt = expiresAt;
-    a.status = "active";
     a.createdAt = util::nowIso8601();
+
+    std::optional<Alert> parentPatch;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        parentPatch = applyDependsOnLocked(a, userId, dependsOnAlertId);
+        if (parentPatch) alerts_[parentPatch->id] = *parentPatch;
         alerts_[a.id] = a;
         rebuildIndexes();
+    }
+    if (parentPatch && !persistAlertSync(*parentPatch)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.erase(a.id);
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
     }
     if (!persistAlertSync(a)) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -532,7 +573,8 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
     bumpUserRevision(a.userId);
     notifySubscriptionChange();
     LOG_INFO << "Created structure alert " << a.id << " " << a.pair << " " << iv << " " << ev
-             << " " << dir;
+             << " " << dir << " status=" << a.status
+             << (a.dependsOnAlertId ? (" depends_on=" + *a.dependsOnAlertId) : "");
     return a;
 }
 
@@ -725,6 +767,87 @@ void AlertManager::triggerAlert(Alert &a, double price,
     a.closePrice = price;
 }
 
+std::optional<Alert> AlertManager::applyDependsOnLocked(
+    Alert &a, const std::string &userId,
+    const std::optional<std::string> &dependsOnAlertId) {
+    if (!dependsOnAlertId || dependsOnAlertId->empty()) {
+        a.chainId = newUuid();
+        a.sequenceIndex = 0;
+        a.status = "active";
+        return std::nullopt;
+    }
+    auto pit = alerts_.find(*dependsOnAlertId);
+    if (pit == alerts_.end())
+        throw std::invalid_argument("depends_on_alert_id not found");
+    Alert &parent = pit->second;
+    if (parent.userId != userId)
+        throw std::invalid_argument("depends_on_alert_id not found");
+    if (util::canonicalPair(parent.pair) != util::canonicalPair(a.pair))
+        throw std::invalid_argument("depends_on_alert_id must be the same pair");
+    if (parent.status != "active" && parent.status != "waiting")
+        throw std::invalid_argument(
+            "depends_on_alert_id must be an active or waiting alert");
+
+    std::optional<Alert> parentPatch;
+    if (!parent.chainId || parent.chainId->empty()) {
+        parent.chainId = newUuid();
+        parent.sequenceIndex = 0;
+        parentPatch = parent;
+    }
+    a.dependsOnAlertId = parent.id;
+    a.chainId = parent.chainId;
+    a.sequenceIndex = parent.sequenceIndex.value_or(0) + 1;
+    a.status = "waiting";
+    return parentPatch;
+}
+
+std::vector<std::pair<Alert, Alert>> AlertManager::armDependentsLocked(
+    const std::string &parentId, const std::optional<std::string> &skipCandleTs) {
+    std::vector<std::pair<Alert, Alert>> out;
+    for (auto &kv : alerts_) {
+        Alert &next = kv.second;
+        if (next.status != "waiting") continue;
+        if (!next.dependsOnAlertId || *next.dependsOnAlertId != parentId) continue;
+        Alert before = next;
+        next.status = "active";
+        if (skipCandleTs && !skipCandleTs->empty())
+            next.lastEvaluatedCandleTime = *skipCandleTs;
+        out.emplace_back(before, next);
+        LOG_INFO << "Armed queue step " << next.id << " after " << parentId;
+    }
+    return out;
+}
+
+void AlertManager::armDependentAlerts(const std::string &parentId,
+                                      const std::optional<std::string> &skipCandleTs) {
+    if (!postgres_) return;
+    struct PersistBatch {
+        Alert before;
+        Alert after;
+    };
+    std::vector<PersistBatch> toPersist;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto &pair : armDependentsLocked(parentId, skipCandleTs)) {
+            toPersist.push_back({pair.first, pair.second});
+        }
+        if (!toPersist.empty()) rebuildIndexes();
+    }
+    bool any = false;
+    for (const auto &batch : toPersist) {
+        if (!persistAlertSync(batch.after)) {
+            std::lock_guard<std::mutex> lk(mu_);
+            alerts_[batch.after.id] = batch.before;
+            rebuildIndexes();
+            LOG_ERROR << "Failed to persist armed queue alert " << batch.after.id;
+            continue;
+        }
+        bumpUserRevision(batch.after.userId);
+        any = true;
+    }
+    if (any) notifySubscriptionChange();
+}
+
 bool AlertManager::priceConditionMet(const Alert &a, double current) {
     if (a.alertType != "price") return false;
     std::string cond = a.condition.value_or("");
@@ -784,6 +907,7 @@ std::optional<TriggeredAlert> AlertManager::tryTriggerPriceAlert(const std::stri
              << " channel=" << persisted.channel << " price=" << currentPrice
              << " target=" << persisted.targetPrice.value_or(0);
     if (onTriggered_) onTriggered_(*result);
+    armDependentAlerts(persisted.id);
     return result;
 }
 
@@ -833,6 +957,9 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                 LOG_INFO << "Triggered price alert " << a.id << " " << a.pair
                          << " channel=" << a.channel << " price=" << current
                          << " target=" << a.targetPrice.value_or(0);
+                for (auto &armed : armDependentsLocked(a.id, std::nullopt)) {
+                    toPersist.push_back({armed.first, armed.second});
+                }
             }
         }
         if (dolProvider_) {
@@ -869,6 +996,9 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                     toPersist.push_back({before, a});
                     LOG_INFO << "Triggered draw alert " << a.id << " " << a.pair
                              << " trigger=" << a.dolTrigger.value_or("") << " price=" << current;
+                    for (auto &armed : armDependentsLocked(a.id, std::nullopt)) {
+                        toPersist.push_back({armed.first, armed.second});
+                    }
                 }
             }
         }
@@ -1008,6 +1138,9 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                 toPersist.push_back({before, a, true});
                 LOG_INFO << "Triggered " << typeLabel << " alert " << a.id << " " << a.pair
                          << " channel=" << a.channel << " close=" << close;
+                for (auto &armed : armDependentsLocked(a.id, candleTsStr)) {
+                    toPersist.push_back({armed.first, armed.second, true});
+                }
             }
             }
 
@@ -1094,6 +1227,10 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                     toPersist.push_back({before, a, true});
                     LOG_INFO << "Triggered market_structure alert " << a.id << " " << a.pair
                              << " close=" << close;
+
+                    for (auto &armed : armDependentsLocked(a.id, candleTsStr)) {
+                        toPersist.push_back({armed.first, armed.second, true});
+                    }
                 }
             }
         }
@@ -1179,7 +1316,8 @@ int AlertManager::expireTimedOutAlerts() {
         std::lock_guard<std::mutex> lk(mu_);
         for (auto &kv : alerts_) {
             Alert &a = kv.second;
-            if (a.status != "active" || !isPastExpiry(a, now)) continue;
+            if (a.status != "active" && a.status != "waiting") continue;
+            if (!isPastExpiry(a, now)) continue;
             Alert before = a;
             a.status = "expired";
             sweepLookbackPending_.erase(a.id);
@@ -1397,6 +1535,7 @@ bool AlertManager::finalizeSweepLookbackTrigger(const std::string &alertId, doub
     bumpUserRevision(persisted.userId);
     if (!result) return false;
     if (onTriggered_) onTriggered_(*result);
+    armDependentAlerts(persisted.id);
     return true;
 }
 

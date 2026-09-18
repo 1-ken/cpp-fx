@@ -139,13 +139,24 @@ Json::Value enrich(const Json::Value &grouped, WsConnContext &ctx) {
         if (rev != ctx.lastAlertsRevision || !ctx.hasCachedAlerts) {
             Json::Value alerts(Json::objectValue);
             Json::Value active(Json::arrayValue);
+            Json::Value waiting(Json::arrayValue);
+            Json::Value triggered(Json::arrayValue);
+            Json::Value expired(Json::arrayValue);
+            Json::Value allArr(Json::arrayValue);
             for (const auto &a : app.alerts->getActiveAlertsForUser(ctx.userId))
                 active.append(a.toJson());
-            Json::Value triggered(Json::arrayValue);
-            for (const auto &a : app.alerts->getAllAlertsForUser(ctx.userId))
-                if (a.status == "triggered") triggered.append(a.toJson());
+            for (const auto &a : app.alerts->getAllAlertsForUser(ctx.userId)) {
+                allArr.append(a.toJson());
+                if (a.status == "waiting") waiting.append(a.toJson());
+                else if (a.status == "triggered") triggered.append(a.toJson());
+                else if (a.status == "expired") expired.append(a.toJson());
+            }
             alerts["active"] = active;
+            alerts["waiting"] = waiting;
             alerts["triggered"] = triggered;
+            alerts["expired"] = expired;
+            alerts["all"] = allArr;
+            alerts["total"] = static_cast<int>(allArr.size());
             ctx.lastAlertsRevision = rev;
             ctx.cachedAlerts = alerts;
             ctx.hasCachedAlerts = true;

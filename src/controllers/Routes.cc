@@ -151,10 +151,13 @@ bool rejectIfSubscriptionBlocksCreate(AppContext &app, const std::string &uid,
                                       std::function<void(const HttpResponsePtr &)> &cb) {
     if (!app.postgres || !app.postgres->available()) return false;
     services::SubscriptionService sub(*app.postgres);
-    const int activeCount = app.alerts
-                                ? static_cast<int>(app.alerts->getActiveAlertsForUser(uid).size())
-                                : 0;
-    auto check = sub.canCreateAlert(uid, channels, activeCount);
+    int openCount = 0;
+    if (app.alerts) {
+        for (const auto &a : app.alerts->getAllAlertsForUser(uid)) {
+            if (a.status == "active" || a.status == "waiting") ++openCount;
+        }
+    }
+    auto check = sub.canCreateAlert(uid, channels, openCount);
     if (!check.allowed) {
         cb(subscriptionErrResp(check));
         return true;
@@ -222,6 +225,14 @@ std::optional<std::string> requireExpiresAt(const Json::Value &b, std::string &e
         return std::nullopt;
     }
     return raw;
+}
+
+std::optional<std::string> parseDependsOnAlertId(const Json::Value &b) {
+    if (!b.isMember("depends_on_alert_id") || !b["depends_on_alert_id"].isString())
+        return std::nullopt;
+    std::string dep = trimStr(b["depends_on_alert_id"].asString());
+    if (dep.empty()) return std::nullopt;
+    return dep;
 }
 
 bool requiresCustomMessage(const std::string &channel, const std::string &customMessage) {
@@ -1071,12 +1082,14 @@ void createDrawAlertBatch(const HttpRequestPtr &req,
 
     std::optional<std::string> batchId;
     if (pairs.size() > 1) batchId = drogon::utils::getUuid();
+    auto dependsOn = parseDependsOnAlertId(b);
 
     Json::Value created(Json::arrayValue);
     try {
         for (const auto &p : pairs) {
             auto a = app.alerts->createDrawAlert(p, levelRef, dolTrigger, uid, email, channels,
-                                                 phone, customMessage, batchId, *expiresAt);
+                                                 phone, customMessage, batchId, *expiresAt,
+                                                 dependsOn);
             created.append(a.toJson());
             Json::Value meta;
             meta["pair"] = a.pair;
@@ -1163,10 +1176,11 @@ void createAlert(const HttpRequestPtr &req,
         if (b.isMember("min_swing_atr") && b["min_swing_atr"].isNumeric())
             minSwing = b["min_swing_atr"].asDouble();
         if (b.isMember("break_k") && b["break_k"].isNumeric()) breakK = b["break_k"].asDouble();
+        std::optional<std::string> dependsOn = parseDependsOnAlertId(b);
         try {
             auto a = app.alerts->createStructureAlert(pair, interval, structureEvent, structureDir,
                                                       uid, email, channels, phone, customMessage,
-                                                      *expiresAt, minSwing, breakK);
+                                                      *expiresAt, minSwing, breakK, dependsOn);
             core::logApiOutcome("alerts", "create", true, 200,
                                 "pair=" + pair + " type=market_structure", uid);
             Json::Value v;
@@ -1233,6 +1247,7 @@ void createAlert(const HttpRequestPtr &req,
         return;
     }
     if (rejectIfSubscriptionBlocksCreate(app, uid, channels, cb)) return;
+    auto dependsOn = parseDependsOnAlertId(b);
 
     if (isCandle) {
         std::string interval = b["interval"].asString();
@@ -1245,7 +1260,7 @@ void createAlert(const HttpRequestPtr &req,
         try {
             auto a = app.alerts->createCandleAlert(pair, interval, direction, threshold, uid,
                                                    email, channels, phone, customMessage,
-                                                   *expiresAt);
+                                                   *expiresAt, dependsOn);
             std::ostringstream detail;
             detail << "pair=" << pair << " channels=" << channels.size()
                    << " interval=" << interval;
@@ -1281,9 +1296,9 @@ void createAlert(const HttpRequestPtr &req,
     }
     try {
         auto a = app.alerts->createPriceAlert(pair, target, condition, uid, email, channels,
-                                              phone, customMessage, *expiresAt);
+                                              phone, customMessage, *expiresAt, dependsOn);
         double livePrice = 0;
-        if (app.hub && app.hub->latestPrice(a.pair, livePrice)) {
+        if (a.status == "active" && app.hub && app.hub->latestPrice(a.pair, livePrice)) {
             app.alerts->tryTriggerPriceAlert(a.id, livePrice);
             if (auto updated = app.alerts->getAlert(a.id)) a = *updated;
         }
@@ -1319,22 +1334,25 @@ void listAlerts(const HttpRequestPtr &req,
     if (!authOrReject(req, cb, uid)) return;
     if (rejectAlertsWithoutDb(cb)) return;
     auto all = app.alerts->getAllAlertsForUser(uid);
-    Json::Value active(Json::arrayValue), triggered(Json::arrayValue), expired(Json::arrayValue),
-        allArr(Json::arrayValue);
+    Json::Value active(Json::arrayValue), waiting(Json::arrayValue), triggered(Json::arrayValue),
+        expired(Json::arrayValue), allArr(Json::arrayValue);
     for (const auto &a : app.alerts->getActiveAlertsSortedForUser(uid)) active.append(a.toJson());
     for (const auto &a : all) {
         allArr.append(a.toJson());
-        if (a.status == "triggered") triggered.append(a.toJson());
+        if (a.status == "waiting") waiting.append(a.toJson());
+        else if (a.status == "triggered") triggered.append(a.toJson());
         else if (a.status == "expired") expired.append(a.toJson());
     }
     core::logApiOutcome("alerts", "list", true, 200,
-                        "active=" + std::to_string(active.size()) + " triggered=" +
+                        "active=" + std::to_string(active.size()) + " waiting=" +
+                            std::to_string(waiting.size()) + " triggered=" +
                             std::to_string(triggered.size()) +
                             " expired=" + std::to_string(expired.size()),
                         uid);
     Json::Value v;
     v["total"] = (int)all.size();
     v["active"] = active;
+    v["waiting"] = waiting;
     v["triggered"] = triggered;
     v["expired"] = expired;
     v["all"] = allArr;

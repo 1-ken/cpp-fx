@@ -15,7 +15,7 @@ struct Alert {
     std::string id;
     std::string userId = "legacy-unassigned";
     std::string pair;
-    std::string status = "active";  // active, triggered, disabled, expired
+    std::string status = "active";  // active, waiting, triggered, disabled, expired
     std::string createdAt;
     std::string alertType = "price";  // price | candle_close | prev_day_level | market_structure
     std::string channel = "email";    // primary / legacy single channel
@@ -49,6 +49,11 @@ struct Alert {
     std::optional<std::string> structureDirection;   // bull | bear | any
     std::optional<double> minSwingAtr;
     std::optional<double> breakK;
+
+    // Structure queue: later steps wait until dependsOnAlertId triggers.
+    std::optional<std::string> dependsOnAlertId;
+    std::optional<std::string> chainId;
+    std::optional<int> sequenceIndex;
 
     // In-app sound is always delivered alongside any chosen channel.
     void ensureSoundChannel() {
@@ -112,6 +117,11 @@ struct Alert {
             structureDirection ? Json::Value(*structureDirection) : Json::Value::null;
         v["min_swing_atr"] = minSwingAtr ? Json::Value(*minSwingAtr) : Json::Value::null;
         v["break_k"] = breakK ? Json::Value(*breakK) : Json::Value::null;
+        v["depends_on_alert_id"] =
+            dependsOnAlertId ? Json::Value(*dependsOnAlertId) : Json::Value::null;
+        v["chain_id"] = chainId ? Json::Value(*chainId) : Json::Value::null;
+        v["sequence_index"] =
+            sequenceIndex ? Json::Value(*sequenceIndex) : Json::Value::null;
         return v;
     }
 
@@ -143,6 +153,10 @@ struct Alert {
             if (v.isMember(k) && v[k].isNumeric()) return v[k].asDouble();
             return std::nullopt;
         };
+        auto optInt = [&](const char *k) -> std::optional<int> {
+            if (v.isMember(k) && v[k].isNumeric()) return v[k].asInt();
+            return std::nullopt;
+        };
         a.triggeredAt = optStr("triggered_at");
         a.lastCheckedPrice = optNum("last_checked_price");
         a.closePrice = optNum("close_price");
@@ -160,6 +174,9 @@ struct Alert {
         a.structureDirection = optStr("structure_direction");
         a.minSwingAtr = optNum("min_swing_atr");
         a.breakK = optNum("break_k");
+        a.dependsOnAlertId = optStr("depends_on_alert_id");
+        a.chainId = optStr("chain_id");
+        a.sequenceIndex = optInt("sequence_index");
         return a;
     }
 };
