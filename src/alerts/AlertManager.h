@@ -10,6 +10,7 @@
 #include <json/json.h>
 
 #include "alerts/Alert.h"
+#include "market/StructureEngine.h"
 
 namespace ctraderplus::services {
 class PostgresService;
@@ -72,6 +73,17 @@ class AlertManager {
                           const std::vector<std::string> &channels,
                           const std::string &phone, const std::string &customMessage,
                           const std::optional<std::string> &batchId);
+    Alert createStructureAlert(const std::string &pair, const std::string &interval,
+                               const std::string &structureEvent,
+                               const std::string &structureDirection,
+                               const std::string &userId, const std::string &email,
+                               const std::vector<std::string> &channels,
+                               const std::string &phone, const std::string &customMessage,
+                               std::optional<double> minSwingAtr = std::nullopt,
+                               std::optional<double> breakK = std::nullopt);
+
+    void ingestStructureHistory(const std::string &pair, const std::string &interval,
+                                const std::vector<Json::Value> &candles);
 
     std::optional<Alert> getAlert(const std::string &id) const;
     std::vector<Alert> getAllAlerts() const;
@@ -130,6 +142,12 @@ class AlertManager {
     std::unordered_map<std::string, std::vector<std::string>> activeDolIndex_;
     std::unordered_map<std::string, uint64_t> userAlertsRevision_;
     std::unordered_map<std::string, bool> sweepLookbackPending_;
+
+    struct StructureTrack {
+        std::vector<market::StructureCandle> candles;
+        bool warmed = false;
+    };
+    std::unordered_map<std::string, StructureTrack> structureTracks_;
 
     std::function<void()> onSubscriptionChange_;
     std::function<void(const TriggeredAlert &)> onTriggered_;

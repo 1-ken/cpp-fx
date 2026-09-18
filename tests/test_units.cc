@@ -1,7 +1,7 @@
 // Minimal assertion-based unit tests for the dependency-light utilities.
 #include <cassert>
 #include <iostream>
-#include <string>
+#include <vector>
 
 #include "core/Config.h"
 #include "ctrader/SymbolRegistry.h"
@@ -10,6 +10,7 @@
 #include "util/ForexMarketHours.h"
 #include "util/PairNormalizer.h"
 #include "util/FormingCandle.h"
+#include "market/StructureEngine.h"
 #include "util/TimeUtil.h"
 #include "ctrader/Types.h"
 
@@ -153,6 +154,41 @@ static void testFormingCandleMergedDoesNotInheritPrevClosed() {
     CHECK(fc["low"].asDouble() == 1.11);
 }
 
+static void testMarketStructureBosChoch() {
+    using ctraderplus::market::StructureCandle;
+    using ctraderplus::market::StructureOptions;
+    using ctraderplus::market::computeMarketStructure;
+    std::vector<StructureCandle> candles;
+    auto add = [&](double o, double h, double l, double c, const char *ts) {
+        StructureCandle b;
+        b.open = o;
+        b.high = h;
+        b.low = l;
+        b.close = c;
+        b.timestamp = ts;
+        candles.push_back(b);
+    };
+    add(100, 101, 99, 100, "t0");
+    add(100, 105, 100, 104, "t1");
+    add(104, 104.2, 102, 103, "t2");
+    add(103, 103, 98, 99, "t3");
+    add(99, 100, 95, 96, "t4");
+    add(96, 98, 96, 97, "t5");
+    add(97, 108, 97, 107, "t6");
+    add(107, 107, 94, 94, "t7");
+    StructureOptions opt;
+    opt.breakK = 0;
+    opt.minSwingAtr = 0;
+    auto result = computeMarketStructure(candles, opt);
+    bool bos = false, choch = false;
+    for (const auto &ev : result.events) {
+        if (ev.kind == "BOS") bos = true;
+        if (ev.kind == "CHoCH") choch = true;
+    }
+    CHECK(bos);
+    CHECK(choch);
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -165,6 +201,7 @@ int main() {
     testFormingCandleMergedWithoutLastBar();
     testFormingCandleMergedWithLastBar();
     testFormingCandleMergedDoesNotInheritPrevClosed();
+    testMarketStructureBosChoch();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

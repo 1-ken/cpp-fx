@@ -16,6 +16,7 @@
 #include "ctrader/SymbolRegistry.h"
 #include "market/MarketHub.h"
 #include "market/PrevDayLevelProvider.h"
+#include "market/StructureEngine.h"
 #include "services/PostgresService.h"
 #include "services/RedisService.h"
 #include "util/PairNormalizer.h"
@@ -219,6 +220,10 @@ void AlertManager::rebuildIndexes() {
         if (a.alertType == "price") {
             activePriceIndex_[key].push_back(a.id);
         } else if (a.alertType == "candle_close" && a.interval) {
+            std::string iv = *a.interval;
+            std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+            activeCandleIndex_[candleIndexKey(key, iv)].push_back(a.id);
+        } else if (a.alertType == "market_structure" && a.interval) {
             std::string iv = *a.interval;
             std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
             activeCandleIndex_[candleIndexKey(key, iv)].push_back(a.id);
@@ -456,6 +461,85 @@ Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &
         if (auto latest = getAlert(a.id)) return *latest;
     }
     return a;
+}
+
+Alert AlertManager::createStructureAlert(const std::string &pair, const std::string &interval,
+                                         const std::string &structureEvent,
+                                         const std::string &structureDirection,
+                                         const std::string &userId, const std::string &email,
+                                         const std::vector<std::string> &channels,
+                                         const std::string &phone,
+                                         const std::string &customMessage,
+                                         std::optional<double> minSwingAtr,
+                                         std::optional<double> breakK) {
+    if (!postgres_) throw std::runtime_error("Database unavailable");
+    std::string iv = interval;
+    std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+    if (intervalSeconds(iv) == 0)
+        throw std::invalid_argument("Invalid interval. Must be one of: 1m, 5m, 15m, 30m, 1h, 4h, 1d");
+    std::string ev = structureEvent;
+    std::transform(ev.begin(), ev.end(), ev.begin(), ::tolower);
+    if (ev != "bos" && ev != "choch" && ev != "sweep" && ev != "any")
+        throw std::invalid_argument("structure_event must be bos, choch, sweep, or any");
+    std::string dir = structureDirection;
+    std::transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
+    if (dir != "bull" && dir != "bear" && dir != "any")
+        throw std::invalid_argument("structure_direction must be bull, bear, or any");
+
+    Alert a;
+    a.id = newUuid();
+    a.userId = userId;
+    std::string canon = util::canonicalPair(pair);
+    a.pair = canon.empty() ? pair : canon;
+    a.alertType = "market_structure";
+    a.interval = iv;
+    a.structureEvent = ev;
+    a.structureDirection = dir;
+    a.minSwingAtr = minSwingAtr.value_or(0);
+    a.breakK = breakK.value_or(0.25);
+    a.email = email;
+    a.channels = channels;
+    a.normalizeChannels();
+    a.phone = phone;
+    a.customMessage = customMessage;
+    a.status = "active";
+    a.createdAt = util::nowIso8601();
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_[a.id] = a;
+        rebuildIndexes();
+    }
+    if (!persistAlertSync(a)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.erase(a.id);
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
+    }
+    bumpUserRevision(a.userId);
+    notifySubscriptionChange();
+    LOG_INFO << "Created structure alert " << a.id << " " << a.pair << " " << iv << " " << ev
+             << " " << dir;
+    return a;
+}
+
+void AlertManager::ingestStructureHistory(const std::string &pair, const std::string &interval,
+                                          const std::vector<Json::Value> &candles) {
+    std::string iv = interval;
+    std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+    std::string key = candleIndexKey(util::canonicalPair(pair), iv);
+    std::lock_guard<std::mutex> lk(mu_);
+    auto &track = structureTracks_[key];
+    track.candles.clear();
+    for (const auto &c : candles) {
+        market::StructureCandle bar;
+        bar.timestamp = c.get("timestamp", "").asString();
+        bar.open = c.get("open", 0.0).asDouble();
+        bar.high = c.get("high", 0.0).asDouble();
+        bar.low = c.get("low", 0.0).asDouble();
+        bar.close = c.get("close", 0.0).asDouble();
+        if (!bar.timestamp.empty()) track.candles.push_back(std::move(bar));
+    }
+    track.warmed = !track.candles.empty();
 }
 
 std::optional<Alert> AlertManager::getAlert(const std::string &id) const {
@@ -875,6 +959,84 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                 LOG_INFO << "Triggered " << typeLabel << " alert " << a.id << " " << a.pair
                          << " channel=" << a.channel << " close=" << close;
             }
+            }
+
+            Json::Value tsVal = candle["timestamp"];
+            std::string candleTsStr =
+                tsVal.isString() ? tsVal.asString() : std::to_string(tsVal.asInt64());
+            std::string trackKey = candleIndexKey(k.pair, k.interval);
+            auto &track = structureTracks_[trackKey];
+            if (track.candles.empty() || track.candles.back().timestamp != candleTsStr) {
+                market::StructureCandle bar;
+                bar.timestamp = candleTsStr;
+                bar.open = candle.get("open", 0.0).asDouble();
+                bar.high = candle.get("high", 0.0).asDouble();
+                bar.low = candle.get("low", 0.0).asDouble();
+                bar.close = candle.get("close", 0.0).asDouble();
+                track.candles.push_back(std::move(bar));
+            }
+            auto idxItStruct = activeCandleIndex_.find(trackKey);
+            if (idxItStruct != activeCandleIndex_.end() && track.candles.size() >= 5) {
+                auto candleStart = parseCandleTs(tsVal);
+                for (const auto &alertId : idxItStruct->second) {
+                    auto it = alerts_.find(alertId);
+                    if (it == alerts_.end()) continue;
+                    Alert &a = it->second;
+                    if (a.status != "active" || a.alertType != "market_structure") continue;
+                    std::string iv = a.interval.value_or("");
+                    std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+                    if (iv != k.interval) continue;
+                    if (a.lastEvaluatedCandleTime && *a.lastEvaluatedCandleTime == candleTsStr)
+                        continue;
+                    int ivSec = intervalSeconds(iv);
+                    auto createdAt = util::parseIso8601(a.createdAt);
+                    if (candleStart && ivSec && createdAt) {
+                        std::time_t closeTime = *candleStart + ivSec;
+                        if (closeTime <= *createdAt) {
+                            Alert before = a;
+                            a.lastEvaluatedCandleTime = candleTsStr;
+                            toPersist.push_back({before, a, false});
+                            continue;
+                        }
+                    }
+                    market::StructureOptions opt;
+                    opt.minSwingAtr = a.minSwingAtr.value_or(0);
+                    opt.breakK = a.breakK.value_or(0.25);
+                    auto result = market::computeMarketStructure(track.candles, opt);
+                    bool should = false;
+                    for (const auto &ev : result.events) {
+                        if (ev.timestamp != candleTsStr) continue;
+                        const std::string want = a.structureEvent.value_or("any");
+                        const std::string keyKind = market::structureKindKey(ev.kind);
+                        if (want != "any" && want != keyKind) continue;
+                        const std::string dir = a.structureDirection.value_or("any");
+                        if (dir != "any" && dir != ev.dir) continue;
+                        should = true;
+                        break;
+                    }
+                    if (!should) {
+                        Alert before = a;
+                        a.lastEvaluatedCandleTime = candleTsStr;
+                        toPersist.push_back({before, a, false});
+                        continue;
+                    }
+                    double close = candle.get("close", 0.0).asDouble();
+                    Alert before = a;
+                    a.status = "triggered";
+                    a.triggeredAt = util::nowIso8601();
+                    a.lastCheckedPrice = close;
+                    a.closePrice = close;
+                    a.lastEvaluatedCandleTime = candleTsStr;
+                    TriggeredAlert t;
+                    t.alert = a;
+                    t.currentPrice = close;
+                    t.alertTypeLabel = "market_structure";
+                    t.timeframe = iv;
+                    triggered.push_back(t);
+                    toPersist.push_back({before, a, true});
+                    LOG_INFO << "Triggered market_structure alert " << a.id << " " << a.pair
+                             << " close=" << close;
+                }
             }
         }
         if (!triggered.empty()) rebuildIndexes();

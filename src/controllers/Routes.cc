@@ -1091,6 +1091,60 @@ void createAlert(const HttpRequestPtr &req,
         createDrawAlertBatch(req, cb, app, uid, b);
         return;
     }
+    if (b.get("alert_type", "").asString() == "market_structure") {
+        std::string pair = trimStr(b.get("pair", "").asString());
+        if (pair.empty()) {
+            cb(errResp("detail", "Pair name cannot be empty", 400));
+            return;
+        }
+        std::string parseErr;
+        auto channels = parseChannels(b, parseErr);
+        if (channels.empty()) {
+            cb(errResp("detail", parseErr.empty() ? "Invalid channels" : parseErr, 400));
+            return;
+        }
+        std::string email = b.get("email", "").asString();
+        std::string phone = b.get("phone", "").asString();
+        std::string customMessage = trimStr(b.get("custom_message", "").asString());
+        if (channelsRequireEmail(channels) && email.empty()) {
+            cb(errResp("detail", "Email is required for email alerts", 400));
+            return;
+        }
+        if (channelsRequirePhone(channels) && phone.empty()) {
+            cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
+            return;
+        }
+        if (channelsRequireCustomMessage(channels, customMessage)) {
+            cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
+            return;
+        }
+        if (rejectIfSubscriptionBlocksCreate(app, uid, channels, cb)) return;
+        std::string interval = b.get("interval", "").asString();
+        std::string structureEvent = b.get("structure_event", "any").asString();
+        std::string structureDir = b.get("structure_direction", "any").asString();
+        std::optional<double> minSwing;
+        std::optional<double> breakK;
+        if (b.isMember("min_swing_atr") && b["min_swing_atr"].isNumeric())
+            minSwing = b["min_swing_atr"].asDouble();
+        if (b.isMember("break_k") && b["break_k"].isNumeric()) breakK = b["break_k"].asDouble();
+        try {
+            auto a = app.alerts->createStructureAlert(pair, interval, structureEvent, structureDir,
+                                                      uid, email, channels, phone, customMessage,
+                                                      minSwing, breakK);
+            core::logApiOutcome("alerts", "create", true, 200,
+                                "pair=" + pair + " type=market_structure", uid);
+            Json::Value v;
+            v["success"] = true;
+            v["alert"] = a.toJson();
+            cb(jsonResp(v));
+        } catch (const std::runtime_error &e) {
+            const std::string msg = e.what();
+            cb(errResp("detail", msg, msg == "Alert not persisted" || msg == "Database unavailable" ? 503 : 400));
+        } catch (const std::exception &e) {
+            cb(errResp("detail", e.what(), 400));
+        }
+        return;
+    }
     std::string pair = b.get("pair", "").asString();
     // trim
     auto trim = [](std::string s) {

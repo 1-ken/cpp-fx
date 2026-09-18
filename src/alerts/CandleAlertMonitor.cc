@@ -71,6 +71,8 @@ std::set<CandleAlertMonitor::SubKey> CandleAlertMonitor::requiredSubscriptions()
         std::string interval;
         if (a.alertType == "candle_close" && a.interval) {
             interval = *a.interval;
+        } else if (a.alertType == "market_structure" && a.interval) {
+            interval = *a.interval;
         } else if (a.alertType == "prev_day_level") {
             const std::string trig = a.dolTrigger.value_or("sweep");
             if (trig != "displacement" && trig != "reversal") continue;
@@ -118,10 +120,25 @@ void CandleAlertMonitor::syncSubscriptions() {
         std::string canon = registry_ ? registry_->canonicalForId(k.symbolId) : "";
         if (iv.empty() || canon.empty()) continue;
         ctrader_->subscribeLiveTrendbar(k.symbolId, k.period);
-        std::lock_guard<std::mutex> lk(mu_);
-        subscribed_.insert(k);
-        meta_[k] = {canon, iv};
-        barState_.erase(k);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            subscribed_.insert(k);
+            meta_[k] = {canon, iv};
+            barState_.erase(k);
+        }
+        int ivSec = util::intervalToSeconds(iv);
+        int64_t toMs = static_cast<int64_t>(std::time(nullptr)) * 1000;
+        ctrader_->getTrendbars(
+            k.symbolId, k.period, 0, toMs, 200,
+            [this, canon, iv, ivSec](ctrader::TrendbarsResult res) {
+                if (!res.ok || !alerts_) return;
+                std::vector<Json::Value> hist;
+                for (const auto &bar : res.bars) {
+                    if (!isBarFullyClosed(bar, ivSec)) continue;
+                    if (auto c = candleJsonFromBar(canon, iv, bar)) hist.push_back(*c);
+                }
+                if (!hist.empty()) alerts_->ingestStructureHistory(canon, iv, hist);
+            });
     }
 }
 
@@ -209,6 +226,8 @@ void CandleAlertMonitor::pollFallback() {
     for (const auto &a : active) {
         std::string interval;
         if (a.alertType == "candle_close" && a.interval) {
+            interval = *a.interval;
+        } else if (a.alertType == "market_structure" && a.interval) {
             interval = *a.interval;
         } else if (a.alertType == "prev_day_level") {
             const std::string trig = a.dolTrigger.value_or("sweep");
