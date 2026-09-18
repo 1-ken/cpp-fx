@@ -56,6 +56,12 @@ std::optional<std::time_t> parseCandleTs(const Json::Value &ts) {
     return std::nullopt;
 }
 
+bool isPastExpiry(const Alert &a, std::time_t now = std::time(nullptr)) {
+    if (!a.expiresAt || a.expiresAt->empty()) return false;
+    auto t = util::parseIso8601(*a.expiresAt);
+    return t.has_value() && *t <= now;
+}
+
 bool dolPriceTriggered(const Alert &a, const market::DayLevels &lv, double price) {
     const std::string ref = a.levelRef.value_or("both");
     const std::string trig = a.dolTrigger.value_or("sweep");
@@ -315,7 +321,8 @@ Alert AlertManager::createPriceAlert(const std::string &pair, double targetPrice
                                      const std::string &userId, const std::string &email,
                                      const std::vector<std::string> &channels,
                                      const std::string &phone,
-                                     const std::string &customMessage) {
+                                     const std::string &customMessage,
+                                     const std::string &expiresAt) {
     if (!postgres_) throw std::runtime_error("Database unavailable");
     Alert a;
     a.id = newUuid();
@@ -330,6 +337,7 @@ Alert AlertManager::createPriceAlert(const std::string &pair, double targetPrice
     a.normalizeChannels();
     a.phone = phone;
     a.customMessage = customMessage;
+    a.expiresAt = expiresAt;
     a.status = "active";
     a.createdAt = util::nowIso8601();
     {
@@ -354,7 +362,8 @@ Alert AlertManager::createCandleAlert(const std::string &pair, const std::string
                                       const std::string &userId, const std::string &email,
                                       const std::vector<std::string> &channels,
                                       const std::string &phone,
-                                      const std::string &customMessage) {
+                                      const std::string &customMessage,
+                                      const std::string &expiresAt) {
     if (!postgres_) throw std::runtime_error("Database unavailable");
     std::string iv = interval;
     std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
@@ -375,6 +384,7 @@ Alert AlertManager::createCandleAlert(const std::string &pair, const std::string
     a.normalizeChannels();
     a.phone = phone;
     a.customMessage = customMessage;
+    a.expiresAt = expiresAt;
     a.status = "active";
     a.createdAt = util::nowIso8601();
     {
@@ -401,7 +411,8 @@ Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &
                                     const std::vector<std::string> &channels,
                                     const std::string &phone,
                                     const std::string &customMessage,
-                                    const std::optional<std::string> &batchId) {
+                                    const std::optional<std::string> &batchId,
+                                    const std::string &expiresAt) {
     if (!postgres_) throw std::runtime_error("Database unavailable");
     if (levelRef != "high" && levelRef != "low" && levelRef != "both")
         throw std::invalid_argument("level_ref must be one of: high, low, both");
@@ -424,6 +435,7 @@ Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &
     a.normalizeChannels();
     a.phone = phone;
     a.customMessage = customMessage;
+    a.expiresAt = expiresAt;
     a.status = "active";
     a.createdAt = util::nowIso8601();
     {
@@ -470,6 +482,7 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
                                          const std::vector<std::string> &channels,
                                          const std::string &phone,
                                          const std::string &customMessage,
+                                         const std::string &expiresAt,
                                          std::optional<double> minSwingAtr,
                                          std::optional<double> breakK) {
     if (!postgres_) throw std::runtime_error("Database unavailable");
@@ -502,6 +515,7 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
     a.normalizeChannels();
     a.phone = phone;
     a.customMessage = customMessage;
+    a.expiresAt = expiresAt;
     a.status = "active";
     a.createdAt = util::nowIso8601();
     {
@@ -733,26 +747,39 @@ std::optional<TriggeredAlert> AlertManager::tryTriggerPriceAlert(const std::stri
         if (it == alerts_.end()) return std::nullopt;
         Alert &a = it->second;
         if (a.status != "active" || a.alertType != "price") return std::nullopt;
-        a.lastCheckedPrice = currentPrice;
-        if (!priceConditionMet(a, currentPrice)) return std::nullopt;
-        previous = a;
-        triggerAlert(a, currentPrice);
-        TriggeredAlert t;
-        t.alert = a;
-        t.currentPrice = currentPrice;
-        t.alertTypeLabel = "price";
-        result = t;
-        persisted = a;
-        rebuildIndexes();
+        if (isPastExpiry(a)) {
+            previous = a;
+            a.status = "expired";
+            persisted = a;
+            rebuildIndexes();
+            result = std::nullopt;
+        } else {
+            a.lastCheckedPrice = currentPrice;
+            if (!priceConditionMet(a, currentPrice)) return std::nullopt;
+            previous = a;
+            triggerAlert(a, currentPrice);
+            TriggeredAlert t;
+            t.alert = a;
+            t.currentPrice = currentPrice;
+            t.alertTypeLabel = "price";
+            result = t;
+            persisted = a;
+            rebuildIndexes();
+        }
     }
     if (!persistAlertSync(persisted)) {
         std::lock_guard<std::mutex> lk(mu_);
         alerts_[alertId] = previous;
         rebuildIndexes();
-        LOG_ERROR << "Failed to persist triggered price alert " << alertId;
+        LOG_ERROR << "Failed to persist alert " << alertId;
         return std::nullopt;
     }
     bumpUserRevision(persisted.userId);
+    if (!result) {
+        LOG_INFO << "Expired price alert " << persisted.id << " " << persisted.pair
+                 << " (past expires_at)";
+        return std::nullopt;
+    }
     LOG_INFO << "Triggered price alert " << persisted.id << " " << persisted.pair
              << " channel=" << persisted.channel << " price=" << currentPrice
              << " target=" << persisted.targetPrice.value_or(0);
@@ -785,6 +812,14 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                 if (it == alerts_.end()) continue;
                 Alert &a = it->second;
                 if (a.status != "active" || a.alertType != "price") continue;
+                if (isPastExpiry(a)) {
+                    Alert before = a;
+                    a.status = "expired";
+                    toPersist.push_back({before, a});
+                    LOG_INFO << "Expired price alert " << a.id << " " << a.pair
+                             << " (past expires_at)";
+                    continue;
+                }
                 a.lastCheckedPrice = current;
                 if (!priceConditionMet(a, current)) continue;
                 Alert before = a;
@@ -812,6 +847,14 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                     if (it == alerts_.end()) continue;
                     Alert &a = it->second;
                     if (a.status != "active" || a.alertType != "prev_day_level") continue;
+                    if (isPastExpiry(a)) {
+                        Alert before = a;
+                        a.status = "expired";
+                        toPersist.push_back({before, a});
+                        LOG_INFO << "Expired draw alert " << a.id << " " << a.pair
+                                 << " (past expires_at)";
+                        continue;
+                    }
                     if (sweepLookbackPending_.count(a.id)) continue;
                     a.lastCheckedPrice = current;
                     if (!dolPriceTriggered(a, levels, current)) continue;
@@ -829,7 +872,7 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                 }
             }
         }
-        if (!triggered.empty()) rebuildIndexes();
+        if (!triggered.empty() || !toPersist.empty()) rebuildIndexes();
     }
     std::vector<TriggeredAlert> notified;
     for (const auto &batch : toPersist) {
@@ -891,6 +934,13 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
             if (it == alerts_.end()) continue;
             Alert &a = it->second;
             if (a.status != "active") continue;
+            if (isPastExpiry(a)) {
+                Alert before = a;
+                a.status = "expired";
+                toPersist.push_back({before, a, true});
+                LOG_INFO << "Expired alert " << a.id << " " << a.pair << " (past expires_at)";
+                continue;
+            }
             const bool isCandleClose = a.alertType == "candle_close";
             const bool isDol = a.alertType == "prev_day_level";
             if (!isCandleClose && !isDol) continue;
@@ -983,6 +1033,14 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                     if (it == alerts_.end()) continue;
                     Alert &a = it->second;
                     if (a.status != "active" || a.alertType != "market_structure") continue;
+                    if (isPastExpiry(a)) {
+                        Alert before = a;
+                        a.status = "expired";
+                        toPersist.push_back({before, a, true});
+                        LOG_INFO << "Expired structure alert " << a.id << " " << a.pair
+                                 << " (past expires_at)";
+                        continue;
+                    }
                     std::string iv = a.interval.value_or("");
                     std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
                     if (iv != k.interval) continue;
@@ -1039,7 +1097,7 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                 }
             }
         }
-        if (!triggered.empty()) rebuildIndexes();
+        if (!triggered.empty() || !toPersist.empty()) rebuildIndexes();
     }
     std::vector<TriggeredAlert> notified;
     for (const auto &batch : toPersist) {
@@ -1099,6 +1157,46 @@ int AlertManager::expireStalePrevDayAlerts() {
             alerts_[batch.after.id] = batch.before;
             rebuildIndexes();
             LOG_ERROR << "Failed to persist expired prev-day alert " << batch.after.id;
+            continue;
+        }
+        bumpUserRevision(batch.after.userId);
+        ++expired;
+    }
+    if (expired > 0) notifySubscriptionChange();
+    return expired;
+}
+
+int AlertManager::expireTimedOutAlerts() {
+    if (!postgres_) return 0;
+    const std::time_t now = std::time(nullptr);
+
+    struct PersistBatch {
+        Alert before;
+        Alert after;
+    };
+    std::vector<PersistBatch> toPersist;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto &kv : alerts_) {
+            Alert &a = kv.second;
+            if (a.status != "active" || !isPastExpiry(a, now)) continue;
+            Alert before = a;
+            a.status = "expired";
+            sweepLookbackPending_.erase(a.id);
+            toPersist.push_back({before, a});
+            LOG_INFO << "Expired alert " << a.id << " " << a.pair << " (expires_at "
+                     << a.expiresAt.value_or("") << ")";
+        }
+        if (!toPersist.empty()) rebuildIndexes();
+    }
+
+    int expired = 0;
+    for (const auto &batch : toPersist) {
+        if (!persistAlertSync(batch.after)) {
+            std::lock_guard<std::mutex> lk(mu_);
+            alerts_[batch.after.id] = batch.before;
+            rebuildIndexes();
+            LOG_ERROR << "Failed to persist timed-out alert " << batch.after.id;
             continue;
         }
         bumpUserRevision(batch.after.userId);
@@ -1270,16 +1368,24 @@ bool AlertManager::finalizeSweepLookbackTrigger(const std::string &alertId, doub
         if (it == alerts_.end()) return false;
         Alert &a = it->second;
         if (a.status != "active" || a.alertType != "prev_day_level") return false;
-        previous = a;
-        triggerAlert(a, touchPrice, touchedAtIso);
-        TriggeredAlert t;
-        t.alert = a;
-        t.currentPrice = touchPrice;
-        t.alertTypeLabel = "prev_day_level";
-        t.timeframe = "1m";
-        result = t;
-        persisted = a;
-        rebuildIndexes();
+        if (isPastExpiry(a)) {
+            previous = a;
+            a.status = "expired";
+            persisted = a;
+            rebuildIndexes();
+            result = std::nullopt;
+        } else {
+            previous = a;
+            triggerAlert(a, touchPrice, touchedAtIso);
+            TriggeredAlert t;
+            t.alert = a;
+            t.currentPrice = touchPrice;
+            t.alertTypeLabel = "prev_day_level";
+            t.timeframe = "1m";
+            result = t;
+            persisted = a;
+            rebuildIndexes();
+        }
     }
     if (!persistAlertSync(persisted)) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1289,7 +1395,8 @@ bool AlertManager::finalizeSweepLookbackTrigger(const std::string &alertId, doub
         return false;
     }
     bumpUserRevision(persisted.userId);
-    if (onTriggered_ && result) onTriggered_(*result);
+    if (!result) return false;
+    if (onTriggered_) onTriggered_(*result);
     return true;
 }
 

@@ -261,7 +261,10 @@ int main() {
             prevDayLevels.refreshDue();
         });
         // After candle poll so near-midnight daily closes can fire first.
-        workerLoop->runEvery(60.0, [&]() { alertManager.expireStalePrevDayAlerts(); });
+        workerLoop->runEvery(60.0, [&]() {
+            alertManager.expireStalePrevDayAlerts();
+            alertManager.expireTimedOutAlerts();
+        });
     }
 
     ctrader.start();

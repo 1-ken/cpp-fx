@@ -26,6 +26,8 @@ struct Alert {
     std::optional<std::string> triggeredAt;
     std::optional<double> lastCheckedPrice;
     std::optional<double> closePrice;
+    // ISO-8601; after this time the alert must not trigger (status → expired).
+    std::optional<std::string> expiresAt;
 
     // price alert
     std::optional<double> targetPrice;
@@ -93,6 +95,7 @@ struct Alert {
         v["last_checked_price"] =
             lastCheckedPrice ? Json::Value(*lastCheckedPrice) : Json::Value::null;
         v["close_price"] = closePrice ? Json::Value(*closePrice) : Json::Value::null;
+        v["expires_at"] = expiresAt ? Json::Value(*expiresAt) : Json::Value::null;
         v["target_price"] = targetPrice ? Json::Value(*targetPrice) : Json::Value::null;
         v["condition"] = condition ? Json::Value(*condition) : Json::Value::null;
         v["interval"] = interval ? Json::Value(*interval) : Json::Value::null;
@@ -143,6 +146,7 @@ struct Alert {
         a.triggeredAt = optStr("triggered_at");
         a.lastCheckedPrice = optNum("last_checked_price");
         a.closePrice = optNum("close_price");
+        a.expiresAt = optStr("expires_at");
         a.targetPrice = optNum("target_price");
         a.condition = optStr("condition");
         a.interval = optStr("interval");

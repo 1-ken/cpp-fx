@@ -201,6 +201,29 @@ std::string trimStr(const std::string &s) {
     return s.substr(a, b - a + 1);
 }
 
+// Require a future ISO-8601 expires_at. Returns empty optional and sets err on failure.
+std::optional<std::string> requireExpiresAt(const Json::Value &b, std::string &err) {
+    if (!b.isMember("expires_at") || !b["expires_at"].isString()) {
+        err = "expires_at is required";
+        return std::nullopt;
+    }
+    std::string raw = trimStr(b["expires_at"].asString());
+    if (raw.empty()) {
+        err = "expires_at is required";
+        return std::nullopt;
+    }
+    auto parsed = util::parseIso8601(raw);
+    if (!parsed) {
+        err = "expires_at must be a valid ISO-8601 timestamp";
+        return std::nullopt;
+    }
+    if (*parsed <= std::time(nullptr)) {
+        err = "expires_at must be in the future";
+        return std::nullopt;
+    }
+    return raw;
+}
+
 bool requiresCustomMessage(const std::string &channel, const std::string &customMessage) {
     return (channel == "sms" || channel == "call") && trimStr(customMessage).empty();
 }
@@ -1005,6 +1028,13 @@ void createDrawAlertBatch(const HttpRequestPtr &req,
         return;
     }
 
+    std::string expiresErr;
+    auto expiresAt = requireExpiresAt(b, expiresErr);
+    if (!expiresAt) {
+        cb(errResp("detail", expiresErr, 400));
+        return;
+    }
+
     const std::string levelRef = b.get("level_ref", "both").asString();
     const std::string dolTrigger = b.get("dol_trigger", "sweep").asString();
 
@@ -1046,7 +1076,7 @@ void createDrawAlertBatch(const HttpRequestPtr &req,
     try {
         for (const auto &p : pairs) {
             auto a = app.alerts->createDrawAlert(p, levelRef, dolTrigger, uid, email, channels,
-                                                 phone, customMessage, batchId);
+                                                 phone, customMessage, batchId, *expiresAt);
             created.append(a.toJson());
             Json::Value meta;
             meta["pair"] = a.pair;
@@ -1118,6 +1148,12 @@ void createAlert(const HttpRequestPtr &req,
             cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
             return;
         }
+        std::string expiresErr;
+        auto expiresAt = requireExpiresAt(b, expiresErr);
+        if (!expiresAt) {
+            cb(errResp("detail", expiresErr, 400));
+            return;
+        }
         if (rejectIfSubscriptionBlocksCreate(app, uid, channels, cb)) return;
         std::string interval = b.get("interval", "").asString();
         std::string structureEvent = b.get("structure_event", "any").asString();
@@ -1130,7 +1166,7 @@ void createAlert(const HttpRequestPtr &req,
         try {
             auto a = app.alerts->createStructureAlert(pair, interval, structureEvent, structureDir,
                                                       uid, email, channels, phone, customMessage,
-                                                      minSwing, breakK);
+                                                      *expiresAt, minSwing, breakK);
             core::logApiOutcome("alerts", "create", true, 200,
                                 "pair=" + pair + " type=market_structure", uid);
             Json::Value v;
@@ -1190,6 +1226,12 @@ void createAlert(const HttpRequestPtr &req,
         cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
         return;
     }
+    std::string expiresErr;
+    auto expiresAt = requireExpiresAt(b, expiresErr);
+    if (!expiresAt) {
+        cb(errResp("detail", expiresErr, 400));
+        return;
+    }
     if (rejectIfSubscriptionBlocksCreate(app, uid, channels, cb)) return;
 
     if (isCandle) {
@@ -1202,7 +1244,8 @@ void createAlert(const HttpRequestPtr &req,
         }
         try {
             auto a = app.alerts->createCandleAlert(pair, interval, direction, threshold, uid,
-                                                   email, channels, phone, customMessage);
+                                                   email, channels, phone, customMessage,
+                                                   *expiresAt);
             std::ostringstream detail;
             detail << "pair=" << pair << " channels=" << channels.size()
                    << " interval=" << interval;
@@ -1238,7 +1281,7 @@ void createAlert(const HttpRequestPtr &req,
     }
     try {
         auto a = app.alerts->createPriceAlert(pair, target, condition, uid, email, channels,
-                                              phone, customMessage);
+                                              phone, customMessage, *expiresAt);
         double livePrice = 0;
         if (app.hub && app.hub->latestPrice(a.pair, livePrice)) {
             app.alerts->tryTriggerPriceAlert(a.id, livePrice);

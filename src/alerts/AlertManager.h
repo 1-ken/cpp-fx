@@ -61,24 +61,28 @@ class AlertManager {
                            const std::string &condition, const std::string &userId,
                            const std::string &email,
                            const std::vector<std::string> &channels,
-                           const std::string &phone, const std::string &customMessage);
+                           const std::string &phone, const std::string &customMessage,
+                           const std::string &expiresAt);
     Alert createCandleAlert(const std::string &pair, const std::string &interval,
                             const std::string &direction, double threshold,
                             const std::string &userId, const std::string &email,
                             const std::vector<std::string> &channels,
-                            const std::string &phone, const std::string &customMessage);
+                            const std::string &phone, const std::string &customMessage,
+                            const std::string &expiresAt);
     Alert createDrawAlert(const std::string &pair, const std::string &levelRef,
                           const std::string &dolTrigger, const std::string &userId,
                           const std::string &email,
                           const std::vector<std::string> &channels,
                           const std::string &phone, const std::string &customMessage,
-                          const std::optional<std::string> &batchId);
+                          const std::optional<std::string> &batchId,
+                          const std::string &expiresAt);
     Alert createStructureAlert(const std::string &pair, const std::string &interval,
                                const std::string &structureEvent,
                                const std::string &structureDirection,
                                const std::string &userId, const std::string &email,
                                const std::vector<std::string> &channels,
                                const std::string &phone, const std::string &customMessage,
+                               const std::string &expiresAt,
                                std::optional<double> minSwingAtr = std::nullopt,
                                std::optional<double> breakK = std::nullopt);
 
@@ -107,6 +111,8 @@ class AlertManager {
     // Expire active prev_day_level alerts whose create UTC day is before today.
     // Silent (no notification). Returns how many were expired.
     int expireStalePrevDayAlerts();
+    // Expire any active alert whose expires_at is in the past. Silent.
+    int expireTimedOutAlerts();
 
     int flushPersistenceEvents(int batchSize);
 
