@@ -1324,6 +1324,8 @@ void createAlert(const HttpRequestPtr &req,
         } else {
             cb(errResp("detail", msg, 400));
         }
+    } catch (const std::exception &e) {
+        cb(errResp("detail", e.what(), 400));
     }
 }
 

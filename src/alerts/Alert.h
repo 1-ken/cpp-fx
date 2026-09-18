@@ -54,6 +54,8 @@ struct Alert {
     std::optional<std::string> dependsOnAlertId;
     std::optional<std::string> chainId;
     std::optional<int> sequenceIndex;
+    // After arming from a queue, require condition unmet once before trigger is allowed.
+    bool requireUnmetSinceArm = false;
 
     // In-app sound is always delivered alongside any chosen channel.
     void ensureSoundChannel() {
@@ -122,6 +124,7 @@ struct Alert {
         v["chain_id"] = chainId ? Json::Value(*chainId) : Json::Value::null;
         v["sequence_index"] =
             sequenceIndex ? Json::Value(*sequenceIndex) : Json::Value::null;
+        v["require_unmet_since_arm"] = requireUnmetSinceArm;
         return v;
     }
 
@@ -177,6 +180,8 @@ struct Alert {
         a.dependsOnAlertId = optStr("depends_on_alert_id");
         a.chainId = optStr("chain_id");
         a.sequenceIndex = optInt("sequence_index");
+        if (v.isMember("require_unmet_since_arm") && v["require_unmet_since_arm"].isBool())
+            a.requireUnmetSinceArm = v["require_unmet_since_arm"].asBool();
         return a;
     }
 };

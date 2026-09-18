@@ -798,6 +798,8 @@ std::optional<Alert> AlertManager::applyDependsOnLocked(
     a.chainId = parent.chainId;
     a.sequenceIndex = parent.sequenceIndex.value_or(0) + 1;
     a.status = "waiting";
+    if (a.status != "waiting" || !a.dependsOnAlertId || *a.dependsOnAlertId != parent.id)
+        throw std::runtime_error("depends_on_alert_id did not queue alert as waiting");
     return parentPatch;
 }
 
@@ -810,10 +812,12 @@ std::vector<std::pair<Alert, Alert>> AlertManager::armDependentsLocked(
         if (!next.dependsOnAlertId || *next.dependsOnAlertId != parentId) continue;
         Alert before = next;
         next.status = "active";
+        next.requireUnmetSinceArm = true;
         if (skipCandleTs && !skipCandleTs->empty())
             next.lastEvaluatedCandleTime = *skipCandleTs;
         out.emplace_back(before, next);
-        LOG_INFO << "Armed queue step " << next.id << " after " << parentId;
+        LOG_INFO << "Armed queue step " << next.id << " after " << parentId
+                 << " (require unmet before trigger)";
     }
     return out;
 }
@@ -878,16 +882,28 @@ std::optional<TriggeredAlert> AlertManager::tryTriggerPriceAlert(const std::stri
             result = std::nullopt;
         } else {
             a.lastCheckedPrice = currentPrice;
-            if (!priceConditionMet(a, currentPrice)) return std::nullopt;
-            previous = a;
-            triggerAlert(a, currentPrice);
-            TriggeredAlert t;
-            t.alert = a;
-            t.currentPrice = currentPrice;
-            t.alertTypeLabel = "price";
-            result = t;
-            persisted = a;
-            rebuildIndexes();
+            const bool met = priceConditionMet(a, currentPrice);
+            if (a.requireUnmetSinceArm) {
+                if (met) return std::nullopt;
+                previous = a;
+                a.requireUnmetSinceArm = false;
+                persisted = a;
+                rebuildIndexes();
+                result = std::nullopt;
+                // Fall through to persist the cleared gate without triggering.
+            } else if (!met) {
+                return std::nullopt;
+            } else {
+                previous = a;
+                triggerAlert(a, currentPrice);
+                TriggeredAlert t;
+                t.alert = a;
+                t.currentPrice = currentPrice;
+                t.alertTypeLabel = "price";
+                result = t;
+                persisted = a;
+                rebuildIndexes();
+            }
         }
     }
     if (!persistAlertSync(persisted)) {
@@ -899,8 +915,10 @@ std::optional<TriggeredAlert> AlertManager::tryTriggerPriceAlert(const std::stri
     }
     bumpUserRevision(persisted.userId);
     if (!result) {
-        LOG_INFO << "Expired price alert " << persisted.id << " " << persisted.pair
-                 << " (past expires_at)";
+        if (persisted.status == "expired") {
+            LOG_INFO << "Expired price alert " << persisted.id << " " << persisted.pair
+                     << " (past expires_at)";
+        }
         return std::nullopt;
     }
     LOG_INFO << "Triggered price alert " << persisted.id << " " << persisted.pair
@@ -945,7 +963,15 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                     continue;
                 }
                 a.lastCheckedPrice = current;
-                if (!priceConditionMet(a, current)) continue;
+                const bool met = priceConditionMet(a, current);
+                if (a.requireUnmetSinceArm) {
+                    if (met) continue;
+                    Alert before = a;
+                    a.requireUnmetSinceArm = false;
+                    toPersist.push_back({before, a});
+                    continue;
+                }
+                if (!met) continue;
                 Alert before = a;
                 triggerAlert(a, current);
                 TriggeredAlert t;
@@ -984,7 +1010,15 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                     }
                     if (sweepLookbackPending_.count(a.id)) continue;
                     a.lastCheckedPrice = current;
-                    if (!dolPriceTriggered(a, levels, current)) continue;
+                    const bool met = dolPriceTriggered(a, levels, current);
+                    if (a.requireUnmetSinceArm) {
+                        if (met) continue;
+                        Alert before = a;
+                        a.requireUnmetSinceArm = false;
+                        toPersist.push_back({before, a});
+                        continue;
+                    }
+                    if (!met) continue;
                     Alert before = a;
                     triggerAlert(a, current);
                     TriggeredAlert t;
