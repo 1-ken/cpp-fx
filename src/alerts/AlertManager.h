@@ -72,7 +72,7 @@ class AlertManager {
                             const std::string &expiresAt,
                             std::optional<std::string> dependsOnAlertId = std::nullopt);
     Alert createDrawAlert(const std::string &pair, const std::string &levelRef,
-                          const std::string &dolTrigger, const std::string &userId,
+                          const std::vector<std::string> &dolTriggers, const std::string &userId,
                           const std::string &email,
                           const std::vector<std::string> &channels,
                           const std::string &phone, const std::string &customMessage,
@@ -80,7 +80,7 @@ class AlertManager {
                           const std::string &expiresAt,
                           std::optional<std::string> dependsOnAlertId = std::nullopt);
     Alert createStructureAlert(const std::string &pair, const std::string &interval,
-                               const std::string &structureEvent,
+                               const std::vector<std::string> &structureEvents,
                                const std::string &structureDirection,
                                const std::string &userId, const std::string &email,
                                const std::vector<std::string> &channels,

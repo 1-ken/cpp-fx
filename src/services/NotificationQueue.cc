@@ -1,5 +1,6 @@
 #include "services/NotificationQueue.h"
 
+#include <algorithm>
 #include <atomic>
 #include <json/json.h>
 #include <memory>
@@ -17,9 +18,84 @@ namespace ctraderplus::services {
 
 namespace {
 
-void dispatchOneChannel(Notifier &notifier, const alerts::TriggeredAlert &t,
-                        const std::string &channel,
-                        std::function<void(bool)> onDone) {
+std::string joinDolTriggers(const alerts::Alert &a) {
+    if (a.dolTriggers.empty()) return "sweep";
+    std::string out;
+    for (size_t i = 0; i < a.dolTriggers.size(); ++i) {
+        if (i) out += "/";
+        out += a.dolTriggers[i];
+    }
+    return out;
+}
+
+}  // namespace
+
+std::string NotificationQueue::callCoalesceKey(const alerts::Alert &a) {
+    return a.userId + "|" + a.phone;
+}
+
+bool NotificationQueue::alertHasCallChannel(const alerts::Alert &a) {
+    const auto channels = a.effectiveChannels();
+    return std::find(channels.begin(), channels.end(), "call") != channels.end();
+}
+
+void NotificationQueue::stripCallChannel(alerts::Alert &a) {
+    a.channels.erase(std::remove(a.channels.begin(), a.channels.end(), "call"), a.channels.end());
+    if (a.channel == "call") {
+        a.channel = a.channels.empty() ? "sound" : a.channels.front();
+    }
+}
+
+void NotificationQueue::appendCallMessage(alerts::Alert &dst, const alerts::Alert &src) {
+    std::string snippet = src.customMessage;
+    if (snippet.empty()) {
+        snippet = src.pair.empty() ? "alert triggered" : (src.pair + " alert");
+    }
+    if (dst.customMessage.empty()) {
+        dst.customMessage = std::move(snippet);
+        return;
+    }
+    if (dst.customMessage.find(snippet) == std::string::npos) {
+        dst.customMessage += ". ";
+        dst.customMessage += snippet;
+    }
+}
+
+bool NotificationQueue::shouldSkipCallLocked(const std::string &key) const {
+    auto it = callGates_.find(key);
+    if (it == callGates_.end()) return false;
+    if (it->second.inFlight) return true;
+    if (it->second.lastPlaced.time_since_epoch().count() == 0) return false;
+    const auto elapsed = std::chrono::steady_clock::now() - it->second.lastPlaced;
+    return elapsed < std::chrono::duration<double>(kCallQuietWindowSeconds);
+}
+
+bool NotificationQueue::tryMergeCallIntoPendingLocked(alerts::TriggeredAlert &incoming) {
+    if (!alertHasCallChannel(incoming.alert) || incoming.alert.phone.empty()) return false;
+
+    const std::string key = callCoalesceKey(incoming.alert);
+    for (auto &job : pending_) {
+        if (!alertHasCallChannel(job.triggered.alert)) continue;
+        if (callCoalesceKey(job.triggered.alert) != key) continue;
+        appendCallMessage(job.triggered.alert, incoming.alert);
+        stripCallChannel(incoming.alert);
+        LOG_INFO << "[alerts] coalesced call into pending job phone=" << incoming.alert.phone
+                 << " pair=" << incoming.alert.pair;
+        return true;
+    }
+
+    if (shouldSkipCallLocked(key)) {
+        stripCallChannel(incoming.alert);
+        LOG_INFO << "[alerts] skipped call (in-flight or quiet window) phone=" << incoming.alert.phone
+                 << " pair=" << incoming.alert.pair;
+        return true;
+    }
+    return false;
+}
+
+void NotificationQueue::dispatchOneChannel(const alerts::TriggeredAlert &t,
+                                           const std::string &channel,
+                                           std::function<void(bool)> onDone) {
     alerts::Alert a = t.alert;
     a.channel = channel;
     alerts::TriggeredAlert copy = t;
@@ -32,7 +108,7 @@ void dispatchOneChannel(Notifier &notifier, const alerts::TriggeredAlert &t,
     if (a.alertType == "prev_day_level") {
         target = copy.currentPrice;
         const std::string ref = a.levelRef.value_or("both");
-        const std::string trig = a.dolTrigger.value_or("sweep");
+        const std::string trig = joinDolTriggers(a);
         const std::string refTxt = ref == "high" ? "PDH" : ref == "low" ? "PDL" : "PDH/PDL";
         const std::string trigTxt = trig == "sweep"          ? "swept"
                                     : trig == "displacement" ? "displaced beyond"
@@ -73,7 +149,7 @@ void dispatchOneChannel(Notifier &notifier, const alerts::TriggeredAlert &t,
     std::string subject = Notifier::formatAlertSubject(a.pair, a.alertType);
 
     if (channel == "sms") {
-        notifier.sendSms(a.phone, smsBody, [a, onDone, postgres = app.postgres](bool ok) {
+        notifier_->sendSms(a.phone, smsBody, [a, onDone, postgres = app.postgres](bool ok) {
             if (ok) {
                 LOG_INFO << "[alerts] SMS sent pair=" << a.pair << " phone=" << a.phone;
                 if (postgres && postgres->available()) postgres->incrementDailySms(a.userId);
@@ -83,17 +159,38 @@ void dispatchOneChannel(Notifier &notifier, const alerts::TriggeredAlert &t,
             onDone(ok);
         });
     } else if (channel == "call") {
-        notifier.sendCall(a.phone, a.customMessage, [a, onDone, postgres = app.postgres](bool ok) {
-            if (ok) {
-                LOG_INFO << "[alerts] call placed pair=" << a.pair << " phone=" << a.phone;
-                if (postgres && postgres->available()) postgres->incrementDailyCall(a.userId);
-            } else {
-                LOG_WARN << "[alerts] call failed pair=" << a.pair << " phone=" << a.phone;
+        const std::string key = callCoalesceKey(a);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (shouldSkipCallLocked(key)) {
+                LOG_INFO << "[alerts] skipped duplicate call at dispatch phone=" << a.phone
+                         << " pair=" << a.pair;
+                onDone(true);
+                return;
             }
-            onDone(ok);
-        });
+            callGates_[key].inFlight = true;
+        }
+
+        const std::string callMessage = a.customMessage;
+        notifier_->sendCall(
+            a.phone, callMessage,
+            [this, a, key, onDone, postgres = app.postgres](bool ok) {
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    auto &gate = callGates_[key];
+                    gate.inFlight = false;
+                    gate.lastPlaced = std::chrono::steady_clock::now();
+                }
+                if (ok) {
+                    LOG_INFO << "[alerts] call placed pair=" << a.pair << " phone=" << a.phone;
+                    if (postgres && postgres->available()) postgres->incrementDailyCall(a.userId);
+                } else {
+                    LOG_WARN << "[alerts] call failed pair=" << a.pair << " phone=" << a.phone;
+                }
+                onDone(ok);
+            });
     } else {
-        notifier.sendEmail(a.email, subject, emailBody, [a, onDone](bool ok) {
+        notifier_->sendEmail(a.email, subject, emailBody, [a, onDone](bool ok) {
             if (ok) {
                 LOG_INFO << "[alerts] email sent pair=" << a.pair << " email=" << a.email;
             } else {
@@ -104,8 +201,8 @@ void dispatchOneChannel(Notifier &notifier, const alerts::TriggeredAlert &t,
     }
 }
 
-void dispatchAllChannels(Notifier &notifier, const alerts::TriggeredAlert &t,
-                         std::function<void(bool)> onDone) {
+void NotificationQueue::dispatchAllChannels(const alerts::TriggeredAlert &t,
+                                            std::function<void(bool)> onDone) {
     auto channels = t.alert.effectiveChannels();
     if (channels.empty()) {
         LOG_ERROR << "[alerts] notification skipped: no channels id=" << t.alert.id;
@@ -113,21 +210,19 @@ void dispatchAllChannels(Notifier &notifier, const alerts::TriggeredAlert &t,
         return;
     }
     if (channels.size() == 1) {
-        dispatchOneChannel(notifier, t, channels.front(), std::move(onDone));
+        dispatchOneChannel(t, channels.front(), std::move(onDone));
         return;
     }
 
     auto remaining = std::make_shared<std::atomic<size_t>>(channels.size());
     auto anyOk = std::make_shared<std::atomic<bool>>(false);
     for (const auto &channel : channels) {
-        dispatchOneChannel(notifier, t, channel, [remaining, anyOk, onDone](bool ok) {
+        dispatchOneChannel(t, channel, [remaining, anyOk, onDone](bool ok) {
             if (ok) anyOk->store(true);
             if (remaining->fetch_sub(1) == 1) onDone(anyOk->load());
         });
     }
 }
-
-}  // namespace
 
 void NotificationQueue::configure(const core::Config &cfg, Notifier *notifier,
                                   RedisService *redis, trantor::EventLoop *workerLoop) {
@@ -141,6 +236,10 @@ void NotificationQueue::enqueue(alerts::TriggeredAlert triggered) {
     if (!loop_ || !notifier_) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        tryMergeCallIntoPendingLocked(triggered);
+        if (triggered.alert.effectiveChannels().empty()) {
+            return;
+        }
         pending_.push_back(Job{std::move(triggered), 0});
     }
     loop_->queueInLoop([this]() { pump(); });
@@ -184,7 +283,7 @@ void NotificationQueue::processJob(Job job) {
         }
         pushDlq(triggered.alert);
     };
-    dispatchAllChannels(*notifier_, triggered, onDone);
+    dispatchAllChannels(triggered, onDone);
 }
 
 void NotificationQueue::pushDlq(const alerts::Alert &a) {

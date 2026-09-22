@@ -40,15 +40,48 @@ struct Alert {
     std::optional<std::string> lastEvaluatedCandleTime;
 
     // prev_day_level (draw on liquidity) alert
-    std::optional<std::string> levelRef;    // high | low | both
-    std::optional<std::string> dolTrigger;  // sweep | displacement | reversal | draw_met
-    std::optional<std::string> batchId;     // groups a multi-pair create
+    std::optional<std::string> levelRef;  // high | low | both
+    // sweep | displacement | reversal | draw_met (multi-select)
+    std::vector<std::string> dolTriggers;
+    std::optional<std::string> batchId;  // groups a multi-pair create
 
     // market_structure alert
-    std::optional<std::string> structureEvent;       // bos | choch | sweep | any
-    std::optional<std::string> structureDirection;   // bull | bear | any
+    // bos | choch | sweep (legacy "any" normalizes to all three)
+    std::vector<std::string> structureEvents;
+    std::optional<std::string> structureDirection;  // bull | bear | any
     std::optional<double> minSwingAtr;
     std::optional<double> breakK;
+
+    bool hasDolTrigger(const std::string &trig) const {
+        if (dolTriggers.empty()) return trig == "sweep";
+        return std::find(dolTriggers.begin(), dolTriggers.end(), trig) != dolTriggers.end();
+    }
+
+    bool matchesStructureEvent(const std::string &keyKind) const {
+        if (structureEvents.empty()) return true;
+        if (std::find(structureEvents.begin(), structureEvents.end(), "any") !=
+            structureEvents.end())
+            return true;
+        return std::find(structureEvents.begin(), structureEvents.end(), keyKind) !=
+               structureEvents.end();
+    }
+
+    bool wantsLiveDolPrice() const {
+        // sweep / draw_met use live ticks; displacement / reversal use daily close.
+        if (dolTriggers.empty()) return true;
+        for (const auto &t : dolTriggers) {
+            if (t == "sweep" || t == "draw_met") return true;
+        }
+        return false;
+    }
+
+    bool wantsDailyDolClose() const {
+        if (dolTriggers.empty()) return false;
+        for (const auto &t : dolTriggers) {
+            if (t == "displacement" || t == "reversal") return true;
+        }
+        return false;
+    }
 
     // Structure queue: later steps wait until dependsOnAlertId triggers.
     std::optional<std::string> dependsOnAlertId;
@@ -112,9 +145,13 @@ struct Alert {
             lastEvaluatedCandleTime ? Json::Value(*lastEvaluatedCandleTime)
                                     : Json::Value::null;
         v["level_ref"] = levelRef ? Json::Value(*levelRef) : Json::Value::null;
-        v["dol_trigger"] = dolTrigger ? Json::Value(*dolTrigger) : Json::Value::null;
+        Json::Value dolArr(Json::arrayValue);
+        for (const auto &t : dolTriggers) dolArr.append(t);
+        v["dol_trigger"] = dolTriggers.empty() ? Json::Value::null : dolArr;
         v["batch_id"] = batchId ? Json::Value(*batchId) : Json::Value::null;
-        v["structure_event"] = structureEvent ? Json::Value(*structureEvent) : Json::Value::null;
+        Json::Value sevArr(Json::arrayValue);
+        for (const auto &e : structureEvents) sevArr.append(e);
+        v["structure_event"] = structureEvents.empty() ? Json::Value::null : sevArr;
         v["structure_direction"] =
             structureDirection ? Json::Value(*structureDirection) : Json::Value::null;
         v["min_swing_atr"] = minSwingAtr ? Json::Value(*minSwingAtr) : Json::Value::null;
@@ -171,9 +208,26 @@ struct Alert {
         a.threshold = optNum("threshold");
         a.lastEvaluatedCandleTime = optStr("last_evaluated_candle_time");
         a.levelRef = optStr("level_ref");
-        a.dolTrigger = optStr("dol_trigger");
         a.batchId = optStr("batch_id");
-        a.structureEvent = optStr("structure_event");
+        auto parseStringList = [&](const char *k) -> std::vector<std::string> {
+            std::vector<std::string> out;
+            if (!v.isMember(k)) return out;
+            const auto &node = v[k];
+            if (node.isString() && !node.asString().empty()) {
+                out.push_back(node.asString());
+            } else if (node.isArray()) {
+                for (const auto &item : node) {
+                    if (item.isString() && !item.asString().empty()) out.push_back(item.asString());
+                }
+            }
+            return out;
+        };
+        a.dolTriggers = parseStringList("dol_trigger");
+        a.structureEvents = parseStringList("structure_event");
+        // Legacy structure_event "any" → all concrete kinds.
+        if (a.structureEvents.size() == 1 && a.structureEvents.front() == "any") {
+            a.structureEvents = {"bos", "choch", "sweep"};
+        }
         a.structureDirection = optStr("structure_direction");
         a.minSwingAtr = optNum("min_swing_atr");
         a.breakK = optNum("break_k");

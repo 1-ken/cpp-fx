@@ -74,8 +74,7 @@ std::set<CandleAlertMonitor::SubKey> CandleAlertMonitor::requiredSubscriptions()
         } else if (a.alertType == "market_structure" && a.interval) {
             interval = *a.interval;
         } else if (a.alertType == "prev_day_level") {
-            const std::string trig = a.dolTrigger.value_or("sweep");
-            if (trig != "displacement" && trig != "reversal") continue;
+            if (!a.wantsDailyDolClose()) continue;
             interval = "1d";  // displacement/reversal confirm on the daily close
         } else {
             continue;
@@ -230,8 +229,7 @@ void CandleAlertMonitor::pollFallback() {
         } else if (a.alertType == "market_structure" && a.interval) {
             interval = *a.interval;
         } else if (a.alertType == "prev_day_level") {
-            const std::string trig = a.dolTrigger.value_or("sweep");
-            if (trig != "displacement" && trig != "reversal") continue;
+            if (!a.wantsDailyDolClose()) continue;
             interval = "1d";
         } else {
             continue;

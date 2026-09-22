@@ -302,6 +302,27 @@ std::vector<std::string> parseChannels(const Json::Value &body, std::string &err
     return channels;
 }
 
+std::vector<std::string> parseStringListField(const Json::Value &body, const char *key,
+                                             const std::string &defaultScalar) {
+    std::vector<std::string> out;
+    if (body.isMember(key)) {
+        const auto &node = body[key];
+        if (node.isArray()) {
+            for (const auto &item : node) {
+                if (!item.isString()) continue;
+                std::string v = trimStr(item.asString());
+                if (v.empty()) continue;
+                if (std::find(out.begin(), out.end(), v) == out.end()) out.push_back(v);
+            }
+        } else if (node.isString()) {
+            std::string v = trimStr(node.asString());
+            if (!v.empty()) out.push_back(v);
+        }
+    }
+    if (out.empty() && !defaultScalar.empty()) out.push_back(defaultScalar);
+    return out;
+}
+
 std::optional<std::time_t> parseQueryTime(const std::string &s) {
     if (s.empty()) return std::nullopt;
     return util::parseIso8601(s);
@@ -1047,7 +1068,7 @@ void createDrawAlertBatch(const HttpRequestPtr &req,
     }
 
     const std::string levelRef = b.get("level_ref", "both").asString();
-    const std::string dolTrigger = b.get("dol_trigger", "sweep").asString();
+    const auto dolTriggers = parseStringListField(b, "dol_trigger", "sweep");
 
     std::vector<std::string> pairs;
     if (b.isMember("pairs") && b["pairs"].isArray()) {
@@ -1087,7 +1108,7 @@ void createDrawAlertBatch(const HttpRequestPtr &req,
     Json::Value created(Json::arrayValue);
     try {
         for (const auto &p : pairs) {
-            auto a = app.alerts->createDrawAlert(p, levelRef, dolTrigger, uid, email, channels,
+            auto a = app.alerts->createDrawAlert(p, levelRef, dolTriggers, uid, email, channels,
                                                  phone, customMessage, batchId, *expiresAt,
                                                  dependsOn);
             created.append(a.toJson());
@@ -1169,7 +1190,7 @@ void createAlert(const HttpRequestPtr &req,
         }
         if (rejectIfSubscriptionBlocksCreate(app, uid, channels, cb)) return;
         std::string interval = b.get("interval", "").asString();
-        std::string structureEvent = b.get("structure_event", "any").asString();
+        auto structureEvents = parseStringListField(b, "structure_event", "any");
         std::string structureDir = b.get("structure_direction", "any").asString();
         std::optional<double> minSwing;
         std::optional<double> breakK;
@@ -1178,7 +1199,7 @@ void createAlert(const HttpRequestPtr &req,
         if (b.isMember("break_k") && b["break_k"].isNumeric()) breakK = b["break_k"].asDouble();
         std::optional<std::string> dependsOn = parseDependsOnAlertId(b);
         try {
-            auto a = app.alerts->createStructureAlert(pair, interval, structureEvent, structureDir,
+            auto a = app.alerts->createStructureAlert(pair, interval, structureEvents, structureDir,
                                                       uid, email, channels, phone, customMessage,
                                                       *expiresAt, minSwing, breakK, dependsOn);
             core::logApiOutcome("alerts", "create", true, 200,

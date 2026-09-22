@@ -64,32 +64,29 @@ bool isPastExpiry(const Alert &a, std::time_t now = std::time(nullptr)) {
 
 bool dolPriceTriggered(const Alert &a, const market::DayLevels &lv, double price) {
     const std::string ref = a.levelRef.value_or("both");
-    const std::string trig = a.dolTrigger.value_or("sweep");
-    if (trig == "draw_met") {
-        if (lv.draw == "high") return price >= lv.pdh;
-        if (lv.draw == "low") return price <= lv.pdl;
-        return false;
+    if (a.hasDolTrigger("draw_met")) {
+        if (lv.draw == "high" && price >= lv.pdh) return true;
+        if (lv.draw == "low" && price <= lv.pdl) return true;
     }
-    // sweep
-    const bool hitHigh = price >= lv.pdh;
-    const bool hitLow = price <= lv.pdl;
-    if (ref == "high") return hitHigh;
-    if (ref == "low") return hitLow;
-    return hitHigh || hitLow;
+    if (a.hasDolTrigger("sweep")) {
+        const bool hitHigh = price >= lv.pdh;
+        const bool hitLow = price <= lv.pdl;
+        if (ref == "high") return hitHigh;
+        if (ref == "low") return hitLow;
+        return hitHigh || hitLow;
+    }
+    return false;
 }
 
 bool dolCloseTriggered(const Alert &a, const std::string &outcome) {
     const std::string ref = a.levelRef.value_or("both");
-    const std::string trig = a.dolTrigger.value_or("displacement");
-    if (trig == "displacement") {
-        if (outcome == "displaced_up") return ref == "high" || ref == "both";
-        if (outcome == "displaced_down") return ref == "low" || ref == "both";
-        return false;
+    if (a.hasDolTrigger("displacement")) {
+        if (outcome == "displaced_up" && (ref == "high" || ref == "both")) return true;
+        if (outcome == "displaced_down" && (ref == "low" || ref == "both")) return true;
     }
-    if (trig == "reversal") {
-        if (outcome == "reversal_from_high") return ref == "high" || ref == "both";
-        if (outcome == "reversal_from_low") return ref == "low" || ref == "both";
-        return false;
+    if (a.hasDolTrigger("reversal")) {
+        if (outcome == "reversal_from_high" && (ref == "high" || ref == "both")) return true;
+        if (outcome == "reversal_from_low" && (ref == "low" || ref == "both")) return true;
     }
     return false;
 }
@@ -234,12 +231,11 @@ void AlertManager::rebuildIndexes() {
             std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
             activeCandleIndex_[candleIndexKey(key, iv)].push_back(a.id);
         } else if (a.alertType == "prev_day_level") {
-            const std::string trig = a.dolTrigger.value_or("sweep");
-            if (trig == "displacement" || trig == "reversal") {
-                // Evaluated on the daily (1d) close.
+            // An alert can select both live and daily-close triggers.
+            if (a.wantsDailyDolClose()) {
                 activeCandleIndex_[candleIndexKey(key, "1d")].push_back(a.id);
-            } else {
-                // sweep / draw_met evaluated against the live price.
+            }
+            if (a.wantsLiveDolPrice()) {
                 activeDolIndex_[key].push_back(a.id);
             }
         }
@@ -427,8 +423,8 @@ Alert AlertManager::createCandleAlert(const std::string &pair, const std::string
 }
 
 Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &levelRef,
-                                    const std::string &dolTrigger, const std::string &userId,
-                                    const std::string &email,
+                                    const std::vector<std::string> &dolTriggers,
+                                    const std::string &userId, const std::string &email,
                                     const std::vector<std::string> &channels,
                                     const std::string &phone,
                                     const std::string &customMessage,
@@ -438,10 +434,19 @@ Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &
     if (!postgres_) throw std::runtime_error("Database unavailable");
     if (levelRef != "high" && levelRef != "low" && levelRef != "both")
         throw std::invalid_argument("level_ref must be one of: high, low, both");
-    if (dolTrigger != "sweep" && dolTrigger != "displacement" && dolTrigger != "reversal" &&
-        dolTrigger != "draw_met")
-        throw std::invalid_argument(
-            "dol_trigger must be one of: sweep, displacement, reversal, draw_met");
+    if (dolTriggers.empty())
+        throw std::invalid_argument("dol_trigger must include at least one trigger");
+    std::vector<std::string> normalizedTriggers;
+    for (const auto &raw : dolTriggers) {
+        std::string t = raw;
+        std::transform(t.begin(), t.end(), t.begin(), ::tolower);
+        if (t != "sweep" && t != "displacement" && t != "reversal" && t != "draw_met")
+            throw std::invalid_argument(
+                "dol_trigger must be one of: sweep, displacement, reversal, draw_met");
+        if (std::find(normalizedTriggers.begin(), normalizedTriggers.end(), t) ==
+            normalizedTriggers.end())
+            normalizedTriggers.push_back(t);
+    }
 
     Alert a;
     a.id = newUuid();
@@ -450,7 +455,7 @@ Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &
     a.pair = canon.empty() ? pair : canon;
     a.alertType = "prev_day_level";
     a.levelRef = levelRef;
-    a.dolTrigger = dolTrigger;
+    a.dolTriggers = normalizedTriggers;
     a.batchId = batchId;
     a.email = email;
     a.channels = channels;
@@ -483,11 +488,16 @@ Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &
     if (dolProvider_) dolProvider_->track(a.pair);
     bumpUserRevision(a.userId);
     notifySubscriptionChange();
+    std::string trigLog;
+    for (size_t i = 0; i < normalizedTriggers.size(); ++i) {
+        if (i) trigLog += ",";
+        trigLog += normalizedTriggers[i];
+    }
     LOG_INFO << "Created draw-on-liquidity alert " << a.id << " " << a.pair << " "
-             << levelRef << " " << dolTrigger << " status=" << a.status;
+             << levelRef << " " << trigLog << " status=" << a.status;
 
-    // Sweep lookback only when the alert is immediately active.
-    if (a.status == "active" && dolTrigger == "sweep") {
+    // Sweep lookback only when the alert is immediately active and includes sweep.
+    if (a.status == "active" && a.hasDolTrigger("sweep")) {
         {
             std::lock_guard<std::mutex> lk(mu_);
             sweepLookbackPending_[a.id] = true;
@@ -507,7 +517,7 @@ Alert AlertManager::createDrawAlert(const std::string &pair, const std::string &
 }
 
 Alert AlertManager::createStructureAlert(const std::string &pair, const std::string &interval,
-                                         const std::string &structureEvent,
+                                         const std::vector<std::string> &structureEvents,
                                          const std::string &structureDirection,
                                          const std::string &userId, const std::string &email,
                                          const std::vector<std::string> &channels,
@@ -522,10 +532,22 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
     std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
     if (intervalSeconds(iv) == 0)
         throw std::invalid_argument("Invalid interval. Must be one of: 1m, 5m, 15m, 30m, 1h, 4h, 1d");
-    std::string ev = structureEvent;
-    std::transform(ev.begin(), ev.end(), ev.begin(), ::tolower);
-    if (ev != "bos" && ev != "choch" && ev != "sweep" && ev != "any")
-        throw std::invalid_argument("structure_event must be bos, choch, sweep, or any");
+    if (structureEvents.empty())
+        throw std::invalid_argument("structure_event must include at least one event");
+    std::vector<std::string> normalizedEvents;
+    for (const auto &raw : structureEvents) {
+        std::string ev = raw;
+        std::transform(ev.begin(), ev.end(), ev.begin(), ::tolower);
+        if (ev == "any") {
+            normalizedEvents = {"bos", "choch", "sweep"};
+            break;
+        }
+        if (ev != "bos" && ev != "choch" && ev != "sweep")
+            throw std::invalid_argument("structure_event must be bos, choch, or sweep");
+        if (std::find(normalizedEvents.begin(), normalizedEvents.end(), ev) ==
+            normalizedEvents.end())
+            normalizedEvents.push_back(ev);
+    }
     std::string dir = structureDirection;
     std::transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
     if (dir != "bull" && dir != "bear" && dir != "any")
@@ -538,7 +560,7 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
     a.pair = canon.empty() ? pair : canon;
     a.alertType = "market_structure";
     a.interval = iv;
-    a.structureEvent = ev;
+    a.structureEvents = normalizedEvents;
     a.structureDirection = dir;
     a.minSwingAtr = minSwingAtr.value_or(0);
     a.breakK = breakK.value_or(0.25);
@@ -572,7 +594,12 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
     }
     bumpUserRevision(a.userId);
     notifySubscriptionChange();
-    LOG_INFO << "Created structure alert " << a.id << " " << a.pair << " " << iv << " " << ev
+    std::string evLog;
+    for (size_t i = 0; i < normalizedEvents.size(); ++i) {
+        if (i) evLog += ",";
+        evLog += normalizedEvents[i];
+    }
+    LOG_INFO << "Created structure alert " << a.id << " " << a.pair << " " << iv << " " << evLog
              << " " << dir << " status=" << a.status
              << (a.dependsOnAlertId ? (" depends_on=" + *a.dependsOnAlertId) : "");
     return a;
@@ -1029,7 +1056,8 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                     triggered.push_back(t);
                     toPersist.push_back({before, a});
                     LOG_INFO << "Triggered draw alert " << a.id << " " << a.pair
-                             << " trigger=" << a.dolTrigger.value_or("") << " price=" << current;
+                             << " trigger=" << (a.dolTriggers.empty() ? "sweep" : a.dolTriggers.front())
+                             << " price=" << current;
                     for (auto &armed : armDependentsLocked(a.id, std::nullopt)) {
                         toPersist.push_back({armed.first, armed.second});
                     }
@@ -1231,9 +1259,8 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                     bool should = false;
                     for (const auto &ev : result.events) {
                         if (ev.timestamp != candleTsStr) continue;
-                        const std::string want = a.structureEvent.value_or("any");
                         const std::string keyKind = market::structureKindKey(ev.kind);
-                        if (want != "any" && want != keyKind) continue;
+                        if (!a.matchesStructureEvent(keyKind)) continue;
                         const std::string dir = a.structureDirection.value_or("any");
                         if (dir != "any" && dir != ev.dir) continue;
                         should = true;
@@ -1446,7 +1473,7 @@ void AlertManager::runSweepLookback(const std::string &alertId, int attempt,
             invokeComplete(onComplete);
             return;
         }
-        if (it->second.dolTrigger.value_or("sweep") != "sweep") {
+        if (!it->second.hasDolTrigger("sweep")) {
             sweepLookbackPending_.erase(alertId);
             invokeComplete(onComplete);
             return;
