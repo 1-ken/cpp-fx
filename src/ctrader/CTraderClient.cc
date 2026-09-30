@@ -204,11 +204,7 @@ void CTraderClient::onConnection(const trantor::TcpConnectionPtr &conn) {
         ready_.store(false);
         state_ = State::Disconnected;
         subscribedSpotIds_.clear();
-        if (!pendingTrendbars_.empty()) {
-            core::Metrics::instance().ctraderInflight.fetch_sub(
-                static_cast<int>(pendingTrendbars_.size()), std::memory_order_relaxed);
-            pendingTrendbars_.clear();
-        }
+        abandonTrendbars("cTrader disconnected");
         if (stateCb_) stateCb_(false);
         scheduleReconnect();
     }
@@ -698,18 +694,102 @@ void CTraderClient::handleOaError(const std::string &code, const std::string &de
 }
 
 void CTraderClient::forceDisconnectAndReconnect(double minDelaySeconds) {
-    subscribedSpotIds_.clear();
-    if (!pendingTrendbars_.empty()) {
-        core::Metrics::instance().ctraderInflight.fetch_sub(
-            static_cast<int>(pendingTrendbars_.size()), std::memory_order_relaxed);
-        pendingTrendbars_.clear();
-    }
     ready_.store(false);
+    subscribedSpotIds_.clear();
+    abandonTrendbars("cTrader disconnected");
     state_ = State::Disconnected;
     if (conn_) conn_->shutdown();
     conn_.reset();
     if (stateCb_) stateCb_(false);
     scheduleReconnect(minDelaySeconds);
+}
+
+void CTraderClient::abandonTrendbars(const std::string &error) {
+    for (auto &kv : pendingTrendbars_) {
+        if (loop_ && kv.second.timeoutTimer != trantor::InvalidTimerId) {
+            loop_->invalidateTimer(kv.second.timeoutTimer);
+        }
+    }
+    pendingTrendbars_.clear();
+    if (trendbarBusy_) {
+        core::Metrics::instance().ctraderInflight.fetch_sub(1, std::memory_order_relaxed);
+        trendbarBusy_ = false;
+    }
+    std::vector<TrendbarsCallback> waiters = std::move(trendbarActive_.waiters);
+    trendbarActive_ = {};
+    for (auto &job : trendbarQueue_) {
+        for (auto &waiter : job.waiters) waiters.push_back(std::move(waiter));
+    }
+    trendbarQueue_.clear();
+    if (waiters.empty()) return;
+    TrendbarsResult result;
+    result.ok = false;
+    result.error = error;
+    for (std::size_t i = 0; i < waiters.size(); ++i) {
+        if (!waiters[i]) continue;
+        if (i + 1 == waiters.size())
+            waiters[i](std::move(result));
+        else
+            waiters[i](result);
+    }
+}
+
+void CTraderClient::finishTrendbarRequest(TrendbarsResult result) {
+    if (trendbarBusy_) {
+        core::Metrics::instance().ctraderInflight.fetch_sub(1, std::memory_order_relaxed);
+        trendbarBusy_ = false;
+    }
+    auto waiters = std::move(trendbarActive_.waiters);
+    trendbarActive_ = {};
+    for (std::size_t i = 0; i < waiters.size(); ++i) {
+        if (!waiters[i]) continue;
+        if (i + 1 == waiters.size())
+            waiters[i](std::move(result));
+        else
+            waiters[i](result);
+    }
+    if (!loop_ || stopping_.load()) return;
+    trendbarGapPending_ = true;
+    loop_->runAfter(0.2, [this]() {
+        trendbarGapPending_ = false;
+        if (stopping_.load()) return;
+        pumpTrendbarQueue();
+    });
+}
+
+void CTraderClient::pumpTrendbarQueue() {
+    if (trendbarBusy_ || trendbarGapPending_ || trendbarQueue_.empty() || !loop_) return;
+    if (!ready_.load() || !conn_) {
+        abandonTrendbars("cTrader not ready");
+        return;
+    }
+    trendbarActive_ = std::move(trendbarQueue_.front());
+    trendbarQueue_.pop_front();
+    trendbarBusy_ = true;
+    core::Metrics::instance().ctraderInflight.fetch_add(1, std::memory_order_relaxed);
+
+    const std::string id = nextClientMsgId();
+    ProtoOAGetTrendbarsReq req;
+    req.set_ctidtraderaccountid(cfg_.accountId);
+    if (trendbarActive_.fromMs > 0) req.set_fromtimestamp(trendbarActive_.fromMs);
+    if (trendbarActive_.toMs > 0) req.set_totimestamp(trendbarActive_.toMs);
+    req.set_period(static_cast<ProtoOATrendbarPeriod>(trendbarActive_.period));
+    req.set_symbolid(trendbarActive_.symbolId);
+    if (trendbarActive_.count > 0) req.set_count(trendbarActive_.count);
+
+    Pending pending;
+    pending.cb = [this](TrendbarsResult result) { finishTrendbarRequest(std::move(result)); };
+    pending.timeoutTimer = loop_->runAfter(cfg_.requestTimeoutSeconds, [this, id]() {
+        auto it = pendingTrendbars_.find(id);
+        if (it == pendingTrendbars_.end()) return;
+        pendingTrendbars_.erase(it);
+        TrendbarsResult timedOut;
+        timedOut.ok = false;
+        timedOut.error = "request timed out";
+        finishTrendbarRequest(std::move(timedOut));
+    });
+    pendingTrendbars_[id] = std::move(pending);
+    sendFramed(frame(req, id));
 }
 
 void CTraderClient::getTrendbars(int64_t symbolId, int period, int64_t fromMs,
@@ -718,7 +798,7 @@ void CTraderClient::getTrendbars(int64_t symbolId, int period, int64_t fromMs,
         TrendbarsResult r;
         r.ok = false;
         r.error = "client not started";
-        cb(std::move(r));
+        if (cb) cb(std::move(r));
         return;
     }
     loop_->queueInLoop([this, symbolId, period, fromMs, toMs, count,
@@ -727,39 +807,32 @@ void CTraderClient::getTrendbars(int64_t symbolId, int period, int64_t fromMs,
             TrendbarsResult r;
             r.ok = false;
             r.error = "cTrader not ready";
-            cb(std::move(r));
+            if (cb) cb(std::move(r));
             return;
         }
-        core::Metrics::instance().ctraderInflight.fetch_add(1, std::memory_order_relaxed);
-        auto tracked = [cb = std::move(cb)](TrendbarsResult result) {
-            core::Metrics::instance().ctraderInflight.fetch_sub(1, std::memory_order_relaxed);
-            if (cb) cb(std::move(result));
+        const auto same = [&](const TrendbarJob &job) {
+            return job.symbolId == symbolId && job.period == period && job.fromMs == fromMs &&
+                   job.toMs == toMs && job.count == count;
         };
-        cb = std::move(tracked);
-        std::string id = nextClientMsgId();
-        ProtoOAGetTrendbarsReq req;
-        req.set_ctidtraderaccountid(cfg_.accountId);
-        if (fromMs > 0) req.set_fromtimestamp(fromMs);
-        if (toMs > 0) req.set_totimestamp(toMs);
-        req.set_period(static_cast<ProtoOATrendbarPeriod>(period));
-        req.set_symbolid(symbolId);
-        if (count > 0) req.set_count(count);
-
-        Pending p;
-        p.cb = std::move(cb);
-        p.timeoutTimer = loop_->runAfter(cfg_.requestTimeoutSeconds, [this, id]() {
-            auto it = pendingTrendbars_.find(id);
-            if (it != pendingTrendbars_.end()) {
-                auto cb2 = std::move(it->second.cb);
-                pendingTrendbars_.erase(it);
-                TrendbarsResult r;
-                r.ok = false;
-                r.error = "request timed out";
-                if (cb2) cb2(std::move(r));
+        if (trendbarBusy_ && same(trendbarActive_)) {
+            trendbarActive_.waiters.push_back(std::move(cb));
+            return;
+        }
+        for (auto &job : trendbarQueue_) {
+            if (same(job)) {
+                job.waiters.push_back(std::move(cb));
+                return;
             }
-        });
-        pendingTrendbars_[id] = std::move(p);
-        sendFramed(frame(req, id));
+        }
+        TrendbarJob job;
+        job.symbolId = symbolId;
+        job.period = period;
+        job.fromMs = fromMs;
+        job.toMs = toMs;
+        job.count = count;
+        job.waiters.push_back(std::move(cb));
+        trendbarQueue_.push_back(std::move(job));
+        pumpTrendbarQueue();
     });
 }
 

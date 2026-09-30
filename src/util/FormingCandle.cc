@@ -36,6 +36,46 @@ Json::Value makeFormingJson(double open,
 
 }  // namespace
 
+Json::Value composeFormingCandle(const FormingBar *running,
+                                  double livePrice,
+                                  bool hasLivePrice,
+                                  const std::string &interval,
+                                  const ctrader::TrendbarData *cachedBar,
+                                  std::time_t now) {
+    int ivSec = intervalToSeconds(interval);
+    if (ivSec == 0) ivSec = 60;
+    if (now == 0) now = std::time(nullptr);
+    const long long bucket = (static_cast<long long>(now) / ivSec) * ivSec;
+
+    double open = livePrice;
+    double high = livePrice;
+    double low = livePrice;
+    double close = livePrice;
+    bool have = hasLivePrice;
+    if (running && running->valid && running->bucket == bucket) {
+        open = running->open;
+        high = running->high;
+        low = running->low;
+        close = running->close;
+        have = true;
+    }
+    if (!have) return Json::Value::null;
+
+    if (cachedBar) {
+        const long long barStart = cachedBar->utcTimestampMinutes * 60;
+        if (barStart >= bucket && barStart < bucket + ivSec) {
+            open = cachedBar->open;
+            high = std::max(high, cachedBar->high);
+            low = std::min(low, cachedBar->low);
+        }
+    }
+
+    Json::Value fc = makeFormingJson(open, high, low, close, ivSec,
+                                     static_cast<std::time_t>(bucket), now);
+    fc["interval"] = interval;
+    return fc;
+}
+
 Json::Value buildFormingCandleFromSpot(double price, const std::string &interval) {
     int ivSec = intervalToSeconds(interval);
     if (ivSec == 0) ivSec = 60;

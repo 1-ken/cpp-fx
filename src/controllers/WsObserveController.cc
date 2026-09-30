@@ -79,7 +79,8 @@ Json::Value buildFormingForPair(const std::string &canon,
                                 market::MarketHub *hub) {
     if (!hub) return Json::Value::null;
     double price = 0;
-    if (!hub->latestPrice(canon, price)) return Json::Value::null;
+    const bool hasPrice = hub->latestPrice(canon, price);
+    const auto running = hub->formingBar(canon, interval);
 
     ctrader::TrendbarData cached{};
     const ctrader::TrendbarData *lastBar = nullptr;
@@ -87,10 +88,8 @@ Json::Value buildFormingForPair(const std::string &canon,
         lastBar = &cached;
     }
 
-    if (lastBar) {
-        return util::buildFormingCandleMerged(price, interval, lastBar, nullptr);
-    }
-    return util::buildFormingCandleFromSpot(price, interval);
+    return util::composeFormingCandle(running ? &*running : nullptr, price, hasPrice, interval,
+                                      lastBar);
 }
 
 Json::Value enrich(const Json::Value &grouped, WsConnContext &ctx,

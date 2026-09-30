@@ -1,12 +1,14 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -16,6 +18,7 @@
 
 #include "ctrader/SymbolRegistry.h"
 #include "ctrader/Types.h"
+#include "util/FormingCandle.h"
 
 namespace ctraderplus::core {
 struct Config;
@@ -73,6 +76,11 @@ class MarketHub {
 
     bool latestPrice(const std::string &canonicalPair, double &out) const;
 
+    // Running OHLC for the current bucket of one chart interval. Empty when no quote
+    // has arrived for that pair yet.
+    std::optional<util::FormingBar> formingBar(const std::string &canonicalPair,
+                                               const std::string &interval) const;
+
     /** Cache last in-bucket trend bar for WS forming-candle merge (key: pair:interval). */
     void cacheTrendbar(const std::string &canonicalPair,
                        const std::string &interval,
@@ -111,6 +119,7 @@ class MarketHub {
         std::string tsIso;
         Json::Value item;
         bool itemReady = false;
+        std::array<util::FormingBar, util::kFormingIntervals.size()> forming{};
     };
 
     void tick();

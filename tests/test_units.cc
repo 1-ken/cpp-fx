@@ -147,6 +147,58 @@ static void testFormingCandleMergedWithLastBar() {
     CHECK(fc["close"].asDouble() == 1.13);
 }
 
+static void testFormingTickKeepsRangeAndResetsBucket() {
+    util::FormingBar bar;
+    util::applyFormingTick(bar, 1000, 1.10);
+    util::applyFormingTick(bar, 1000, 1.20);
+    util::applyFormingTick(bar, 1000, 1.05);
+    CHECK(bar.open == 1.10);
+    CHECK(bar.high == 1.20);
+    CHECK(bar.low == 1.05);
+    CHECK(bar.close == 1.05);
+    util::applyFormingTick(bar, 2000, 1.30);
+    CHECK(bar.bucket == 2000);
+    CHECK(bar.open == 1.30);
+    CHECK(bar.high == 1.30);
+    CHECK(bar.low == 1.30);
+    CHECK(bar.close == 1.30);
+}
+
+static void testComposeFormingIgnoresPreviousBucket() {
+    const std::time_t now = 1700000040 + 10;
+    util::FormingBar live;
+    live.valid = true;
+    live.bucket = 1700000040;
+    live.open = 1.10;
+    live.high = 1.12;
+    live.low = 1.09;
+    live.close = 1.11;
+
+    ctrader::TrendbarData previous{};
+    previous.utcTimestampMinutes = (1700000040 - 60) / 60;
+    previous.open = 5;
+    previous.high = 9;
+    previous.low = 0.1;
+    previous.close = 4;
+    Json::Value kept = util::composeFormingCandle(&live, 1.11, true, "1m", &previous, now);
+    CHECK(kept["open"].asDouble() == 1.10);
+    CHECK(kept["high"].asDouble() == 1.12);
+    CHECK(kept["low"].asDouble() == 1.09);
+    CHECK(kept["close"].asDouble() == 1.11);
+
+    ctrader::TrendbarData current{};
+    current.utcTimestampMinutes = 1700000040 / 60;
+    current.open = 1.101;
+    current.high = 1.15;
+    current.low = 1.07;
+    current.close = 1.11;
+    Json::Value widened = util::composeFormingCandle(&live, 1.11, true, "1m", &current, now);
+    CHECK(widened["open"].asDouble() == 1.101);
+    CHECK(widened["high"].asDouble() == 1.15);
+    CHECK(widened["low"].asDouble() == 1.07);
+    CHECK(widened["close"].asDouble() == 1.11);
+}
+
 static void testFormingCandleMergedDoesNotInheritPrevClosed() {
     ctrader::TrendbarData prev{};
     prev.open = 1.10;
@@ -319,6 +371,8 @@ int main() {
     testFormingCandleMergedWithoutLastBar();
     testFormingCandleMergedWithLastBar();
     testFormingCandleMergedDoesNotInheritPrevClosed();
+    testFormingTickKeepsRangeAndResetsBucket();
+    testComposeFormingIgnoresPreviousBucket();
     testMarketStructureBosChoch();
     testIncrementalMatchesFull();
     testAlertReplayFiresOnce();

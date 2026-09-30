@@ -79,6 +79,13 @@ void MarketHub::onSpot(const ctrader::SpotUpdate &update) {
         st.item["common_name"] = st.name;
         st.item["source"] = st.group;
         st.itemReady = true;
+        const std::time_t now = std::time(nullptr);
+        for (std::size_t i = 0; i < util::kFormingIntervals.size(); ++i) {
+            const int iv = util::intervalToSeconds(util::kFormingIntervals[i]);
+            if (iv <= 0) continue;
+            const int64_t bucket = static_cast<int64_t>(now) / iv * iv;
+            util::applyFormingTick(st.forming[i], bucket, st.price);
+        }
         if (util::isForexMarketOpen()) {
             quote.pair = st.canonical;
             quote.name = st.name;
@@ -161,6 +168,26 @@ SnapshotBundle MarketHub::buildSnapshot() const {
 
 std::shared_ptr<Json::Value> MarketHub::buildGroupedSnapshot() const {
     return buildSnapshot().grouped;
+}
+
+std::optional<util::FormingBar> MarketHub::formingBar(const std::string &canonicalPair,
+                                                          const std::string &interval) const {
+    int index = -1;
+    for (std::size_t i = 0; i < util::kFormingIntervals.size(); ++i) {
+        if (interval == util::kFormingIntervals[i]) {
+            index = static_cast<int>(i);
+            break;
+        }
+    }
+    if (index < 0) return std::nullopt;
+    const std::string canon = util::canonicalPair(canonicalPair);
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto &kv : states_) {
+        if (kv.second.canonical == canon && kv.second.forming[static_cast<std::size_t>(index)].valid) {
+            return kv.second.forming[static_cast<std::size_t>(index)];
+        }
+    }
+    return std::nullopt;
 }
 
 bool MarketHub::latestPrice(const std::string &canonicalPair, double &out) const {

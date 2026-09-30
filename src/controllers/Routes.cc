@@ -993,12 +993,13 @@ void historicalOhlc(const HttpRequestPtr &req,
             Json::Value formingCandle(Json::nullValue);
             double livePrice = 0;
             if (app.hub && app.hub->latestPrice(canon, livePrice)) {
-                formingCandle = util::buildFormingCandleMerged(
-                    livePrice, interval, lastBar, nullptr);
+                const auto running = app.hub->formingBar(canon, interval);
+                formingCandle = util::composeFormingCandle(
+                    running ? &*running : nullptr, livePrice, true, interval, lastBar);
                 if (lastBar && app.hub) {
                     app.hub->cacheTrendbar(canon, interval, *lastBar);
                 }
-                hasForming = true;
+                hasForming = !formingCandle.isNull();
             }
             out["closed_candles_count"] = closedCount;
             out["count"] = closedCount;

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -107,6 +108,9 @@ class CTraderClient {
     void sendFramed(const std::string &framed);
 
     std::string nextClientMsgId();
+    void pumpTrendbarQueue();
+    void finishTrendbarRequest(TrendbarsResult result);
+    void abandonTrendbars(const std::string &error);
 
     core::CTraderConfig cfg_;
     trantor::EventLoopThread loopThread_;
@@ -138,6 +142,19 @@ class CTraderClient {
         trantor::TimerId timeoutTimer = trantor::InvalidTimerId;
     };
     std::unordered_map<std::string, Pending> pendingTrendbars_;
+
+    struct TrendbarJob {
+        int64_t symbolId = 0;
+        int period = 0;
+        int64_t fromMs = 0;
+        int64_t toMs = 0;
+        uint32_t count = 0;
+        std::vector<TrendbarsCallback> waiters;
+    };
+    std::deque<TrendbarJob> trendbarQueue_;
+    TrendbarJob trendbarActive_;
+    bool trendbarBusy_ = false;
+    bool trendbarGapPending_ = false;
 
     SymbolsCallback symbolsCb_;
     SpotCallback spotCb_;
