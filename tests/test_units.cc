@@ -1,11 +1,15 @@
 // Minimal assertion-based unit tests for the dependency-light utilities.
 #include <cassert>
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 
+#include "alerts/AlertManager.h"
 #include "core/Config.h"
 #include "ctrader/SymbolRegistry.h"
 #include "market/AllowedPairs.h"
+#include "market/MarketHub.h"
+#include "services/NotificationQueue.h"
 #include "services/Notifier.h"
 #include "util/ForexMarketHours.h"
 #include "util/PairNormalizer.h"
@@ -189,6 +193,120 @@ static void testMarketStructureBosChoch() {
     CHECK(choch);
 }
 
+static bool sameEvents(const std::vector<market::StructureEvent> &a,
+                       const std::vector<market::StructureEvent> &b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].kind != b[i].kind || a[i].dir != b[i].dir || a[i].timestamp != b[i].timestamp)
+            return false;
+        if (a[i].level != b[i].level) return false;
+    }
+    return true;
+}
+
+static void testIncrementalMatchesFull() {
+    using market::IncrementalStructure;
+    using market::StructureCandle;
+    using market::StructureOptions;
+    using market::computeMarketStructure;
+    std::vector<StructureCandle> candles;
+    auto add = [&](double o, double h, double l, double c, const char *ts) {
+        StructureCandle b;
+        b.open = o;
+        b.high = h;
+        b.low = l;
+        b.close = c;
+        b.timestamp = ts;
+        candles.push_back(b);
+    };
+    add(100, 101, 99, 100, "t0");
+    add(100, 105, 100, 104, "t1");
+    add(104, 104.2, 102, 103, "t2");
+    add(103, 103, 98, 99, "t3");
+    add(99, 100, 95, 96, "t4");
+    add(96, 98, 96, 97, "t5");
+    add(97, 108, 97, 107, "t6");
+    add(107, 107, 94, 94, "t7");
+    StructureOptions opt;
+    opt.breakK = 0;
+    opt.minSwingAtr = 0;
+    IncrementalStructure inc(opt);
+    std::vector<market::StructureEvent> online;
+    for (const auto &c : candles) {
+        auto ev = inc.append(c);
+        online.insert(online.end(), ev.begin(), ev.end());
+    }
+    auto full = computeMarketStructure(candles, opt);
+    CHECK(sameEvents(online, full.events));
+    CHECK(inc.trend() == full.trend);
+
+    std::srand(42);
+    for (int trial = 0; trial < 20; ++trial) {
+        std::vector<StructureCandle> seq;
+        double price = 100;
+        for (int i = 0; i < 40; ++i) {
+            double delta = (std::rand() % 200 - 100) / 50.0;
+            StructureCandle b;
+            b.open = price;
+            b.close = price + delta;
+            b.high = std::max(b.open, b.close) + (std::rand() % 50) / 100.0;
+            b.low = std::min(b.open, b.close) - (std::rand() % 50) / 100.0;
+            b.timestamp = "b" + std::to_string(trial) + "_" + std::to_string(i);
+            price = b.close;
+            seq.push_back(b);
+        }
+        StructureOptions ropt;
+        ropt.breakK = 0.1;
+        ropt.minSwingAtr = 0.2;
+        IncrementalStructure rinc(ropt);
+        std::vector<market::StructureEvent> rev;
+        for (const auto &c : seq) {
+            auto ev = rinc.append(c);
+            rev.insert(rev.end(), ev.begin(), ev.end());
+        }
+        auto rfull = computeMarketStructure(seq, ropt);
+        CHECK(sameEvents(rev, rfull.events));
+    }
+}
+
+static void testAlertReplayFiresOnce() {
+    alerts::AlertManager mgr;
+    alerts::Alert a;
+    a.id = "replay-1";
+    a.userId = "user";
+    a.pair = "EURUSD";
+    a.alertType = "price";
+    a.status = "active";
+    a.condition = "above";
+    a.targetPrice = 1.10;
+    a.channels = {"sound"};
+    a.normalizeChannels();
+    mgr.cacheAlert(a);
+    int fires = 0;
+    std::string seenKey;
+    mgr.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
+        ++fires;
+        seenKey = services::NotificationQueue::idempotencyKey(t.alert);
+    });
+    market::FlatPair px;
+    px.pair = "EURUSD";
+    px.hasPrice = true;
+    px.price = 1.25;
+    mgr.checkPriceAlerts({px});
+    mgr.checkPriceAlerts({px});
+    CHECK(fires == 1);
+    CHECK(seenKey.rfind("replay-1|", 0) == 0);
+    CHECK(seenKey.size() >= std::string("|triggered").size());
+    CHECK(seenKey.compare(seenKey.size() - std::string("|triggered").size(),
+                          std::string("|triggered").size(), "|triggered") == 0);
+    alerts::Alert again = a;
+    again.status = "triggered";
+    again.triggeredAt = "2026-01-01T00:00:00Z";
+    const std::string key = services::NotificationQueue::idempotencyKey(again);
+    CHECK(key == "replay-1|2026-01-01T00:00:00Z|triggered");
+    CHECK(services::NotificationQueue::idempotencyKey(again) == key);
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -202,6 +320,8 @@ int main() {
     testFormingCandleMergedWithLastBar();
     testFormingCandleMergedDoesNotInheritPrevClosed();
     testMarketStructureBosChoch();
+    testIncrementalMatchesFull();
+    testAlertReplayFiresOnce();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

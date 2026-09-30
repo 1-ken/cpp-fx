@@ -12,6 +12,7 @@
 
 #include <trantor/utils/Logger.h>
 
+#include "core/Metrics.h"
 #include "ctrader/CTraderClient.h"
 #include "ctrader/SymbolRegistry.h"
 #include "market/MarketHub.h"
@@ -197,7 +198,7 @@ std::string AlertManager::candleIndexKey(const std::string &pair,
 }
 
 void AlertManager::bumpUserRevision(const std::string &userId) {
-    std::lock_guard<std::mutex> lk(revMu_);
+    std::lock_guard<std::mutex> lk(mu_);
     ++userAlertsRevision_[userId];
 }
 
@@ -206,9 +207,53 @@ void AlertManager::notifySubscriptionChange() {
 }
 
 uint64_t AlertManager::userAlertsRevision(const std::string &userId) const {
-    std::lock_guard<std::mutex> lk(revMu_);
+    std::lock_guard<std::mutex> lk(mu_);
     auto it = userAlertsRevision_.find(userId);
     return it == userAlertsRevision_.end() ? 0 : it->second;
+}
+
+void AlertManager::cacheAlert(Alert alert) {
+    alert.normalizeChannels();
+    std::lock_guard<std::mutex> lk(mu_);
+    alerts_[alert.id] = std::move(alert);
+    rebuildIndexes();
+}
+
+namespace {
+constexpr std::size_t kStructureWindow = 512;
+
+std::string structureOptKey(const market::StructureOptions &opt) {
+    return std::to_string(opt.minSwingAtr) + "|" + std::to_string(opt.breakK) + "|" +
+           std::to_string(opt.atrPeriod);
+}
+}  // namespace
+
+void AlertManager::appendStructureCandle(StructureTrack &track, market::StructureCandle bar) {
+    if (!track.candles.empty() && track.candles.back().timestamp == bar.timestamp) return;
+    track.candles.push_back(std::move(bar));
+    if (track.candles.size() > kStructureWindow) {
+        track.candles.erase(track.candles.begin(),
+                            track.candles.begin() +
+                                static_cast<std::ptrdiff_t>(track.candles.size() - kStructureWindow));
+        for (auto &kv : track.engines) {
+            kv.second.reset();
+            for (const auto &c : track.candles) kv.second.append(c);
+        }
+        return;
+    }
+    for (auto &kv : track.engines) kv.second.append(track.candles.back());
+}
+
+market::IncrementalStructure &AlertManager::structureEngine(StructureTrack &track,
+                                                            const market::StructureOptions &opt) {
+    auto [it, inserted] = track.engines.try_emplace(structureOptKey(opt), opt);
+    (void)inserted;
+    auto &eng = it->second;
+    if (eng.barsApplied() != static_cast<int>(track.candles.size())) {
+        eng.reset();
+        for (const auto &c : track.candles) eng.append(c);
+    }
+    return eng;
 }
 
 void AlertManager::rebuildIndexes() {
@@ -240,6 +285,37 @@ void AlertManager::rebuildIndexes() {
             }
         }
     }
+    expiryByMinute_.clear();
+    activePrevDayIds_.clear();
+    for (const auto &kv : alerts_) {
+        const Alert &a = kv.second;
+        if (a.status == "active" && a.alertType == "prev_day_level")
+            activePrevDayIds_.push_back(a.id);
+        if (a.status != "active" && a.status != "waiting") continue;
+        if (!a.expiresAt) continue;
+        auto exp = util::parseIso8601(*a.expiresAt);
+        if (!exp) continue;
+        const std::time_t minute = *exp - (*exp % 60);
+        expiryByMinute_[minute].push_back(a.id);
+    }
+}
+
+void AlertManager::persistAlertThen(const Alert &a, std::function<void(bool)> done) {
+    if (!postgres_) {
+        if (done) done(true);
+        return;
+    }
+    Json::Value alertJson = a.toJson();
+    const std::string alertId = a.id;
+    auto write = [this, alertJson, alertId, done = std::move(done)]() {
+        const bool ok = postgres_->upsertAlert(alertJson);
+        if (!ok) LOG_ERROR << "upsertAlert failed (async) alert_id=" << alertId;
+        if (done) done(ok);
+    };
+    if (dbExecutor_)
+        dbExecutor_(std::move(write));
+    else
+        write();
 }
 
 void AlertManager::persistAlert(const Alert &a) {
@@ -261,12 +337,23 @@ void AlertManager::persistAlert(const Alert &a) {
 bool AlertManager::persistAlertSync(const Alert &a) {
     if (!postgres_) return false;
     Json::Value alertJson = a.toJson();
-    if (!dbExecutor_) return postgres_->upsertAlert(alertJson);
+    auto write = [this, alertJson]() {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = postgres_->upsertAlert(alertJson);
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        core::Metrics::instance().pgQueryCount.fetch_add(1, std::memory_order_relaxed);
+        core::Metrics::instance().pgQueryDurationUs.fetch_add(static_cast<uint64_t>(us > 0 ? us : 0),
+                                                             std::memory_order_relaxed);
+        return ok;
+    };
+    if (!dbExecutor_ || (dbLoop_ && dbLoop_->isInLoopThread())) return write();
     auto prom = std::make_shared<std::promise<bool>>();
     auto fut = prom->get_future();
-    dbExecutor_([this, alertJson, prom]() {
+    dbExecutor_([write, prom]() {
         try {
-            prom->set_value(postgres_->upsertAlert(alertJson));
+            prom->set_value(write());
         } catch (...) {
             try {
                 prom->set_exception(std::current_exception());
@@ -279,7 +366,7 @@ bool AlertManager::persistAlertSync(const Alert &a) {
 
 bool AlertManager::persistDeleteSync(const std::string &id) {
     if (!postgres_) return false;
-    if (!dbExecutor_) return postgres_->deleteAlert(id);
+    if (!dbExecutor_ || (dbLoop_ && dbLoop_->isInLoopThread())) return postgres_->deleteAlert(id);
     auto prom = std::make_shared<std::promise<bool>>();
     auto fut = prom->get_future();
     dbExecutor_([this, id, prom]() {
@@ -613,6 +700,7 @@ void AlertManager::ingestStructureHistory(const std::string &pair, const std::st
     std::lock_guard<std::mutex> lk(mu_);
     auto &track = structureTracks_[key];
     track.candles.clear();
+    track.engines.clear();
     for (const auto &c : candles) {
         market::StructureCandle bar;
         bar.timestamp = c.get("timestamp", "").asString();
@@ -622,7 +710,11 @@ void AlertManager::ingestStructureHistory(const std::string &pair, const std::st
         bar.close = c.get("close", 0.0).asDouble();
         if (!bar.timestamp.empty()) track.candles.push_back(std::move(bar));
     }
-    track.warmed = !track.candles.empty();
+    if (track.candles.size() > 512) {
+        track.candles.erase(track.candles.begin(),
+                            track.candles.begin() +
+                                static_cast<std::ptrdiff_t>(track.candles.size() - 512));
+    }
 }
 
 std::optional<Alert> AlertManager::getAlert(const std::string &id) const {
@@ -958,6 +1050,7 @@ std::optional<TriggeredAlert> AlertManager::tryTriggerPriceAlert(const std::stri
 
 std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
     const std::vector<market::FlatPair> &pairs) {
+    const auto evalStarted = std::chrono::steady_clock::now();
     std::vector<TriggeredAlert> triggered;
     std::unordered_map<std::string, double> prices;
     for (const auto &p : pairs) {
@@ -1068,20 +1161,47 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
     }
     std::vector<TriggeredAlert> notified;
     for (const auto &batch : toPersist) {
-        if (postgres_ && !persistAlertSync(batch.after)) {
-            std::lock_guard<std::mutex> lk(mu_);
-            alerts_[batch.after.id] = batch.before;
-            rebuildIndexes();
-            LOG_ERROR << "Failed to persist triggered price alert " << batch.after.id;
+        std::vector<TriggeredAlert> mine;
+        for (const auto &t : triggered) {
+            if (t.alert.id == batch.after.id) mine.push_back(t);
+        }
+        if (!postgres_) {
+            bumpUserRevision(batch.after.userId);
+            notified.insert(notified.end(), mine.begin(), mine.end());
             continue;
         }
-        bumpUserRevision(batch.after.userId);
-        for (const auto &t : triggered) {
-            if (t.alert.id == batch.after.id) notified.push_back(t);
+        Alert before = batch.before;
+        Alert after = batch.after;
+        persistAlertThen(after, [this, before, after, mine](bool ok) {
+            if (!ok) {
+                std::lock_guard<std::mutex> lk(mu_);
+                alerts_[after.id] = before;
+                rebuildIndexes();
+                LOG_ERROR << "Failed to persist triggered price alert " << after.id;
+                return;
+            }
+            bumpUserRevision(after.userId);
+            core::Metrics::instance().alertTriggerTotal.fetch_add(mine.size(),
+                                                                  std::memory_order_relaxed);
+            if (!onTriggered_) return;
+            for (const auto &t : mine) onTriggered_(t);
+        });
+        notified.insert(notified.end(), mine.begin(), mine.end());
+    }
+    if (!postgres_) {
+        for (const auto &t : notified) {
+            if (onTriggered_) onTriggered_(t);
         }
     }
-    for (const auto &t : notified) {
-        if (onTriggered_) onTriggered_(t);
+    const auto evalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - evalStarted)
+                            .count();
+    core::Metrics::instance().alertEvalCount.fetch_add(1, std::memory_order_relaxed);
+    core::Metrics::instance().alertEvalDurationUs.fetch_add(
+        static_cast<uint64_t>(evalUs > 0 ? evalUs : 0), std::memory_order_relaxed);
+    if (!postgres_) {
+        core::Metrics::instance().alertTriggerTotal.fetch_add(notified.size(),
+                                                              std::memory_order_relaxed);
     }
     return notified;
 }
@@ -1211,15 +1331,13 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                 tsVal.isString() ? tsVal.asString() : std::to_string(tsVal.asInt64());
             std::string trackKey = candleIndexKey(k.pair, k.interval);
             auto &track = structureTracks_[trackKey];
-            if (track.candles.empty() || track.candles.back().timestamp != candleTsStr) {
-                market::StructureCandle bar;
-                bar.timestamp = candleTsStr;
-                bar.open = candle.get("open", 0.0).asDouble();
-                bar.high = candle.get("high", 0.0).asDouble();
-                bar.low = candle.get("low", 0.0).asDouble();
-                bar.close = candle.get("close", 0.0).asDouble();
-                track.candles.push_back(std::move(bar));
-            }
+            market::StructureCandle bar;
+            bar.timestamp = candleTsStr;
+            bar.open = candle.get("open", 0.0).asDouble();
+            bar.high = candle.get("high", 0.0).asDouble();
+            bar.low = candle.get("low", 0.0).asDouble();
+            bar.close = candle.get("close", 0.0).asDouble();
+            appendStructureCandle(track, std::move(bar));
             auto idxItStruct = activeCandleIndex_.find(trackKey);
             if (idxItStruct != activeCandleIndex_.end() && track.candles.size() >= 5) {
                 auto candleStart = parseCandleTs(tsVal);
@@ -1255,9 +1373,9 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                     market::StructureOptions opt;
                     opt.minSwingAtr = a.minSwingAtr.value_or(0);
                     opt.breakK = a.breakK.value_or(0.25);
-                    auto result = market::computeMarketStructure(track.candles, opt);
+                    auto &engine = structureEngine(track, opt);
                     bool should = false;
-                    for (const auto &ev : result.events) {
+                    for (const auto &ev : engine.events()) {
                         if (ev.timestamp != candleTsStr) continue;
                         const std::string keyKind = market::structureKindKey(ev.kind);
                         if (!a.matchesStructureEvent(keyKind)) continue;
@@ -1299,25 +1417,38 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
     }
     std::vector<TriggeredAlert> notified;
     for (const auto &batch : toPersist) {
-        if (!postgres_) continue;
         if (batch.isTrigger) {
-            if (!persistAlertSync(batch.after)) {
-                std::lock_guard<std::mutex> lk(mu_);
-                alerts_[batch.after.id] = batch.before;
-                rebuildIndexes();
-                LOG_ERROR << "Failed to persist triggered candle alert " << batch.after.id;
+            std::vector<TriggeredAlert> mine;
+            for (const auto &t : triggered) {
+                if (t.alert.id == batch.after.id) mine.push_back(t);
+            }
+            if (!postgres_) {
+                bumpUserRevision(batch.after.userId);
+                notified.insert(notified.end(), mine.begin(), mine.end());
                 continue;
             }
-            bumpUserRevision(batch.after.userId);
-            for (const auto &t : triggered) {
-                if (t.alert.id == batch.after.id) notified.push_back(t);
-            }
+            Alert before = batch.before;
+            Alert after = batch.after;
+            persistAlertThen(after, [this, before, after, mine](bool ok) {
+                if (!ok) {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    alerts_[after.id] = before;
+                    rebuildIndexes();
+                    LOG_ERROR << "Failed to persist triggered candle alert " << after.id;
+                    return;
+                }
+                bumpUserRevision(after.userId);
+                if (!onTriggered_) return;
+                for (const auto &t : mine) onTriggered_(t);
+            });
         } else {
             persistAlert(batch.after);
         }
     }
-    for (const auto &t : notified) {
-        if (onTriggered_) onTriggered_(t);
+    if (!postgres_) {
+        for (const auto &t : notified) {
+            if (onTriggered_) onTriggered_(t);
+        }
     }
     return notified;
 }
@@ -1333,8 +1464,10 @@ int AlertManager::expireStalePrevDayAlerts() {
     std::vector<PersistBatch> toPersist;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        for (auto &kv : alerts_) {
-            Alert &a = kv.second;
+        for (const auto &id : activePrevDayIds_) {
+            auto it = alerts_.find(id);
+            if (it == alerts_.end()) continue;
+            Alert &a = it->second;
             if (a.status != "active" || a.alertType != "prev_day_level") continue;
             auto createdDay = utcYmdFromIso(a.createdAt);
             if (!createdDay || !(*createdDay < today)) continue;
@@ -1375,8 +1508,19 @@ int AlertManager::expireTimedOutAlerts() {
     std::vector<PersistBatch> toPersist;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        for (auto &kv : alerts_) {
-            Alert &a = kv.second;
+        std::vector<std::string> due;
+        for (auto it = expiryByMinute_.begin(); it != expiryByMinute_.end();) {
+            if (it->first > now) break;
+            due.insert(due.end(), it->second.begin(), it->second.end());
+            if (it->first + 60 <= now)
+                it = expiryByMinute_.erase(it);
+            else
+                ++it;
+        }
+        for (const auto &id : due) {
+            auto it = alerts_.find(id);
+            if (it == alerts_.end()) continue;
+            Alert &a = it->second;
             if (a.status != "active" && a.status != "waiting") continue;
             if (!isPastExpiry(a, now)) continue;
             Alert before = a;

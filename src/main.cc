@@ -1,11 +1,14 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <ctime>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -19,6 +22,7 @@
 #include "controllers/WsObserveController.h"
 #include "core/AppContext.h"
 #include "core/Config.h"
+#include "core/Metrics.h"
 #include "ctrader/CTraderClient.h"
 #include "ctrader/CTraderTokenStore.h"
 #include "ctrader/SymbolRegistry.h"
@@ -51,9 +55,15 @@ int main() {
     static market::PrevDayLevelProvider prevDayLevels;
     static services::NotificationQueue notificationQueue;
 
-    static trantor::EventLoopThread workerThread;
+    static trantor::EventLoopThread workerThread("alert-persist");
+    static trantor::EventLoopThread evalThread("alert-eval");
+    static trantor::EventLoopThread notifyThread("alert-notify");
     workerThread.run();
+    evalThread.run();
+    notifyThread.run();
     trantor::EventLoop *workerLoop = workerThread.getLoop();
+    trantor::EventLoop *evalLoop = evalThread.getLoop();
+    trantor::EventLoop *notifyLoop = notifyThread.getLoop();
     auto dbExec = [workerLoop](std::function<void()> task) {
         workerLoop->queueInLoop(std::move(task));
     };
@@ -99,19 +109,25 @@ int main() {
     subscriptionPlanner.setPostgres(pgPtr);
     prevDayLevels.configure(&ctrader, &registry);
     alertManager.configure(pgPtr, redisPtr, dbExec, cfg.redisAlertQueueKey);
+    alertManager.setDbLoop(workerLoop);
     alertManager.setPrevDayLevelProvider(&prevDayLevels);
     alertManager.setCTraderClient(&ctrader);
     alertManager.setSymbolRegistry(&registry);
 
-    notificationQueue.configure(cfg, &notifier, redisPtr, workerLoop);
+    notificationQueue.configure(cfg, &notifier, redisPtr, notifyLoop);
     notificationQueue.startDlqRetryLoop();
 
-    auto refreshSubscriptions = [&]() {
+    auto refreshSubscriptionsNow = [&]() {
         if (cfg.ctrader.subscribeAllSymbols && cfg.subscribedPairs.empty()) return;
         if (!ctrader.isReady()) return;
         auto ids = subscriptionPlanner.computeSymbolIds();
         ctrader.refreshSpotSubscriptions(std::move(ids));
     };
+    static std::atomic<bool> subscriptionRefreshPending{false};
+    auto refreshSubscriptions = [&]() { subscriptionRefreshPending.store(true); };
+    workerLoop->runEvery(0.5, [&]() {
+        if (subscriptionRefreshPending.exchange(false)) refreshSubscriptionsNow();
+    });
 
     hub.setPostgres(pgPtr);
     hub.setDbExecutor(dbExec);
@@ -119,8 +135,49 @@ int main() {
     hub.setBroadcastSink([](std::shared_ptr<Json::Value> grouped) {
         controllers::WsObserveController::broadcastToAll(std::move(grouped));
     });
+    static std::mutex pendingQuoteMu;
+    static std::unordered_map<std::string, market::FlatPair> pendingQuotes;
+    static std::atomic<bool> evalScheduled{false};
+    auto schedulePriceEval = [&]() {
+        if (evalScheduled.exchange(true)) return;
+        evalLoop->queueInLoop([&]() {
+            for (;;) {
+                std::unordered_map<std::string, market::FlatPair> batch;
+                {
+                    std::lock_guard<std::mutex> lk(pendingQuoteMu);
+                    batch.swap(pendingQuotes);
+                }
+                if (batch.empty()) {
+                    evalScheduled.store(false);
+                    std::lock_guard<std::mutex> lk(pendingQuoteMu);
+                    if (pendingQuotes.empty()) return;
+                    evalScheduled.store(true);
+                    continue;
+                }
+                std::vector<market::FlatPair> pairs;
+                pairs.reserve(batch.size());
+                for (auto &kv : batch) pairs.push_back(std::move(kv.second));
+                alertManager.checkPriceAlerts(pairs);
+            }
+        });
+    };
+    hub.setQuoteSink([&](market::FlatPair quote) {
+        if (quote.pair.empty() || !quote.hasPrice) return;
+        {
+            std::lock_guard<std::mutex> lk(pendingQuoteMu);
+            pendingQuotes[quote.pair] = std::move(quote);
+        }
+        schedulePriceEval();
+    });
     hub.setAlertSink([&](std::shared_ptr<std::vector<market::FlatPair>> pairs) {
-        alertManager.checkPriceAlerts(*pairs);
+        if (!pairs) return;
+        {
+            std::lock_guard<std::mutex> lk(pendingQuoteMu);
+            for (auto &fp : *pairs) {
+                if (!fp.pair.empty() && fp.hasPrice) pendingQuotes[fp.pair] = std::move(fp);
+            }
+        }
+        schedulePriceEval();
     });
 
     candleMonitor.configure(&cfg, &ctrader, &registry, &alertManager, {});
@@ -128,6 +185,13 @@ int main() {
     alertManager.setSubscriptionChangeCallback(refreshSubscriptions);
     alertManager.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
         notificationQueue.enqueue(t);
+        Json::Value frame(Json::objectValue);
+        frame["type"] = "alert_triggered";
+        frame["alert"] = t.alert.toJson();
+        frame["current_price"] = t.currentPrice;
+        frame["timeframe"] = t.timeframe;
+        frame["alert_type"] = t.alertTypeLabel;
+        controllers::WsObserveController::pushTriggered(t.alert.userId, std::move(frame));
     });
 
     ctrader.setSymbolsCallback([&](std::vector<ctrader::SymbolInfo> symbols) {
@@ -143,7 +207,7 @@ int main() {
     });
     ctrader.setSpotCallback([&](const ctrader::SpotUpdate &u) {
         hub.onSpot(u);
-        candleMonitor.onSpot(u);
+        evalLoop->queueInLoop([u]() { candleMonitor.onSpot(u); });
     });
 
     auto &app = core::AppContext::instance();
@@ -186,7 +250,7 @@ int main() {
             LOG_INFO << "Database migrations complete (version=" << version << ")";
             workerLoop->queueInLoop([&]() {
                 alertManager.loadAlerts();
-                refreshSubscriptions();
+                refreshSubscriptionsNow();
             });
         } catch (const std::exception &e) {
             LOG_ERROR << "Database migrations failed: " << e.what();
@@ -213,12 +277,14 @@ int main() {
     }
 
     if (redisPtr && pgPtr) {
-        constexpr int kAlertFlushBatchSize = 15;
-        workerLoop->runEvery(0.25, [&]() {
+        // Drain any legacy list entries once. Live alert writes go straight to Postgres.
+        constexpr int kAlertFlushBatchSize = 100;
+        auto drainLegacy = std::make_shared<std::function<void()>>();
+        *drainLegacy = [&, drainLegacy]() {
             redis.readJsonQueue(cfg.redisAlertQueueKey, kAlertFlushBatchSize,
-                                [&](std::vector<std::string> batch) {
+                                [&, drainLegacy](std::vector<std::string> batch) {
                                     if (batch.empty()) return;
-                                    workerLoop->queueInLoop([&, batch]() {
+                                    workerLoop->queueInLoop([&, batch, drainLegacy]() {
                                         for (const auto &js : batch) {
                                             Json::Value ev;
                                             Json::CharReaderBuilder b;
@@ -234,10 +300,16 @@ int main() {
                                                 postgres.deleteAlert(
                                                     ev.get("alert_id", "").asString());
                                         }
+                                        (*drainLegacy)();
                                     });
                                 });
-        });
+        };
+        workerLoop->queueInLoop([drainLegacy]() { (*drainLegacy)(); });
     }
+
+    workerLoop->runEvery(30.0, []() {
+        LOG_INFO << core::Metrics::instance().jsonLine();
+    });
 
     {
         double pollInterval = std::max(0.05, cfg.candleCheckIntervalSeconds);

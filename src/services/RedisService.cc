@@ -98,7 +98,7 @@ bool RedisService::connect() {
     try {
         client_ = drogon::nosql::RedisClient::newRedisClient(
             trantor::InetAddress(connectIp, static_cast<uint16_t>(port_)),
-            /*connections=*/2, password_, static_cast<unsigned int>(db_), username_);
+            /*connections=*/4, password_, static_cast<unsigned int>(db_), username_);
         std::string log = "Redis client created for " + host_ + " (" + connectIp + ":" +
                           std::to_string(port_) + "/" + std::to_string(db_) + ")";
         if (!username_.empty()) log += " acl_user=" + username_;
@@ -217,6 +217,100 @@ bool RedisService::setStringSync(const std::string &key, const std::string &valu
         LOG_WARN << "Redis setStringSync error: " << e.what();
         return false;
     }
+}
+
+namespace {
+
+std::vector<RedisService::StreamMessage> parseStreamReply(const drogon::nosql::RedisResult &r) {
+    std::vector<RedisService::StreamMessage> out;
+    if (r.type() != drogon::nosql::RedisResultType::kArray || r.isNil()) return out;
+    for (const auto &stream : r.asArray()) {
+        if (stream.type() != drogon::nosql::RedisResultType::kArray) continue;
+        auto parts = stream.asArray();
+        if (parts.size() < 2 || parts[1].type() != drogon::nosql::RedisResultType::kArray) continue;
+        for (const auto &msg : parts[1].asArray()) {
+            if (msg.type() != drogon::nosql::RedisResultType::kArray) continue;
+            auto mp = msg.asArray();
+            if (mp.size() < 2) continue;
+            RedisService::StreamMessage entry;
+            if (mp[0].type() == drogon::nosql::RedisResultType::kString) entry.id = mp[0].asString();
+            if (mp[1].type() != drogon::nosql::RedisResultType::kArray) continue;
+            auto fields = mp[1].asArray();
+            for (size_t i = 0; i + 1 < fields.size(); i += 2) {
+                if (fields[i].type() != drogon::nosql::RedisResultType::kString) continue;
+                if (fields[i + 1].type() != drogon::nosql::RedisResultType::kString) continue;
+                const std::string k = fields[i].asString();
+                const std::string v = fields[i + 1].asString();
+                if (k == "payload") entry.payload = v;
+                else if (k == "idem") entry.idem = v;
+                else if (k == "run") entry.runId = v;
+            }
+            if (!entry.id.empty()) out.push_back(std::move(entry));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+void RedisService::ensureStreamGroup(const std::string &key, const std::string &group) {
+    if (!client_) return;
+    client_->execCommandAsync(
+        [](const drogon::nosql::RedisResult &) {},
+        [](const std::exception &e) {
+            const std::string msg = e.what();
+            if (msg.find("BUSYGROUP") == std::string::npos) {
+                LOG_DEBUG << "Redis XGROUP CREATE: " << msg;
+            }
+        },
+        "XGROUP CREATE %s %s $ MKSTREAM", key.c_str(), group.c_str());
+}
+
+void RedisService::streamAdd(const std::string &key, const std::string &payload,
+                             const std::string &idem, const std::string &runId,
+                             std::function<void(std::optional<std::string>)> cb) {
+    if (!client_) {
+        if (cb) cb(std::nullopt);
+        return;
+    }
+    client_->execCommandAsync(
+        [cb](const drogon::nosql::RedisResult &r) {
+            if (!cb) return;
+            if (r.type() == drogon::nosql::RedisResultType::kString) cb(r.asString());
+            else cb(std::nullopt);
+        },
+        [cb](const std::exception &e) {
+            LOG_DEBUG << "Redis XADD error: " << e.what();
+            if (cb) cb(std::nullopt);
+        },
+        "XADD %s * payload %s idem %s run %s", key.c_str(), payload.c_str(), idem.c_str(),
+        runId.c_str());
+}
+
+void RedisService::readStreamGroup(const std::string &key, const std::string &group,
+                                   const std::string &consumer, int count, int blockMs,
+                                   std::function<void(std::vector<StreamMessage>)> cb) {
+    if (!client_) {
+        cb({});
+        return;
+    }
+    client_->execCommandAsync(
+        [cb](const drogon::nosql::RedisResult &r) { cb(parseStreamReply(r)); },
+        [cb](const std::exception &e) {
+            LOG_DEBUG << "Redis XREADGROUP error: " << e.what();
+            cb({});
+        },
+        "XREADGROUP GROUP %s %s COUNT %d BLOCK %d STREAMS %s >", group.c_str(), consumer.c_str(),
+        count, blockMs, key.c_str());
+}
+
+void RedisService::ackStream(const std::string &key, const std::string &group,
+                             const std::string &id) {
+    if (!client_ || id.empty()) return;
+    client_->execCommandAsync(
+        [](const drogon::nosql::RedisResult &) {},
+        [](const std::exception &e) { LOG_DEBUG << "Redis XACK error: " << e.what(); },
+        "XACK %s %s %s", key.c_str(), group.c_str(), id.c_str());
 }
 
 void RedisService::requeueJsonBatch(const std::string &key,

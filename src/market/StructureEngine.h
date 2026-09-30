@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -51,6 +52,28 @@ std::vector<double> computeAtr(const std::vector<StructureCandle> &candles, int 
 
 StructureResult computeMarketStructure(const std::vector<StructureCandle> &candles,
                                        const StructureOptions &opt = {});
+
+// Online equivalent of computeMarketStructure: appending every bar yields the
+// same events as a full scan of that series.
+class IncrementalStructure {
+  public:
+    explicit IncrementalStructure(StructureOptions opt = {});
+    IncrementalStructure(const IncrementalStructure &) = delete;
+    IncrementalStructure &operator=(const IncrementalStructure &) = delete;
+    IncrementalStructure(IncrementalStructure &&) noexcept;
+    IncrementalStructure &operator=(IncrementalStructure &&) noexcept;
+    ~IncrementalStructure();
+
+    std::vector<StructureEvent> append(const StructureCandle &candle);
+    void reset();
+    const std::vector<StructureEvent> &events() const;
+    std::string trend() const;
+    int barsApplied() const;
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 std::string structureKindKey(const std::string &kind);
 

@@ -1,5 +1,7 @@
 #include "util/ForexMarketHours.h"
 
+#include <atomic>
+
 namespace ctraderplus::util {
 
 namespace {
@@ -19,13 +21,22 @@ void utcParts(std::time_t t, int &weekdayMon0, int &hour) {
 
 bool isForexMarketOpen(std::time_t nowUtc) {
     if (nowUtc == 0) nowUtc = std::time(nullptr);
+    const std::time_t minute = nowUtc - (nowUtc % 60);
+    static std::atomic<std::time_t> cachedMinute{-1};
+    static std::atomic<int> cachedOpen{0};
+    if (cachedMinute.load(std::memory_order_relaxed) == minute) {
+        return cachedOpen.load(std::memory_order_relaxed) != 0;
+    }
     int weekday, hour;
     utcParts(nowUtc, weekday, hour);
 
-    if (weekday == 5) return false;          // Saturday
-    if (weekday == 6) return hour >= 22;     // Sunday: open from 22:00 UTC
-    if (weekday == 4) return hour < 22;      // Friday: closes at 22:00 UTC
-    return true;                             // Mon-Thu
+    bool open = true;
+    if (weekday == 5) open = false;          // Saturday
+    else if (weekday == 6) open = hour >= 22;  // Sunday: open from 22:00 UTC
+    else if (weekday == 4) open = hour < 22;   // Friday: closes at 22:00 UTC
+    cachedOpen.store(open ? 1 : 0, std::memory_order_relaxed);
+    cachedMinute.store(minute, std::memory_order_relaxed);
+    return open;
 }
 
 long long secondsUntilMarketOpens(std::time_t nowUtc) {

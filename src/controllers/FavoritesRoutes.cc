@@ -5,6 +5,7 @@
 #include <json/json.h>
 
 #include "controllers/ActivityLog.h"
+#include "controllers/HttpUtil.h"
 #include "core/ApiLog.h"
 #include "core/AppContext.h"
 #include "core/Auth.h"
@@ -19,17 +20,8 @@ namespace ctraderplus::controllers {
 
 namespace {
 
-HttpResponsePtr jsonResp(const Json::Value &v, int code = 200) {
-    auto resp = HttpResponse::newHttpJsonResponse(v);
-    resp->setStatusCode(static_cast<HttpStatusCode>(code));
-    return resp;
-}
-
-HttpResponsePtr errResp(const std::string &msg, int code) {
-    Json::Value v;
-    v["detail"] = msg;
-    return jsonResp(v, code);
-}
+using ::ctraderplus::controllers::errResp;
+using ::ctraderplus::controllers::jsonResp;
 
 bool authOrReject(const HttpRequestPtr &req,
                   std::function<void(const HttpResponsePtr &)> &cb,
@@ -56,23 +48,26 @@ void listFavorites(const HttpRequestPtr &req,
     if (!authOrReject(req, cb, uid)) return;
     if (!dbReadyOrReject(cb)) return;
 
-    if (!core::withPostgres([&](services::PostgresService &pg) {
-            try {
-                auto pairs = pg.listFavorites(uid);
-                Json::Value arr(Json::arrayValue);
-                for (const auto &p : pairs) arr.append(p);
-                Json::Value v;
-                v["pairs"] = arr;
-                core::logApiOutcome("favorites", "list", true, 200,
-                                    "count=" + std::to_string(pairs.size()), uid);
-                cb(jsonResp(v));
-            } catch (const std::exception &e) {
-                core::logApiOutcome("favorites", "list", false, 500, e.what(), uid);
-                cb(errResp("Failed to list favorites", 500));
-            }
-        })) {
-        cb(errResp("Database not ready", 503));
-    }
+    auto cbPtr = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    core::runOnDbWorker([cbPtr, uid]() {
+        if (!core::withPostgres([&](services::PostgresService &pg) {
+                try {
+                    auto pairs = pg.listFavorites(uid);
+                    Json::Value arr(Json::arrayValue);
+                    for (const auto &p : pairs) arr.append(p);
+                    Json::Value v;
+                    v["pairs"] = arr;
+                    core::logApiOutcome("favorites", "list", true, 200,
+                                        "count=" + std::to_string(pairs.size()), uid);
+                    (*cbPtr)(jsonResp(v));
+                } catch (const std::exception &e) {
+                    core::logApiOutcome("favorites", "list", false, 500, e.what(), uid);
+                    (*cbPtr)(errResp("Failed to list favorites", 500));
+                }
+            })) {
+            (*cbPtr)(errResp("Database not ready", 503));
+        }
+    });
 }
 
 void addFavorite(const HttpRequestPtr &req,
@@ -94,26 +89,31 @@ void addFavorite(const HttpRequestPtr &req,
         return;
     }
 
-    if (!core::withPostgres([&](services::PostgresService &pg) {
-            try {
-                pg.addFavorite(uid, pair);
-                Json::Value meta;
-                meta["pair"] = pair;
-                logActivityAsync(uid, "favorite_add", clientIp(req), clientUserAgent(req), meta);
-                core::logApiOutcome("favorites", "add", true, 200, "pair=" + pair, uid);
-                Json::Value v;
-                v["pairs"] = Json::Value(Json::arrayValue);
-                for (const auto &p : pg.listFavorites(uid)) v["pairs"].append(p);
-                if (AppContext::instance().refreshSubscriptions)
-                    AppContext::instance().refreshSubscriptions();
-                cb(jsonResp(v));
-            } catch (const std::exception &e) {
-                core::logApiOutcome("favorites", "add", false, 500, e.what(), uid);
-                cb(errResp(e.what(), 500));
-            }
-        })) {
-        cb(errResp("Database not ready", 503));
-    }
+    const std::string ip = clientIp(req);
+    const std::string ua = clientUserAgent(req);
+    auto cbPtr = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    core::runOnDbWorker([cbPtr, uid, pair, ip, ua]() {
+        if (!core::withPostgres([&](services::PostgresService &pg) {
+                try {
+                    pg.addFavorite(uid, pair);
+                    Json::Value meta;
+                    meta["pair"] = pair;
+                    logActivityAsync(uid, "favorite_add", ip, ua, meta);
+                    core::logApiOutcome("favorites", "add", true, 200, "pair=" + pair, uid);
+                    Json::Value v;
+                    v["pairs"] = Json::Value(Json::arrayValue);
+                    for (const auto &p : pg.listFavorites(uid)) v["pairs"].append(p);
+                    if (AppContext::instance().refreshSubscriptions)
+                        AppContext::instance().refreshSubscriptions();
+                    (*cbPtr)(jsonResp(v));
+                } catch (const std::exception &e) {
+                    core::logApiOutcome("favorites", "add", false, 500, e.what(), uid);
+                    (*cbPtr)(errResp(e.what(), 500));
+                }
+            })) {
+            (*cbPtr)(errResp("Database not ready", 503));
+        }
+    });
 }
 
 void removeFavorite(const HttpRequestPtr &req,
@@ -130,27 +130,31 @@ void removeFavorite(const HttpRequestPtr &req,
         return;
     }
 
-    if (!core::withPostgres([&](services::PostgresService &pg) {
-            try {
-                pg.removeFavorite(uid, pair);
-                Json::Value meta;
-                meta["pair"] = pair;
-                logActivityAsync(uid, "favorite_remove", clientIp(req), clientUserAgent(req),
-                                 meta);
-                core::logApiOutcome("favorites", "remove", true, 200, "pair=" + pair, uid);
-                Json::Value v;
-                v["pairs"] = Json::Value(Json::arrayValue);
-                for (const auto &p : pg.listFavorites(uid)) v["pairs"].append(p);
-                if (AppContext::instance().refreshSubscriptions)
-                    AppContext::instance().refreshSubscriptions();
-                cb(jsonResp(v));
-            } catch (const std::exception &e) {
-                core::logApiOutcome("favorites", "remove", false, 500, e.what(), uid);
-                cb(errResp(e.what(), 500));
-            }
-        })) {
-        cb(errResp("Database not ready", 503));
-    }
+    const std::string ip = clientIp(req);
+    const std::string ua = clientUserAgent(req);
+    auto cbPtr = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    core::runOnDbWorker([cbPtr, uid, pair, ip, ua]() {
+        if (!core::withPostgres([&](services::PostgresService &pg) {
+                try {
+                    pg.removeFavorite(uid, pair);
+                    Json::Value meta;
+                    meta["pair"] = pair;
+                    logActivityAsync(uid, "favorite_remove", ip, ua, meta);
+                    core::logApiOutcome("favorites", "remove", true, 200, "pair=" + pair, uid);
+                    Json::Value v;
+                    v["pairs"] = Json::Value(Json::arrayValue);
+                    for (const auto &p : pg.listFavorites(uid)) v["pairs"].append(p);
+                    if (AppContext::instance().refreshSubscriptions)
+                        AppContext::instance().refreshSubscriptions();
+                    (*cbPtr)(jsonResp(v));
+                } catch (const std::exception &e) {
+                    core::logApiOutcome("favorites", "remove", false, 500, e.what(), uid);
+                    (*cbPtr)(errResp(e.what(), 500));
+                }
+            })) {
+            (*cbPtr)(errResp("Database not ready", 503));
+        }
+    });
 }
 
 }  // namespace

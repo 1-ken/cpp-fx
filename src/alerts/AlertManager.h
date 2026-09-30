@@ -1,11 +1,15 @@
 #pragma once
 
+#include <ctime>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include <trantor/net/EventLoop.h>
 
 #include <json/json.h>
 
@@ -52,6 +56,9 @@ class AlertManager {
     }
     void setCTraderClient(ctrader::CTraderClient *client) { ctrader_ = client; }
     void setSymbolRegistry(ctrader::SymbolRegistry *registry) { registry_ = registry; }
+    void setDbLoop(trantor::EventLoop *loop) { dbLoop_ = loop; }
+    // Install an alert in memory without writing Postgres. Used by replay tests.
+    void cacheAlert(Alert alert);
     void loadAlerts();
     bool dbPersistenceEnabled() const { return postgres_ != nullptr; }
 
@@ -121,8 +128,14 @@ class AlertManager {
     int flushPersistenceEvents(int batchSize);
 
   private:
+    struct StructureTrack {
+        std::vector<market::StructureCandle> candles;
+        std::unordered_map<std::string, market::IncrementalStructure> engines;
+    };
+
     void rebuildIndexes();
     void persistAlert(const Alert &a);
+    void persistAlertThen(const Alert &a, std::function<void(bool)> done);
     bool persistAlertSync(const Alert &a);
     bool persistDeleteSync(const std::string &id);
     void persistDelete(const std::string &id);
@@ -142,6 +155,9 @@ class AlertManager {
     void bumpUserRevision(const std::string &userId);
     void notifySubscriptionChange();
     static std::string candleIndexKey(const std::string &pair, const std::string &interval);
+    void appendStructureCandle(StructureTrack &track, market::StructureCandle bar);
+    market::IncrementalStructure &structureEngine(StructureTrack &track,
+                                                  const market::StructureOptions &opt);
 
     static int intervalSeconds(const std::string &interval);
 
@@ -155,19 +171,15 @@ class AlertManager {
     void clearSweepLookbackPending(const std::string &alertId);
 
     mutable std::mutex mu_;
-    mutable std::mutex revMu_;
     std::unordered_map<std::string, Alert> alerts_;
     std::unordered_map<std::string, std::vector<std::string>> activePriceIndex_;
     std::unordered_map<std::string, std::vector<std::string>> activeCandleIndex_;
     std::unordered_map<std::string, std::vector<std::string>> activeDolIndex_;
     std::unordered_map<std::string, uint64_t> userAlertsRevision_;
     std::unordered_map<std::string, bool> sweepLookbackPending_;
-
-    struct StructureTrack {
-        std::vector<market::StructureCandle> candles;
-        bool warmed = false;
-    };
     std::unordered_map<std::string, StructureTrack> structureTracks_;
+    std::map<std::time_t, std::vector<std::string>> expiryByMinute_;
+    std::vector<std::string> activePrevDayIds_;
 
     std::function<void()> onSubscriptionChange_;
     std::function<void(const TriggeredAlert &)> onTriggered_;
@@ -178,6 +190,7 @@ class AlertManager {
     ctrader::CTraderClient *ctrader_ = nullptr;
     ctrader::SymbolRegistry *registry_ = nullptr;
     std::function<void(std::function<void()>)> dbExecutor_;
+    trantor::EventLoop *dbLoop_ = nullptr;
     std::string redisAlertQueueKey_ = "fx:alerts:events";
 };
 

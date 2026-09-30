@@ -6,6 +6,7 @@
 #include <trantor/utils/Logger.h>
 
 #include "core/Config.h"
+#include "core/Metrics.h"
 #include "market/AllowedPairs.h"
 #include "services/PostgresService.h"
 #include "util/ForexMarketHours.h"
@@ -35,6 +36,9 @@ void MarketHub::onSpot(const ctrader::SpotUpdate &update) {
     if (canonical.empty()) return;
     if (filterPairs_ && allowedPairs_.count(canonical) == 0) return;
 
+    FlatPair quote;
+    bool emitQuote = false;
+    {
     std::lock_guard<std::mutex> lk(mu_);
     PairState &st = states_[update.symbolId];
     st.symbolId = update.symbolId;
@@ -65,6 +69,31 @@ void MarketHub::onSpot(const ctrader::SpotUpdate &update) {
         st.hasChange = true;
     }
     st.tsIso = util::nowIso8601();
+    if (st.hasPrice) {
+        st.item = Json::Value(Json::objectValue);
+        st.item["pair"] = st.canonical;
+        st.item["price"] = st.price;
+        st.item["change"] = st.hasChange ? Json::Value(st.change) : Json::Value::null;
+        st.item["bid"] = st.hasBid ? Json::Value(st.bid) : Json::Value::null;
+        st.item["ask"] = st.hasAsk ? Json::Value(st.ask) : Json::Value::null;
+        st.item["common_name"] = st.name;
+        st.item["source"] = st.group;
+        st.itemReady = true;
+        if (util::isForexMarketOpen()) {
+            quote.pair = st.canonical;
+            quote.name = st.name;
+            quote.group = st.group;
+            quote.price = st.price;
+            quote.hasPrice = true;
+            quote.change = st.change;
+            quote.hasChange = st.hasChange;
+            quote.bid = st.bid;
+            quote.ask = st.ask;
+            emitQuote = true;
+        }
+    }
+    }
+    if (emitQuote && quoteSink_) quoteSink_(std::move(quote));
 }
 
 void MarketHub::start(trantor::EventLoop *loop) {
@@ -103,15 +132,16 @@ SnapshotBundle MarketHub::buildSnapshot() const {
         fp.ask = s.ask;
         out.flat.push_back(std::move(fp));
 
-        Json::Value item(Json::objectValue);
-        item["pair"] = s.canonical;
-        item["price"] = s.price;
-        if (s.hasChange) item["change"] = s.change;
-        else item["change"] = Json::Value::null;
-        item["bid"] = s.hasBid ? Json::Value(s.bid) : Json::Value::null;
-        item["ask"] = s.hasAsk ? Json::Value(s.ask) : Json::Value::null;
-        item["common_name"] = s.name;
-        item["source"] = s.group;
+        Json::Value item = s.itemReady ? s.item : Json::Value(Json::objectValue);
+        if (!s.itemReady) {
+            item["pair"] = s.canonical;
+            item["price"] = s.price;
+            item["change"] = s.hasChange ? Json::Value(s.change) : Json::Value::null;
+            item["bid"] = s.hasBid ? Json::Value(s.bid) : Json::Value::null;
+            item["ask"] = s.hasAsk ? Json::Value(s.ask) : Json::Value::null;
+            item["common_name"] = s.name;
+            item["source"] = s.group;
+        }
         if (s.group == "currencies")
             currencies.append(item);
         else if (s.group == "indices")
@@ -164,6 +194,11 @@ bool MarketHub::cachedTrendbar(const std::string &canonicalPair,
     if (it == trendbarCache_.end()) return false;
     out = it->second;
     return true;
+}
+
+std::shared_ptr<Json::Value> MarketHub::lastGroupedSnapshot() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return lastGrouped_;
 }
 
 std::string MarketHub::lastSnapshotTs() const {
@@ -226,7 +261,14 @@ void MarketHub::tick() {
         lastSnapshotTs_ = ts;
     }
     (*bundle.grouped)["ts"] = ts;
+    const uint64_t seq = snapshotSeq_.fetch_add(1, std::memory_order_relaxed) + 1;
+    (*bundle.grouped)["seq"] = Json::UInt64(seq);
+    core::Metrics::instance().snapshotSeq.store(seq, std::memory_order_relaxed);
     snapshotFailureCount_.store(0);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        lastGrouped_ = bundle.grouped;
+    }
 
     if (broadcastSink_) broadcastSink_(bundle.grouped);
     if (alertSink_) {

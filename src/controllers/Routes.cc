@@ -1,6 +1,7 @@
 #include "controllers/Routes.h"
 
 #include "controllers/ActivityLog.h"
+#include "controllers/HttpUtil.h"
 #include "controllers/AdminRoutes.h"
 #include "controllers/AuthRoutes.h"
 #include "controllers/Cors.h"
@@ -53,17 +54,9 @@ namespace ctraderplus::controllers {
 
 namespace {
 
-HttpResponsePtr jsonResp(const Json::Value &v, int code = 200) {
-    auto resp = HttpResponse::newHttpJsonResponse(v);
-    resp->setStatusCode(static_cast<HttpStatusCode>(code));
-    return resp;
-}
-
-HttpResponsePtr errResp(const std::string &detailKey, const std::string &msg, int code) {
-    Json::Value v;
-    v[detailKey] = msg;
-    return jsonResp(v, code);
-}
+using ::ctraderplus::controllers::errResp;
+using ::ctraderplus::controllers::jsonResp;
+using ::ctraderplus::controllers::trimStr;
 
 // ---- Historical OHLC cache --------------------------------------------------
 // cTrader rate-limits historical trendbar requests. Each pair view fans out
@@ -197,12 +190,6 @@ bool authOrReject(const HttpRequestPtr &req,
 
 int clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-std::string trimStr(const std::string &s) {
-    size_t a = s.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos) return "";
-    size_t b = s.find_last_not_of(" \t\r\n");
-    return s.substr(a, b - a + 1);
-}
 
 // Require a future ISO-8601 expires_at. Returns empty optional and sets err on failure.
 std::optional<std::string> requireExpiresAt(const Json::Value &b, std::string &err) {
@@ -552,33 +539,36 @@ void onboardingComplete(const HttpRequestPtr &req,
         cb(errResp("detail", "Database not ready", 503));
         return;
     }
-    if (!core::withPostgres([&](services::PostgresService &pg) {
-            try {
-                auto st = pg.completeUserOnboarding(uid);
-                if (!st.onboardingCompletedAt) {
-                    cb(errResp("detail", "Database unavailable", 503));
-                    return;
+    auto cbPtr = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    core::runOnDbWorker([cbPtr, uid]() {
+        if (!core::withPostgres([&](services::PostgresService &pg) {
+                try {
+                    auto st = pg.completeUserOnboarding(uid);
+                    if (!st.onboardingCompletedAt) {
+                        (*cbPtr)(errResp("detail", "Database unavailable", 503));
+                        return;
+                    }
+                    services::SubscriptionService sub(pg);
+                    auto subState = sub.getState(uid);
+                    Json::Value v;
+                    v["success"] = true;
+                    v["userId"] = st.userId;
+                    v["onboardingCompletedAt"] = util::toIso8601(*st.onboardingCompletedAt);
+                    v["isFirstTimeUser"] = false;
+                    Json::Value subJson = sub.toBootstrapJson(subState);
+                    for (const auto &key : subJson.getMemberNames()) {
+                        v[key] = subJson[key];
+                    }
+                    core::logApiOutcome("user", "onboarding_complete", true, 200, "ok", uid);
+                    (*cbPtr)(jsonResp(v));
+                } catch (const std::exception &e) {
+                    core::logApiOutcome("user", "onboarding_complete", false, 503, e.what(), uid);
+                    (*cbPtr)(errResp("detail", "Database unavailable", 503));
                 }
-                services::SubscriptionService sub(pg);
-                auto subState = sub.getState(uid);
-                Json::Value v;
-                v["success"] = true;
-                v["userId"] = st.userId;
-                v["onboardingCompletedAt"] = util::toIso8601(*st.onboardingCompletedAt);
-                v["isFirstTimeUser"] = false;
-                Json::Value subJson = sub.toBootstrapJson(subState);
-                for (const auto &key : subJson.getMemberNames()) {
-                    v[key] = subJson[key];
-                }
-                core::logApiOutcome("user", "onboarding_complete", true, 200, "ok", uid);
-                cb(jsonResp(v));
-            } catch (const std::exception &e) {
-                core::logApiOutcome("user", "onboarding_complete", false, 503, e.what(), uid);
-                cb(errResp("detail", "Database unavailable", 503));
-            }
-        })) {
-        cb(errResp("detail", "Database not ready", 503));
-    }
+            })) {
+            (*cbPtr)(errResp("detail", "Database not ready", 503));
+        }
+    });
 }
 
 void updateUserPhone(const HttpRequestPtr &req,
@@ -600,30 +590,33 @@ void updateUserPhone(const HttpRequestPtr &req,
     const std::string onlyIfEmpty = req->getParameter("only_if_empty");
     const bool forceUpdate = onlyIfEmpty != "true" && onlyIfEmpty != "1";
 
-    if (!core::withPostgres([&](services::PostgresService &pg) {
-            try {
-                pg.updateUserPhone(uid, phone, forceUpdate);
-                Json::Value v;
-                v["success"] = true;
-                auto saved = pg.getUserPhone(uid);
-                if (saved) {
-                    v["phone"] = *saved;
-                } else {
-                    v["phone"] = Json::Value::null;
+    auto cbPtr = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    core::runOnDbWorker([cbPtr, uid, phone, forceUpdate]() {
+        if (!core::withPostgres([&](services::PostgresService &pg) {
+                try {
+                    pg.updateUserPhone(uid, phone, forceUpdate);
+                    Json::Value v;
+                    v["success"] = true;
+                    auto saved = pg.getUserPhone(uid);
+                    if (saved) {
+                        v["phone"] = *saved;
+                    } else {
+                        v["phone"] = Json::Value::null;
+                    }
+                    core::logApiOutcome("user", "update_phone", true, 200,
+                                        forceUpdate ? "force" : "if_empty", uid);
+                    (*cbPtr)(jsonResp(v));
+                } catch (const std::runtime_error &e) {
+                    core::logApiOutcome("user", "update_phone", false, 400, e.what(), uid);
+                    (*cbPtr)(errResp("detail", e.what(), 400));
+                } catch (const std::exception &e) {
+                    core::logApiOutcome("user", "update_phone", false, 500, e.what(), uid);
+                    (*cbPtr)(errResp("detail", "Failed to save phone", 500));
                 }
-                core::logApiOutcome("user", "update_phone", true, 200,
-                                    forceUpdate ? "force" : "if_empty", uid);
-                cb(jsonResp(v));
-            } catch (const std::runtime_error &e) {
-                core::logApiOutcome("user", "update_phone", false, 400, e.what(), uid);
-                cb(errResp("detail", e.what(), 400));
-            } catch (const std::exception &e) {
-                core::logApiOutcome("user", "update_phone", false, 500, e.what(), uid);
-                cb(errResp("detail", "Failed to save phone", 500));
-            }
-        })) {
-        cb(errResp("detail", "Database not ready", 503));
-    }
+            })) {
+            (*cbPtr)(errResp("detail", "Database not ready", 503));
+        }
+    });
 }
 
 void submitFeedback(const HttpRequestPtr &req,
@@ -652,20 +645,23 @@ void submitFeedback(const HttpRequestPtr &req,
         if (source.size() > 64) source = source.substr(0, 64);
     }
 
-    if (!core::withPostgres([&](services::PostgresService &pg) {
-            try {
-                pg.insertUserFeedback(uid, enjoying, improvements, source);
-                Json::Value v;
-                v["success"] = true;
-                core::logApiOutcome("user", "feedback", true, 200, enjoying ? "yes" : "no", uid);
-                cb(jsonResp(v));
-            } catch (const std::exception &e) {
-                core::logApiOutcome("user", "feedback", false, 500, e.what(), uid);
-                cb(errResp("detail", "Failed to save feedback", 500));
-            }
-        })) {
-        cb(errResp("detail", "Database not ready", 503));
-    }
+    auto cbPtr = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    core::runOnDbWorker([cbPtr, uid, enjoying, improvements, source]() {
+        if (!core::withPostgres([&](services::PostgresService &pg) {
+                try {
+                    pg.insertUserFeedback(uid, enjoying, improvements, source);
+                    Json::Value v;
+                    v["success"] = true;
+                    core::logApiOutcome("user", "feedback", true, 200, enjoying ? "yes" : "no", uid);
+                    (*cbPtr)(jsonResp(v));
+                } catch (const std::exception &e) {
+                    core::logApiOutcome("user", "feedback", false, 500, e.what(), uid);
+                    (*cbPtr)(errResp("detail", "Failed to save feedback", 500));
+                }
+            })) {
+            (*cbPtr)(errResp("detail", "Database not ready", 503));
+        }
+    });
 }
 
 void tourComplete(const HttpRequestPtr &req,
@@ -677,26 +673,29 @@ void tourComplete(const HttpRequestPtr &req,
         cb(errResp("detail", "Database not ready", 503));
         return;
     }
-    if (!core::withPostgres([&](services::PostgresService &pg) {
-            try {
-                services::SubscriptionService sub(pg);
-                auto state = sub.completeTour(uid);
-                Json::Value v;
-                v["success"] = true;
-                v["userId"] = uid;
-                Json::Value subJson = sub.toBootstrapJson(state);
-                for (const auto &key : subJson.getMemberNames()) {
-                    v[key] = subJson[key];
+    auto cbPtr = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    core::runOnDbWorker([cbPtr, uid]() {
+        if (!core::withPostgres([&](services::PostgresService &pg) {
+                try {
+                    services::SubscriptionService sub(pg);
+                    auto state = sub.completeTour(uid);
+                    Json::Value v;
+                    v["success"] = true;
+                    v["userId"] = uid;
+                    Json::Value subJson = sub.toBootstrapJson(state);
+                    for (const auto &key : subJson.getMemberNames()) {
+                        v[key] = subJson[key];
+                    }
+                    core::logApiOutcome("user", "tour_complete", true, 200, "ok", uid);
+                    (*cbPtr)(jsonResp(v));
+                } catch (const std::exception &e) {
+                    core::logApiOutcome("user", "tour_complete", false, 503, e.what(), uid);
+                    (*cbPtr)(errResp("detail", "Database unavailable", 503));
                 }
-                core::logApiOutcome("user", "tour_complete", true, 200, "ok", uid);
-                cb(jsonResp(v));
-            } catch (const std::exception &e) {
-                core::logApiOutcome("user", "tour_complete", false, 503, e.what(), uid);
-                cb(errResp("detail", "Database unavailable", 503));
-            }
-        })) {
-        cb(errResp("detail", "Database not ready", 503));
-    }
+            })) {
+            (*cbPtr)(errResp("detail", "Database not ready", 503));
+        }
+    });
 }
 
 void dismissPaywall(const HttpRequestPtr &req,
@@ -708,24 +707,27 @@ void dismissPaywall(const HttpRequestPtr &req,
         cb(errResp("detail", "Database not ready", 503));
         return;
     }
-    if (!core::withPostgres([&](services::PostgresService &pg) {
-            try {
-                services::SubscriptionService sub(pg);
-                sub.dismissPaywall(uid);
-                auto state = sub.getState(uid);
-                Json::Value v;
-                v["success"] = true;
-                Json::Value subJson = sub.toBootstrapJson(state);
-                for (const auto &key : subJson.getMemberNames()) {
-                    v[key] = subJson[key];
+    auto cbPtr = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    core::runOnDbWorker([cbPtr, uid]() {
+        if (!core::withPostgres([&](services::PostgresService &pg) {
+                try {
+                    services::SubscriptionService sub(pg);
+                    sub.dismissPaywall(uid);
+                    auto state = sub.getState(uid);
+                    Json::Value v;
+                    v["success"] = true;
+                    Json::Value subJson = sub.toBootstrapJson(state);
+                    for (const auto &key : subJson.getMemberNames()) {
+                        v[key] = subJson[key];
+                    }
+                    (*cbPtr)(jsonResp(v));
+                } catch (const std::exception &e) {
+                    (*cbPtr)(errResp("detail", "Database unavailable", 503));
                 }
-                cb(jsonResp(v));
-            } catch (const std::exception &e) {
-                cb(errResp("detail", "Database unavailable", 503));
-            }
-        })) {
-        cb(errResp("detail", "Database not ready", 503));
-    }
+            })) {
+            (*cbPtr)(errResp("detail", "Database not ready", 503));
+        }
+    });
 }
 
 void selectTier(const HttpRequestPtr &req,
@@ -743,29 +745,32 @@ void selectTier(const HttpRequestPtr &req,
         return;
     }
     const std::string tier = (*body)["tier"].asString();
-    if (!core::withPostgres([&](services::PostgresService &pg) {
-            try {
-                services::SubscriptionService sub(pg);
-                std::string status;
-                if (!sub.selectTier(uid, tier, status)) {
-                    cb(errResp("detail", "Invalid subscription tier", 400));
-                    return;
+    auto cbPtr = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    core::runOnDbWorker([cbPtr, uid, tier]() {
+        if (!core::withPostgres([&](services::PostgresService &pg) {
+                try {
+                    services::SubscriptionService sub(pg);
+                    std::string status;
+                    if (!sub.selectTier(uid, tier, status)) {
+                        (*cbPtr)(errResp("detail", "Invalid subscription tier", 400));
+                        return;
+                    }
+                    auto state = sub.getState(uid);
+                    Json::Value v;
+                    v["success"] = true;
+                    v["status"] = status;
+                    Json::Value subJson = sub.toBootstrapJson(state);
+                    for (const auto &key : subJson.getMemberNames()) {
+                        v[key] = subJson[key];
+                    }
+                    (*cbPtr)(jsonResp(v));
+                } catch (const std::exception &e) {
+                    (*cbPtr)(errResp("detail", "Database unavailable", 503));
                 }
-                auto state = sub.getState(uid);
-                Json::Value v;
-                v["success"] = true;
-                v["status"] = status;
-                Json::Value subJson = sub.toBootstrapJson(state);
-                for (const auto &key : subJson.getMemberNames()) {
-                    v[key] = subJson[key];
-                }
-                cb(jsonResp(v));
-            } catch (const std::exception &e) {
-                cb(errResp("detail", "Database unavailable", 503));
-            }
-        })) {
-        cb(errResp("detail", "Database not ready", 503));
-    }
+            })) {
+            (*cbPtr)(errResp("detail", "Database not ready", 503));
+        }
+    });
 }
 
 void historical(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> &&cb) {
@@ -1025,12 +1030,14 @@ bool rejectAlertsWithoutDb(std::function<void(const HttpResponsePtr &)> &cb) {
 void maybeSaveUserPhoneFromAlert(const std::string &uid, const std::string &phone,
                                  const std::vector<std::string> &channels) {
     if (trimStr(phone).empty() || !channelsRequirePhone(channels)) return;
-    core::withPostgres([&](services::PostgresService &pg) {
-        try {
-            pg.updateUserPhone(uid, phone, false);
-        } catch (const std::exception &e) {
-            LOG_DEBUG << "maybeSaveUserPhoneFromAlert: " << e.what();
-        }
+    core::runOnDbWorker([uid, phone]() {
+        core::withPostgres([&](services::PostgresService &pg) {
+            try {
+                pg.updateUserPhone(uid, phone, false);
+            } catch (const std::exception &e) {
+                LOG_DEBUG << "maybeSaveUserPhoneFromAlert: " << e.what();
+            }
+        });
     });
 }
 

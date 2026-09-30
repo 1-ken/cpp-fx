@@ -39,6 +39,21 @@ class RedisService {
     std::optional<std::string> getStringSync(const std::string &key);
     bool setStringSync(const std::string &key, const std::string &value);
 
+    struct StreamMessage {
+        std::string id;
+        std::string payload;
+        std::string idem;
+        std::string runId;
+    };
+
+    void ensureStreamGroup(const std::string &key, const std::string &group);
+    void streamAdd(const std::string &key, const std::string &payload, const std::string &idem,
+                   const std::string &runId, std::function<void(std::optional<std::string>)> cb);
+    void readStreamGroup(const std::string &key, const std::string &group,
+                         const std::string &consumer, int count, int blockMs,
+                         std::function<void(std::vector<StreamMessage>)> cb);
+    void ackStream(const std::string &key, const std::string &group, const std::string &id);
+
   private:
     const core::Config &cfg_;
     std::string host_ = "127.0.0.1";

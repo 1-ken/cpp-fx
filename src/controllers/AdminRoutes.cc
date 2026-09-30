@@ -14,6 +14,7 @@
 #include <json/json.h>
 #include <trantor/utils/Logger.h>
 
+#include "controllers/HttpUtil.h"
 #include "core/ApiLog.h"
 #include "core/AppContext.h"
 #include "core/Auth.h"
@@ -33,44 +34,11 @@ namespace ctraderplus::controllers {
 
 namespace {
 
-HttpResponsePtr jsonResp(const Json::Value &v, int code = 200) {
-    auto resp = HttpResponse::newHttpJsonResponse(v);
-    resp->setStatusCode(static_cast<HttpStatusCode>(code));
-    return resp;
-}
-
-HttpResponsePtr errResp(const std::string &msg, int code) {
-    Json::Value v;
-    v["detail"] = msg;
-    return jsonResp(v, code);
-}
-
-std::string trim(const std::string &s) {
-    size_t a = s.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos) return "";
-    size_t b = s.find_last_not_of(" \t\r\n");
-    return s.substr(a, b - a + 1);
-}
-
-std::string normalizeMarketerCode(const std::string &code) {
-    std::string out;
-    out.reserve(code.size());
-    for (unsigned char c : code) {
-        if (c >= 'A' && c <= 'Z')
-            out.push_back(static_cast<char>(c + 32));
-        else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')
-            out.push_back(static_cast<char>(c));
-    }
-    return out;
-}
-
-bool isValidMarketerCodeFormat(const std::string &code) {
-    if (code.size() < 3 || code.size() > 32) return false;
-    for (unsigned char c : code) {
-        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
-    }
-    return true;
-}
+using ::ctraderplus::controllers::errResp;
+using ::ctraderplus::controllers::isValidMarketerCodeFormat;
+using ::ctraderplus::controllers::jsonResp;
+using ::ctraderplus::controllers::normalizeMarketerCode;
+using ::ctraderplus::controllers::trim;
 
 std::string normalizePhone(const std::string &phone) {
     std::string out;
@@ -264,8 +232,16 @@ void adminOtpVerify(const HttpRequestPtr &req,
         }
     };
 
-    if (consumeOtp(phone, code)) {
+    auto finishVerified = [issueToken, redisKey, &app]() {
+        if (app.redis && app.redis->connected()) {
+            app.redis->deleteKey(redisKey, [issueToken]() { issueToken(); });
+            return;
+        }
         issueToken();
+    };
+
+    if (consumeOtp(phone, code)) {
+        finishVerified();
         return;
     }
 
@@ -275,14 +251,19 @@ void adminOtpVerify(const HttpRequestPtr &req,
         return;
     }
 
-    app.redis->getString(redisKey, [phone, code, issueToken, cb](std::optional<std::string> stored) {
+    app.redis->getString(redisKey, [phone, code, finishVerified, cb, redisKey](std::optional<std::string> stored) {
         if (!stored || *stored != code) {
             core::logApiOutcome("admin", "otp_verify", false, 401, "invalid_otp");
             cb(errResp("Invalid OTP", 401));
             return;
         }
         consumeOtp(phone, code);
-        issueToken();
+        auto &app = AppContext::instance();
+        if (app.redis && app.redis->connected()) {
+            app.redis->deleteKey(redisKey, [finishVerified]() { finishVerified(); });
+            return;
+        }
+        finishVerified();
     });
 }
 

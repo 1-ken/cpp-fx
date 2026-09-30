@@ -62,6 +62,8 @@ class MarketHub {
     void setAlertSink(std::function<void(std::shared_ptr<std::vector<FlatPair>>)> sink) {
         alertSink_ = std::move(sink);
     }
+    // Fired on each live quote (coalesce at the consumer). Independent of the snapshot tick.
+    void setQuoteSink(std::function<void(FlatPair)> sink) { quoteSink_ = std::move(sink); }
 
     void onSpot(const ctrader::SpotUpdate &update);
     void start(trantor::EventLoop *loop);
@@ -78,6 +80,9 @@ class MarketHub {
     bool cachedTrendbar(const std::string &canonicalPair,
                         const std::string &interval,
                         ctrader::TrendbarData &out) const;
+
+    std::shared_ptr<Json::Value> lastGroupedSnapshot() const;
+    uint64_t snapshotSeq() const { return snapshotSeq_.load(); }
 
     std::string lastSnapshotTs() const;
     double lastSnapshotAgeSeconds() const;
@@ -104,6 +109,8 @@ class MarketHub {
         double ask = 0;
         bool hasAsk = false;
         std::string tsIso;
+        Json::Value item;
+        bool itemReady = false;
     };
 
     void tick();
@@ -116,11 +123,14 @@ class MarketHub {
     std::function<void(std::function<void()>)> dbExecutor_;
     std::function<void(std::shared_ptr<Json::Value>)> broadcastSink_;
     std::function<void(std::shared_ptr<std::vector<FlatPair>>)> alertSink_;
+    std::function<void(FlatPair)> quoteSink_;
 
     mutable std::mutex mu_;
     std::map<int64_t, PairState> states_;
     std::map<std::string, ctrader::TrendbarData> trendbarCache_;
     std::string lastSnapshotTs_;
+    std::shared_ptr<Json::Value> lastGrouped_;
+    std::atomic<uint64_t> snapshotSeq_{0};
     std::atomic<int> snapshotFailureCount_{0};
     std::atomic<int> activeWs_{0};
     bool marketClosedLogged_ = false;

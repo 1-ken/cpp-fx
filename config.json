@@ -38,7 +38,7 @@
   "redisPubsubEnabled": false,
   "notificationDlqKey": "fx:alerts:notifications:dlq",
   "postgresDsn": "postgresql://user:password@localhost:5432/observer",
-  "postgresConnNum": 2,
+  "postgresConnNum": 4,
   "archiveIntervalSeconds": 60,
   "archiveBatchSize": 200,
   "candleCheckIntervalSeconds": 2.0,

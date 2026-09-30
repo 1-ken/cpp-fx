@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdlib>
 #include <json/json.h>
 #include <memory>
 
@@ -12,7 +14,9 @@
 #include "services/PostgresService.h"
 #include "services/SubscriptionService.h"
 #include "core/AppContext.h"
+#include "core/Metrics.h"
 #include "util/TimeUtil.h"
+#include "util/Uuid.h"
 
 namespace ctraderplus::services {
 
@@ -224,23 +228,84 @@ void NotificationQueue::dispatchAllChannels(const alerts::TriggeredAlert &t,
     }
 }
 
+std::string NotificationQueue::idempotencyKey(const alerts::Alert &alert) {
+    return alert.id + "|" + alert.triggeredAt.value_or("") + "|" + alert.status;
+}
+
 void NotificationQueue::configure(const core::Config &cfg, Notifier *notifier,
                                   RedisService *redis, trantor::EventLoop *workerLoop) {
     cfg_ = &cfg;
     notifier_ = notifier;
     redis_ = redis;
     loop_ = workerLoop;
+    if (runId_.empty()) {
+        runId_ = util::generateUuid();
+        if (runId_.empty()) runId_ = "local";
+    }
+}
+
+std::string NotificationQueue::jobPayload(const Job &job) const {
+    Json::Value root = job.triggered.alert.toJson();
+    root["current_price"] = job.triggered.currentPrice;
+    root["timeframe"] = job.triggered.timeframe;
+    root["alert_type_label"] = job.triggered.alertTypeLabel;
+    root["idem"] = job.idem;
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    return Json::writeString(wb, root);
+}
+
+void NotificationQueue::noteStreamId(const std::string &idem, const std::string &streamId) {
+    if (idem.empty() || streamId.empty()) return;
+    bool alreadyDone = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (deliveredIdems_.count(idem)) alreadyDone = true;
+        else streamIds_[idem] = streamId;
+    }
+    if (alreadyDone && redis_) redis_->ackStream(streamKey_, streamGroup_, streamId);
+}
+
+void NotificationQueue::ackIdem(const std::string &idem) {
+    std::string id;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = streamIds_.find(idem);
+        if (it == streamIds_.end()) return;
+        id = it->second;
+        streamIds_.erase(it);
+    }
+    if (redis_) redis_->ackStream(streamKey_, streamGroup_, id);
 }
 
 void NotificationQueue::enqueue(alerts::TriggeredAlert triggered) {
     if (!loop_ || !notifier_) return;
+    const std::string idem = idempotencyKey(triggered.alert);
+    Job job;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        if (deliveredIdems_.count(idem) || queuedIdems_.count(idem)) return;
         tryMergeCallIntoPendingLocked(triggered);
-        if (triggered.alert.effectiveChannels().empty()) {
-            return;
+        if (triggered.alert.effectiveChannels().empty()) return;
+        queuedIdems_.insert(idem);
+        job.triggered = std::move(triggered);
+        job.idem = idem;
+        pending_.push_back(job);
+        core::Metrics::instance().notificationQueueDepth.store(static_cast<int>(pending_.size()),
+                                                               std::memory_order_relaxed);
+    }
+    bool mirrorExternal = false;
+    for (const auto &channel : job.triggered.alert.effectiveChannels()) {
+        if (channel != "sound") {
+            mirrorExternal = true;
+            break;
         }
-        pending_.push_back(Job{std::move(triggered), 0});
+    }
+    if (mirrorExternal && redis_ && redis_->connected()) {
+        redis_->streamAdd(streamKey_, jobPayload(job), idem, runId_,
+                          [this, idem](std::optional<std::string> id) {
+                              if (id) noteStreamId(idem, *id);
+                          });
     }
     loop_->queueInLoop([this]() { pump(); });
 }
@@ -252,9 +317,14 @@ void NotificationQueue::pump() {
         Job job;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            if (pending_.empty()) return;
+            if (pending_.empty()) {
+                core::Metrics::instance().notificationQueueDepth.store(0, std::memory_order_relaxed);
+                return;
+            }
             job = std::move(pending_.front());
             pending_.pop_front();
+            core::Metrics::instance().notificationQueueDepth.store(
+                static_cast<int>(pending_.size()), std::memory_order_relaxed);
         }
         processJob(job);
     }
@@ -265,12 +335,35 @@ void NotificationQueue::pump() {
 }
 
 void NotificationQueue::processJob(Job job) {
-    alerts::TriggeredAlert triggered = std::move(job.triggered);
-    auto onDone = [this, job = std::move(job), triggered](bool ok) mutable {
-        if (ok) return;
+    alerts::TriggeredAlert triggered = job.triggered;
+    const std::string idem = job.idem.empty() ? idempotencyKey(triggered.alert) : job.idem;
+    job.idem = idem;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (deliveredIdems_.count(idem)) {
+            // Already handed to a provider for this alert revision.
+        }
+    }
+    if (redis_ && redis_->connected() && job.attempts == 0) {
+        redis_->setStringEx("fx:alerts:idem:" + idem, "done", 7 * 24 * 3600, [](bool) {});
+    }
+    auto onDone = [this, job = std::move(job), triggered, idem](bool ok) mutable {
+        if (ok) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                deliveredIdems_.insert(idem);
+                queuedIdems_.erase(idem);
+            }
+            ackIdem(idem);
+            return;
+        }
         ++job.attempts;
+        core::Metrics::instance().notificationRetryTotal.fetch_add(1, std::memory_order_relaxed);
         if (job.attempts < cfg_->notificationMaxRetries) {
-            double delay = cfg_->notificationRetryDelaySeconds;
+            const double base = std::max(0.1, cfg_->notificationRetryDelaySeconds);
+            double delay = base * std::pow(2.0, static_cast<double>(job.attempts - 1));
+            const double jitter = 0.5 + (static_cast<double>(std::rand() % 1000) / 1000.0);
+            delay = std::min(60.0, delay * jitter);
             job.triggered = triggered;
             loop_->runAfter(delay, [this, j = std::move(job)]() mutable {
                 {
@@ -281,6 +374,11 @@ void NotificationQueue::processJob(Job job) {
             });
             return;
         }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            queuedIdems_.erase(idem);
+        }
+        ackIdem(idem);
         pushDlq(triggered.alert);
     };
     dispatchAllChannels(triggered, onDone);
@@ -291,10 +389,69 @@ void NotificationQueue::pushDlq(const alerts::Alert &a) {
     Json::Value j = a.toJson();
     Json::StreamWriterBuilder wb;
     wb["indentation"] = "";
-    redis_->pushJson(cfg_->notificationDlqKey, Json::writeString(wb, j));
+    const std::string payload = Json::writeString(wb, j);
+    redis_->pushJson(cfg_->notificationDlqKey, payload);
+    redis_->streamAdd(cfg_->notificationDlqKey + ":stream", payload, idempotencyKey(a), runId_,
+                      {});
+    core::Metrics::instance().notificationDlqDepth.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NotificationQueue::handleStreamMessages(std::vector<RedisService::StreamMessage> msgs) {
+    for (auto &msg : msgs) {
+        if (msg.runId == runId_) {
+            noteStreamId(msg.idem, msg.id);
+            continue;
+        }
+        if (!redis_) continue;
+        redis_->getString("fx:alerts:idem:" + msg.idem,
+                          [this, msg](std::optional<std::string> stored) {
+                              if (stored && *stored == "done") {
+                                  redis_->ackStream(streamKey_, streamGroup_, msg.id);
+                                  return;
+                              }
+                              Json::Value alertJson;
+                              Json::CharReaderBuilder b;
+                              std::unique_ptr<Json::CharReader> rd(b.newCharReader());
+                              std::string errs;
+                              if (!rd->parse(msg.payload.c_str(), msg.payload.c_str() + msg.payload.size(),
+                                             &alertJson, &errs)) {
+                                  redis_->ackStream(streamKey_, streamGroup_, msg.id);
+                                  return;
+                              }
+                              alerts::TriggeredAlert t;
+                              t.alert = alerts::Alert::fromJson(alertJson);
+                              t.currentPrice = alertJson.get("current_price", 0).asDouble();
+                              t.timeframe = alertJson.get("timeframe", "").asString();
+                              t.alertTypeLabel = alertJson.get("alert_type_label", "price").asString();
+                              noteStreamId(msg.idem.empty() ? idempotencyKey(t.alert) : msg.idem, msg.id);
+                              enqueue(std::move(t));
+                          });
+    }
+}
+
+void NotificationQueue::startStreamLoop() {
+    if (!loop_ || !redis_ || streamStarted_) return;
+    streamStarted_ = true;
+    redis_->ensureStreamGroup(streamKey_, streamGroup_);
+    redis_->ensureStreamGroup(cfg_->notificationDlqKey + ":stream", streamGroup_);
+    auto again = std::make_shared<std::function<void()>>();
+    *again = [this, again]() {
+        if (!loop_) return;
+        if (!redis_ || !redis_->connected()) {
+            loop_->runAfter(1.0, [again]() { (*again)(); });
+            return;
+        }
+        redis_->readStreamGroup(streamKey_, streamGroup_, runId_, 16, 1000,
+                                [this, again](std::vector<RedisService::StreamMessage> msgs) {
+                                    if (!msgs.empty()) handleStreamMessages(std::move(msgs));
+                                    if (loop_) loop_->runAfter(0.05, [again]() { (*again)(); });
+                                });
+    };
+    loop_->queueInLoop([again]() { (*again)(); });
 }
 
 void NotificationQueue::startDlqRetryLoop() {
+    startStreamLoop();
     if (!loop_ || !redis_ || !notifier_) return;
     const double interval = std::max(1.0, cfg_->notificationRetryDelaySeconds);
     const std::string dlqKey = cfg_->notificationDlqKey;

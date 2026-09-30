@@ -19,4 +19,13 @@ bool withPostgres(const std::function<void(services::PostgresService &)> &fn) {
     return true;
 }
 
+void runOnDbWorker(std::function<void()> fn) {
+    auto &app = AppContext::instance();
+    if (app.dbExec) {
+        app.dbExec(std::move(fn));
+        return;
+    }
+    fn();
+}
+
 }  // namespace ctraderplus::core

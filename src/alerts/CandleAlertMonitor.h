@@ -1,13 +1,16 @@
 #pragma once
 
 #include <cstdint>
+#include <ctime>
+#include <deque>
 #include <functional>
-#include <map>
 #include <mutex>
 #include <optional>
-#include <set>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <json/json.h>
 
@@ -47,8 +50,13 @@ class CandleAlertMonitor {
     struct SubKey {
         int64_t symbolId = 0;
         int period = 0;
-        bool operator<(const SubKey &o) const {
-            return std::tie(symbolId, period) < std::tie(o.symbolId, o.period);
+        bool operator==(const SubKey &o) const {
+            return symbolId == o.symbolId && period == o.period;
+        }
+    };
+    struct SubKeyHash {
+        std::size_t operator()(const SubKey &k) const {
+            return std::hash<int64_t>{}((k.symbolId << 8) ^ static_cast<int64_t>(k.period));
         }
     };
 
@@ -57,7 +65,20 @@ class CandleAlertMonitor {
         ctrader::TrendbarData bar{};
     };
 
-    std::set<SubKey> requiredSubscriptions() const;
+    struct WarmJob {
+        SubKey key;
+        std::string canon;
+        std::string interval;
+    };
+
+    struct BarCacheEntry {
+        std::time_t fetchedAt = 0;
+        std::vector<ctrader::TrendbarData> bars;
+    };
+
+    std::unordered_set<SubKey, SubKeyHash> requiredSubscriptions() const;
+    void enqueueWarm(WarmJob job);
+    void pumpWarm();
     void evaluateCandles(const std::vector<Json::Value> &candles);
     void dispatchTriggered(const std::vector<TriggeredAlert> &triggered);
     void processLiveTrendbar(int64_t symbolId, const ctrader::TrendbarData &tb);
@@ -72,9 +93,12 @@ class CandleAlertMonitor {
     DispatchFn dispatch_;
 
     mutable std::mutex mu_;
-    std::set<SubKey> subscribed_;
-    std::map<SubKey, BarTrack> barState_;
-    std::map<SubKey, std::pair<std::string, std::string>> meta_;  // canon, interval
+    std::unordered_set<SubKey, SubKeyHash> subscribed_;
+    std::unordered_map<SubKey, BarTrack, SubKeyHash> barState_;
+    std::unordered_map<SubKey, std::pair<std::string, std::string>, SubKeyHash> meta_;
+    std::deque<WarmJob> warmQueue_;
+    int warmInFlight_ = 0;
+    std::unordered_map<SubKey, BarCacheEntry, SubKeyHash> warmCache_;
 };
 
 }  // namespace ctraderplus::alerts

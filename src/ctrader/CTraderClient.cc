@@ -11,6 +11,7 @@
 
 #include <trantor/utils/Logger.h>
 
+#include "core/Metrics.h"
 #include "ctrader/CTraderAuth.h"
 #include "ctrader/ProtoUtil.h"
 #include "util/HostResolve.h"
@@ -203,7 +204,11 @@ void CTraderClient::onConnection(const trantor::TcpConnectionPtr &conn) {
         ready_.store(false);
         state_ = State::Disconnected;
         subscribedSpotIds_.clear();
-        pendingTrendbars_.clear();
+        if (!pendingTrendbars_.empty()) {
+            core::Metrics::instance().ctraderInflight.fetch_sub(
+                static_cast<int>(pendingTrendbars_.size()), std::memory_order_relaxed);
+            pendingTrendbars_.clear();
+        }
         if (stateCb_) stateCb_(false);
         scheduleReconnect();
     }
@@ -694,7 +699,11 @@ void CTraderClient::handleOaError(const std::string &code, const std::string &de
 
 void CTraderClient::forceDisconnectAndReconnect(double minDelaySeconds) {
     subscribedSpotIds_.clear();
-    pendingTrendbars_.clear();
+    if (!pendingTrendbars_.empty()) {
+        core::Metrics::instance().ctraderInflight.fetch_sub(
+            static_cast<int>(pendingTrendbars_.size()), std::memory_order_relaxed);
+        pendingTrendbars_.clear();
+    }
     ready_.store(false);
     state_ = State::Disconnected;
     if (conn_) conn_->shutdown();
@@ -721,6 +730,12 @@ void CTraderClient::getTrendbars(int64_t symbolId, int period, int64_t fromMs,
             cb(std::move(r));
             return;
         }
+        core::Metrics::instance().ctraderInflight.fetch_add(1, std::memory_order_relaxed);
+        auto tracked = [cb = std::move(cb)](TrendbarsResult result) {
+            core::Metrics::instance().ctraderInflight.fetch_sub(1, std::memory_order_relaxed);
+            if (cb) cb(std::move(result));
+        };
+        cb = std::move(tracked);
         std::string id = nextClientMsgId();
         ProtoOAGetTrendbarsReq req;
         req.set_ctidtraderaccountid(cfg_.accountId);

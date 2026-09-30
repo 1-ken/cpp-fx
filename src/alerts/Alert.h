@@ -90,6 +90,9 @@ struct Alert {
     // After arming from a queue, require condition unmet once before trigger is allowed.
     bool requireUnmetSinceArm = false;
 
+    mutable bool channelsCached_ = false;
+    mutable std::vector<std::string> cachedChannels_;
+
     // In-app sound is always delivered alongside any chosen channel.
     void ensureSoundChannel() {
         if (std::find(channels.begin(), channels.end(), "sound") == channels.end()) {
@@ -102,17 +105,23 @@ struct Alert {
         if (channels.empty()) channels.push_back("sound");
         ensureSoundChannel();
         channel = channels.front();
+        channelsCached_ = false;
     }
 
-    std::vector<std::string> effectiveChannels() const {
-        std::vector<std::string> out;
-        if (!channels.empty())
-            out = channels;
-        else if (!channel.empty())
-            out = {channel};
-        if (std::find(out.begin(), out.end(), "sound") == out.end()) out.push_back("sound");
-        if (out.empty()) out.push_back("sound");
-        return out;
+    const std::vector<std::string> &effectiveChannels() const {
+        if (!channelsCached_) {
+            cachedChannels_.clear();
+            if (!channels.empty())
+                cachedChannels_ = channels;
+            else if (!channel.empty())
+                cachedChannels_ = {channel};
+            if (std::find(cachedChannels_.begin(), cachedChannels_.end(), "sound") ==
+                cachedChannels_.end())
+                cachedChannels_.push_back("sound");
+            if (cachedChannels_.empty()) cachedChannels_.push_back("sound");
+            channelsCached_ = true;
+        }
+        return cachedChannels_;
     }
 
     Json::Value toJson() const {

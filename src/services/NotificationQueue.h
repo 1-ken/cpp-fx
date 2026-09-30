@@ -6,15 +6,16 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <trantor/net/EventLoop.h>
 
 #include "alerts/AlertManager.h"
 #include "core/Config.h"
+#include "services/RedisService.h"
 
 namespace ctraderplus::services {
 class Notifier;
-class RedisService;
 }
 
 namespace ctraderplus::services {
@@ -29,10 +30,14 @@ class NotificationQueue {
 
     void startDlqRetryLoop();
 
+    static std::string idempotencyKey(const alerts::Alert &alert);
+
   private:
     struct Job {
         alerts::TriggeredAlert triggered;
         int attempts = 0;
+        std::string idem;
+        bool mirrored = false;
     };
 
     struct CallGate {
@@ -43,6 +48,11 @@ class NotificationQueue {
     void pump();
     void processJob(Job job);
     void pushDlq(const alerts::Alert &a);
+    void startStreamLoop();
+    void handleStreamMessages(std::vector<services::RedisService::StreamMessage> msgs);
+    void noteStreamId(const std::string &idem, const std::string &streamId);
+    void ackIdem(const std::string &idem);
+    std::string jobPayload(const Job &job) const;
 
     static std::string callCoalesceKey(const alerts::Alert &a);
     static bool alertHasCallChannel(const alerts::Alert &a);
@@ -62,6 +72,13 @@ class NotificationQueue {
     std::mutex mu_;
     std::deque<Job> pending_;
     std::unordered_map<std::string, CallGate> callGates_;
+    std::unordered_map<std::string, std::string> streamIds_;
+    std::unordered_set<std::string> queuedIdems_;
+    std::unordered_set<std::string> deliveredIdems_;
+    std::string runId_;
+    std::string streamKey_ = "fx:alerts:notifications";
+    std::string streamGroup_ = "notif";
+    bool streamStarted_ = false;
     bool pumping_ = false;
 
     static constexpr double kCallQuietWindowSeconds = 15.0;

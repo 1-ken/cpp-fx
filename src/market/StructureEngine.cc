@@ -145,6 +145,7 @@ class Engine {
 
     std::vector<StructureEvent> events_;
     std::string trend_;
+    const std::string &trend() const { return trend_; }
 
   private:
     double breakK_ = 0.25;
@@ -197,5 +198,67 @@ std::string structureKindKey(const std::string &kind) {
     if (kind == "SWEEP") return "sweep";
     return "bos";
 }
+
+struct IncrementalStructure::Impl {
+    StructureOptions opt;
+    FractalPivotDetector detector;
+    Engine engine;
+    std::vector<StructureEvent> events;
+    int index = 0;
+    int period = 14;
+    double sum = 0;
+    double atr = 0;
+    double prevClose = 0;
+    bool hasPrev = false;
+
+    explicit Impl(StructureOptions o)
+        : opt(o), detector(o.minSwingAtr), engine(o.breakK), period(o.atrPeriod > 0 ? o.atrPeriod : 14) {}
+
+    double nextAtr(const StructureCandle &c) {
+        const double tr = !hasPrev
+                              ? (c.high - c.low)
+                              : std::max({c.high - c.low, std::fabs(c.high - prevClose),
+                                          std::fabs(c.low - prevClose)});
+        if (index < period) {
+            sum += tr;
+            atr = sum / static_cast<double>(index + 1);
+        } else {
+            atr = (atr * (period - 1) + tr) / static_cast<double>(period);
+        }
+        prevClose = c.close;
+        hasPrev = true;
+        return atr;
+    }
+};
+
+IncrementalStructure::IncrementalStructure(StructureOptions opt)
+    : impl_(std::make_unique<Impl>(opt)) {}
+
+IncrementalStructure::IncrementalStructure(IncrementalStructure &&) noexcept = default;
+IncrementalStructure &IncrementalStructure::operator=(IncrementalStructure &&) noexcept = default;
+IncrementalStructure::~IncrementalStructure() = default;
+
+void IncrementalStructure::reset() {
+    StructureOptions opt = impl_->opt;
+    impl_ = std::make_unique<Impl>(opt);
+}
+
+std::vector<StructureEvent> IncrementalStructure::append(const StructureCandle &candle) {
+    const double a = impl_->nextAtr(candle);
+    const int index = impl_->index++;
+    auto evs = impl_->engine.onBar(candle, index, a);
+    auto pivot = impl_->detector.update(candle, index, a);
+    if (pivot) impl_->engine.onPivot(*pivot, a);
+    impl_->events.insert(impl_->events.end(), evs.begin(), evs.end());
+    return evs;
+}
+
+const std::vector<StructureEvent> &IncrementalStructure::events() const {
+    return impl_->events;
+}
+
+std::string IncrementalStructure::trend() const { return impl_->engine.trend(); }
+
+int IncrementalStructure::barsApplied() const { return impl_->index; }
 
 }  // namespace ctraderplus::market

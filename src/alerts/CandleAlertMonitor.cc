@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <ctime>
+#include <unordered_set>
 #include <vector>
 
 #include <trantor/utils/Logger.h>
@@ -57,14 +58,17 @@ void CandleAlertMonitor::onConnectionReady(bool ready) {
             subscribed_.clear();
             barState_.clear();
             meta_.clear();
+            warmQueue_.clear();
+            warmInFlight_ = 0;
             return;
         }
     }
     syncSubscriptions();
 }
 
-std::set<CandleAlertMonitor::SubKey> CandleAlertMonitor::requiredSubscriptions() const {
-    std::set<SubKey> needed;
+std::unordered_set<CandleAlertMonitor::SubKey, CandleAlertMonitor::SubKeyHash>
+CandleAlertMonitor::requiredSubscriptions() const {
+    std::unordered_set<SubKey, SubKeyHash> needed;
     if (!alerts_) return needed;
     for (const auto &a : alerts_->getActiveAlerts()) {
         if (!registry_) continue;
@@ -95,15 +99,15 @@ void CandleAlertMonitor::syncSubscriptions() {
     if (!ctrader_ || !ctrader_->isReady() || !util::isForexMarketOpen()) return;
 
     auto needed = requiredSubscriptions();
-    std::set<SubKey> toAdd;
-    std::set<SubKey> toRemove;
+    std::vector<SubKey> toAdd;
+    std::vector<SubKey> toRemove;
     {
         std::lock_guard<std::mutex> lk(mu_);
         for (const auto &k : needed) {
-            if (!subscribed_.count(k)) toAdd.insert(k);
+            if (!subscribed_.count(k)) toAdd.push_back(k);
         }
         for (const auto &k : subscribed_) {
-            if (!needed.count(k)) toRemove.insert(k);
+            if (!needed.count(k)) toRemove.push_back(k);
         }
     }
 
@@ -125,20 +129,76 @@ void CandleAlertMonitor::syncSubscriptions() {
             meta_[k] = {canon, iv};
             barState_.erase(k);
         }
-        int ivSec = util::intervalToSeconds(iv);
-        int64_t toMs = static_cast<int64_t>(std::time(nullptr)) * 1000;
-        ctrader_->getTrendbars(
-            k.symbolId, k.period, 0, toMs, 200,
-            [this, canon, iv, ivSec](ctrader::TrendbarsResult res) {
-                if (!res.ok || !alerts_) return;
+        enqueueWarm(WarmJob{k, canon, iv});
+    }
+}
+
+void CandleAlertMonitor::enqueueWarm(WarmJob job) {
+    constexpr int kWarmTtlSec = 60;
+    const std::time_t now = std::time(nullptr);
+    std::vector<ctrader::TrendbarData> cachedBars;
+    bool cacheHit = false;
+    const std::string canon = job.canon;
+    const std::string iv = job.interval;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = warmCache_.find(job.key);
+        if (it != warmCache_.end() && now - it->second.fetchedAt < kWarmTtlSec) {
+            cachedBars = it->second.bars;
+            cacheHit = true;
+        } else {
+            warmQueue_.push_back(std::move(job));
+        }
+    }
+    if (cacheHit) {
+        const int ivSec = util::intervalToSeconds(iv);
+        std::vector<Json::Value> hist;
+        for (const auto &bar : cachedBars) {
+            if (!isBarFullyClosed(bar, ivSec)) continue;
+            if (auto c = candleJsonFromBar(canon, iv, bar)) hist.push_back(*c);
+        }
+        if (!hist.empty() && alerts_) alerts_->ingestStructureHistory(canon, iv, hist);
+        return;
+    }
+    pumpWarm();
+}
+
+void CandleAlertMonitor::pumpWarm() {
+    constexpr int kMaxInFlight = 4;
+    WarmJob job;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (warmInFlight_ >= kMaxInFlight || warmQueue_.empty() || !ctrader_) return;
+        job = std::move(warmQueue_.front());
+        warmQueue_.pop_front();
+        ++warmInFlight_;
+    }
+    const int ivSec = util::intervalToSeconds(job.interval);
+    const int64_t toMs = static_cast<int64_t>(std::time(nullptr)) * 1000;
+    const SubKey key = job.key;
+    const std::string canon = job.canon;
+    const std::string iv = job.interval;
+    ctrader_->getTrendbars(
+        key.symbolId, key.period, 0, toMs, 200,
+        [this, key, canon, iv, ivSec](ctrader::TrendbarsResult res) {
+            if (res.ok) {
+                std::lock_guard<std::mutex> lk(mu_);
+                warmCache_[key] = BarCacheEntry{std::time(nullptr), res.bars};
+            }
+            if (res.ok && alerts_) {
                 std::vector<Json::Value> hist;
                 for (const auto &bar : res.bars) {
                     if (!isBarFullyClosed(bar, ivSec)) continue;
                     if (auto c = candleJsonFromBar(canon, iv, bar)) hist.push_back(*c);
                 }
                 if (!hist.empty()) alerts_->ingestStructureHistory(canon, iv, hist);
-            });
-    }
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (warmInFlight_ > 0) --warmInFlight_;
+            }
+            pumpWarm();
+        });
 }
 
 std::optional<Json::Value> CandleAlertMonitor::candleJsonFromBar(
@@ -221,7 +281,7 @@ void CandleAlertMonitor::pollFallback() {
     if (!ctrader_ || !ctrader_->isReady() || !util::isForexMarketOpen() || !alerts_) return;
 
     auto active = alerts_->getActiveAlerts();
-    std::set<SubKey> seen;
+    std::unordered_set<SubKey, SubKeyHash> seen;
     for (const auto &a : active) {
         std::string interval;
         if (a.alertType == "candle_close" && a.interval) {

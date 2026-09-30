@@ -1,7 +1,11 @@
 #include "controllers/WsObserveController.h"
 
 #include <algorithm>
+#include <chrono>
 #include <ctime>
+#include <map>
+#include <set>
+#include <tuple>
 #include <unordered_map>
 
 #include <trantor/utils/Logger.h>
@@ -11,6 +15,7 @@
 #include "core/AppContext.h"
 #include "core/Auth.h"
 #include "core/Config.h"
+#include "core/Metrics.h"
 #include "ctrader/CTraderClient.h"
 #include "ctrader/SymbolRegistry.h"
 #include "market/MarketHub.h"
@@ -23,7 +28,7 @@ using namespace drogon;
 namespace ctraderplus::controllers {
 
 std::mutex WsObserveController::connsMu_;
-std::set<WebSocketConnectionPtr> WsObserveController::conns_;
+std::vector<WebSocketConnectionPtr> WsObserveController::conns_;
 
 namespace {
 
@@ -88,7 +93,8 @@ Json::Value buildFormingForPair(const std::string &canon,
     return util::buildFormingCandleFromSpot(price, interval);
 }
 
-Json::Value enrich(const Json::Value &grouped, WsConnContext &ctx) {
+Json::Value enrich(const Json::Value &grouped, WsConnContext &ctx,
+                   const Json::Value *precomputedForming = nullptr) {
     auto &app = core::AppContext::instance();
     Json::Value payload = grouped;  // deep copy
 
@@ -99,7 +105,8 @@ Json::Value enrich(const Json::Value &grouped, WsConnContext &ctx) {
     // Optional pair filter + forming candle enrichment.
     if (ctx.pairCanon) {
         const std::string canon = *ctx.pairCanon;
-        Json::Value forming = buildFormingForPair(canon, ctx.interval, app.hub);
+        Json::Value forming = precomputedForming ? *precomputedForming
+                                                 : buildFormingForPair(canon, ctx.interval, app.hub);
         if (!forming.isNull()) {
             topForming = forming;
             chartLivePrice = forming.get("close", 0.0).asDouble();
@@ -226,9 +233,11 @@ void WsObserveController::handleNewConnection(const HttpRequestPtr &req,
         ctx->counted = true;
     }
     conn->setContext(ctx);
+    ctx->lastPong = std::chrono::steady_clock::now();
+    conn->setPingMessage("", std::chrono::seconds(10));
     {
         std::lock_guard<std::mutex> lk(connsMu_);
-        conns_.insert(conn);
+        conns_.push_back(conn);
     }
     trackWsOpen(ctx->userId, peerIp);
     const int userConns = countUserWsConnections(ctx->userId);
@@ -237,9 +246,12 @@ void WsObserveController::handleNewConnection(const HttpRequestPtr &req,
              << " pair=" << (ctx->pairCanon ? *ctx->pairCanon : "all") << ")";
 }
 
-void WsObserveController::handleNewMessage(const WebSocketConnectionPtr &,
-                                           std::string &&, const WebSocketMessageType &) {
-    // No inbound protocol; ignore client messages.
+void WsObserveController::handleNewMessage(const WebSocketConnectionPtr &conn,
+                                           std::string &&, const WebSocketMessageType &type) {
+    if (type != WebSocketMessageType::Pong && type != WebSocketMessageType::Ping) return;
+    if (!conn || !conn->hasContext()) return;
+    auto ctx = conn->getContext<WsConnContext>();
+    if (ctx) ctx->lastPong = std::chrono::steady_clock::now();
 }
 
 void WsObserveController::handleConnectionClosed(const WebSocketConnectionPtr &conn) {
@@ -252,34 +264,190 @@ void WsObserveController::handleConnectionClosed(const WebSocketConnectionPtr &c
         }
     }
     std::lock_guard<std::mutex> lk(connsMu_);
-    conns_.erase(conn);
+    conns_.erase(std::remove(conns_.begin(), conns_.end(), conn), conns_.end());
 }
+
+namespace {
+
+struct FanoutKey {
+    std::string interval;
+    std::string pair;
+    bool hasStreamParams = false;
+    std::string userId;
+    bool operator<(const FanoutKey &o) const {
+        return std::tie(interval, pair, hasStreamParams, userId) <
+               std::tie(o.interval, o.pair, o.hasStreamParams, o.userId);
+    }
+};
+
+bool sendWithBackpressure(const WebSocketConnectionPtr &conn, WsConnContext &ctx,
+                          std::string msg) {
+    auto &app = core::AppContext::instance();
+    const double timeout = app.config ? app.config->wsSendTimeoutSeconds : 3.0;
+    const auto now = std::chrono::steady_clock::now();
+    if (ctx.inflightBytes > 0 && timeout > 0) {
+        const double age =
+            std::chrono::duration<double>(now - ctx.inflightSince).count();
+        if (age > timeout) {
+            core::Metrics::instance().wsDroppedSlow.fetch_add(1, std::memory_order_relaxed);
+            LOG_WARN << "ws_dropped_slow user=" << core::hashUserIdForLog(ctx.userId)
+                     << " inflight_bytes=" << ctx.inflightBytes;
+            conn->forceClose();
+            return false;
+        }
+    }
+    if (ctx.inflightBytes == 0) ctx.inflightSince = now;
+    ctx.inflightBytes += msg.size();
+    const uint64_t ticket = ++ctx.sendTicket;
+    const std::size_t n = msg.size();
+    conn->send(msg);
+    auto loop = drogon::app().getLoop();
+    if (loop) {
+        loop->runAfter(0, [conn, ticket, n]() {
+            if (!conn || !conn->connected() || !conn->hasContext()) return;
+            auto held = conn->getContext<WsConnContext>();
+            if (!held || held->sendTicket != ticket) return;
+            if (held->inflightBytes >= n) held->inflightBytes -= n;
+            else held->inflightBytes = 0;
+            if (held->inflightBytes == 0) held->inflightSince = {};
+        });
+    }
+    return true;
+}
+
+}  // namespace
 
 void WsObserveController::broadcastToAll(std::shared_ptr<Json::Value> grouped) {
     if (!grouped) return;
+    const auto started = std::chrono::steady_clock::now();
     struct Target {
         WebSocketConnectionPtr conn;
         std::shared_ptr<WsConnContext> ctx;
     };
     std::vector<Target> snapshot;
-    snapshot.reserve(16);
+    std::vector<WebSocketConnectionPtr> silent;
     {
         std::lock_guard<std::mutex> lk(connsMu_);
+        const auto now = std::chrono::steady_clock::now();
+        const double timeout = core::AppContext::instance().config
+                                   ? core::AppContext::instance().config->wsSendTimeoutSeconds
+                                   : 3.0;
+        const double staleAfter = std::max(20.0, timeout + 10.0);
         snapshot.reserve(conns_.size());
+        for (auto it = conns_.begin(); it != conns_.end();) {
+            auto &conn = *it;
+            if (!conn || !conn->connected() || !conn->hasContext()) {
+                it = conns_.erase(it);
+                continue;
+            }
+            auto ctx = conn->getContext<WsConnContext>();
+            if (!ctx) {
+                it = conns_.erase(it);
+                continue;
+            }
+            const double quiet =
+                std::chrono::duration<double>(now - ctx->lastPong).count();
+            if (ctx->lastPong.time_since_epoch().count() != 0 && quiet > staleAfter) {
+                core::Metrics::instance().wsDroppedSlow.fetch_add(1, std::memory_order_relaxed);
+                LOG_WARN << "ws_dropped_silent user=" << core::hashUserIdForLog(ctx->userId);
+                silent.push_back(conn);
+                it = conns_.erase(it);
+                continue;
+            }
+            snapshot.push_back({conn, ctx});
+            ++it;
+        }
+    }
+    for (auto &conn : silent) {
+        if (conn) conn->forceClose();
+    }
+    core::Metrics::instance().wsClients.store(static_cast<int>(snapshot.size()),
+                                              std::memory_order_relaxed);
+
+    std::map<std::string, Json::Value> formingByKey;
+    auto formingFor = [&](const std::string &pair, const std::string &interval) -> Json::Value {
+        const std::string key = pair + "|" + interval;
+        auto it = formingByKey.find(key);
+        if (it == formingByKey.end()) {
+            it = formingByKey.emplace(key, buildFormingForPair(pair, interval,
+                                                               core::AppContext::instance().hub))
+                     .first;
+        }
+        return it->second;
+    };
+
+    std::map<FanoutKey, std::vector<Target>> groups;
+    for (auto &target : snapshot) {
+        FanoutKey key;
+        key.interval = target.ctx->interval;
+        key.hasStreamParams = target.ctx->hasStreamParams;
+        if (target.ctx->pairCanon) key.pair = *target.ctx->pairCanon;
+        if (!target.ctx->hasStreamParams) key.userId = target.ctx->userId;
+        groups[key].push_back(std::move(target));
+    }
+
+    for (auto &group : groups) {
+        if (group.second.empty() || !group.second.front().ctx) continue;
+        Json::Value forming(Json::nullValue);
+        const Json::Value *formingPtr = nullptr;
+        if (!group.first.pair.empty()) {
+            forming = formingFor(group.first.pair, group.first.interval);
+            formingPtr = &forming;
+        }
+        Json::Value payload = enrich(*grouped, *group.second.front().ctx, formingPtr);
+        for (std::size_t i = 1; i < group.second.size(); ++i) {
+            auto &ctx = *group.second[i].ctx;
+            ctx.lastAlertsRevision = group.second.front().ctx->lastAlertsRevision;
+            ctx.cachedAlerts = group.second.front().ctx->cachedAlerts;
+            ctx.hasCachedAlerts = group.second.front().ctx->hasCachedAlerts;
+        }
+        std::string wire;
+        try {
+            wire = toJsonString(payload);
+        } catch (const std::exception &e) {
+            LOG_WARN << "WebSocket broadcast failed: " << e.what();
+            continue;
+        }
+        for (auto &target : group.second) {
+            if (!target.conn || !target.conn->connected() || !target.ctx) continue;
+            try {
+                sendWithBackpressure(target.conn, *target.ctx, wire);
+            } catch (const std::exception &e) {
+                LOG_WARN << "WebSocket broadcast failed: " << e.what();
+            }
+        }
+    }
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - started)
+                        .count();
+    core::Metrics::instance().wsBroadcasts.fetch_add(1, std::memory_order_relaxed);
+    core::Metrics::instance().wsBroadcastDurationUs.fetch_add(
+        static_cast<uint64_t>(us > 0 ? us : 0), std::memory_order_relaxed);
+}
+
+void WsObserveController::pushTriggered(const std::string &userId, const Json::Value &frame) {
+    if (userId.empty()) return;
+    std::string wire;
+    try {
+        wire = toJsonString(frame);
+    } catch (const std::exception &e) {
+        LOG_WARN << "alert frame encode failed: " << e.what();
+        return;
+    }
+    std::vector<WebSocketConnectionPtr> targets;
+    {
+        std::lock_guard<std::mutex> lk(connsMu_);
         for (const auto &conn : conns_) {
             if (!conn || !conn->connected() || !conn->hasContext()) continue;
             auto ctx = conn->getContext<WsConnContext>();
-            if (!ctx) continue;
-            snapshot.push_back({conn, ctx});
+            if (ctx && ctx->userId == userId) targets.push_back(conn);
         }
     }
-    for (auto &target : snapshot) {
-        if (!target.conn || !target.conn->connected() || !target.ctx) continue;
+    for (auto &conn : targets) {
         try {
-            Json::Value payload = enrich(*grouped, *target.ctx);
-            target.conn->send(toJsonString(payload));
+            conn->send(wire);
         } catch (const std::exception &e) {
-            LOG_WARN << "WebSocket broadcast failed: " << e.what();
+            LOG_WARN << "alert frame send failed: " << e.what();
         }
     }
 }
