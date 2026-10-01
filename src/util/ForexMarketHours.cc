@@ -76,4 +76,27 @@ long long secondsUntilMarketOpens(std::time_t nowUtc) {
     return diff > 0 ? diff : 0;
 }
 
+std::optional<std::time_t> forexSessionStart(std::time_t ts) {
+    if (ts <= 0 || !isForexMarketOpen(ts)) return std::nullopt;
+    std::tm tmv{};
+#if defined(_WIN32)
+    gmtime_s(&tmv, &ts);
+#else
+    gmtime_r(&ts, &tmv);
+#endif
+    std::tm start = tmv;
+    start.tm_hour = 22;
+    start.tm_min = 0;
+    start.tm_sec = 0;
+    // Before today's rollover the session opened at yesterday's 22:00 UTC.
+    if (tmv.tm_hour < 22) start.tm_mday -= 1;
+#if defined(_WIN32)
+    std::time_t startTime = _mkgmtime(&start);
+#else
+    std::time_t startTime = timegm(&start);
+#endif
+    if (startTime == static_cast<std::time_t>(-1)) return std::nullopt;
+    return startTime;
+}
+
 }  // namespace ctraderplus::util

@@ -321,6 +321,221 @@ static void testIncrementalMatchesFull() {
     }
 }
 
+static void testForexSessionStart() {
+    auto at = [](const char *iso) {
+        auto t = util::parseIso8601(iso);
+        CHECK(t.has_value());
+        return *t;
+    };
+    auto start = util::forexSessionStart(at("2026-06-03T12:00:00"));  // Wednesday
+    CHECK(start && *start == at("2026-06-02T22:00:00"));
+    auto rolled = util::forexSessionStart(at("2026-06-03T22:00:00"));
+    CHECK(rolled && *rolled == at("2026-06-03T22:00:00"));
+    auto before = util::forexSessionStart(at("2026-06-03T21:55:00"));
+    CHECK(before && *before == at("2026-06-02T22:00:00"));
+    CHECK(!util::forexSessionStart(at("2026-06-05T22:00:00")));  // Friday close
+    CHECK(!util::forexSessionStart(at("2026-06-06T12:00:00")));  // Saturday
+    CHECK(!util::forexSessionStart(at("2026-06-07T21:00:00")));  // Sunday before open
+    auto sun = util::forexSessionStart(at("2026-06-07T22:00:00"));
+    CHECK(sun && *sun == at("2026-06-07T22:00:00"));
+    auto month = util::forexSessionStart(at("2026-06-01T10:00:00"));  // Monday
+    CHECK(month && *month == at("2026-05-31T22:00:00"));
+}
+
+static Json::Value testCandle(const char *pair, const char *interval, const char *ts, double o,
+                              double h, double l, double c) {
+    Json::Value v;
+    v["pair"] = pair;
+    v["interval"] = interval;
+    v["timestamp"] = ts;
+    v["open"] = o;
+    v["high"] = h;
+    v["low"] = l;
+    v["close"] = c;
+    return v;
+}
+
+static std::vector<Json::Value> structureFixture(const char *interval, const char *breakTs) {
+    const char *warm[] = {"2026-06-03T21:30:00", "2026-06-03T21:35:00", "2026-06-03T21:40:00",
+                          "2026-06-03T21:45:00", "2026-06-03T21:50:00", "2026-06-03T21:55:00"};
+    struct Bar {
+        double o, h, l, c;
+    };
+    const Bar bars[] = {
+        {100, 101, 99, 100}, {100, 105, 100, 104}, {104, 104.2, 102, 103},
+        {103, 103, 98, 99},  {99, 100, 95, 96},    {96, 98, 96, 97},
+        {97, 108, 97, 107},
+    };
+    std::vector<Json::Value> out;
+    for (int i = 0; i < 6; ++i)
+        out.push_back(testCandle("EURUSD", interval, warm[i], bars[i].o, bars[i].h, bars[i].l,
+                                 bars[i].c));
+    out.push_back(testCandle("EURUSD", interval, breakTs, 97, 108, 97, 107));
+    return out;
+}
+
+static void feedCandles(alerts::AlertManager &mgr, const std::vector<Json::Value> &candles) {
+    for (const auto &c : candles) mgr.checkCandleAlerts({c});
+}
+
+static alerts::Alert makeSessionAlert(const std::string &id,
+                                      const std::vector<std::string> &intervals) {
+    alerts::Alert a;
+    a.id = id;
+    a.userId = "user";
+    a.pair = "EURUSD";
+    a.alertType = "structure_session";
+    a.status = "active";
+    a.createdAt = "2026-06-03T20:00:00";
+    a.intervals = intervals;
+    a.interval = intervals.front();
+    a.structureEvents = {"bos", "choch", "sweep"};
+    a.structureDirection = "bull";
+    a.minSwingAtr = 0;
+    a.breakK = 0;
+    a.sessionStepIndex = 0;
+    auto sess = util::forexSessionStart(*util::parseIso8601("2026-06-03T22:00:00"));
+    a.sessionStart = util::toIso8601(*sess);
+    a.channels = {"sound"};
+    a.normalizeChannels();
+    return a;
+}
+
+static void testStructureSessionAlert() {
+    alerts::AlertManager mgr;
+    auto alert = makeSessionAlert("sess-1", {"5m"});
+    mgr.cacheAlert(alert);
+    int fires = 0;
+    mgr.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++fires; });
+
+    auto bars = structureFixture("5m", "2026-06-03T22:00:00");
+    feedCandles(mgr, std::vector<Json::Value>(bars.begin(), bars.end() - 1));
+    CHECK(fires == 0);
+    auto mid = mgr.getAlert("sess-1");
+    CHECK(mid && mid->status == "active" && mid->sessionStepIndex == 0);
+    CHECK(!mid->lastFiredSession);
+
+    mgr.checkCandleAlerts({bars.back()});
+    CHECK(fires == 1);
+    auto fired = mgr.getAlert("sess-1");
+    CHECK(fired && fired->status == "active");
+    CHECK(fired->lastFiredSession.has_value());
+    CHECK(fired->triggeredAt.has_value());
+
+    mgr.checkCandleAlerts(
+        {testCandle("EURUSD", "5m", "2026-06-03T22:05:00", 107, 107, 94, 94)});
+    CHECK(fires == 1);
+
+    mgr.checkCandleAlerts(
+        {testCandle("EURUSD", "5m", "2026-06-04T22:05:00", 107, 107.2, 106.8, 107)});
+    auto nextDay = mgr.getAlert("sess-1");
+    CHECK(nextDay && nextDay->sessionStepIndex == 0);
+    CHECK(fires == 1);
+    auto nextStart = util::forexSessionStart(*util::parseIso8601("2026-06-04T22:05:00"));
+    auto stored = util::parseIso8601(*nextDay->sessionStart);
+    CHECK(nextStart && stored && *nextStart == *stored);
+
+    alerts::AlertManager restarted;
+    int fires2 = 0;
+    restarted.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++fires2; });
+    restarted.cacheAlert(alerts::Alert::fromJson(fired->toJson()));
+    feedCandles(restarted, bars);
+    CHECK(fires2 == 0);
+    auto kept = restarted.getAlert("sess-1");
+    CHECK(kept && kept->status == "active" && kept->lastFiredSession == fired->lastFiredSession);
+}
+
+static void testStructureSessionSteps() {
+    alerts::AlertManager mgr;
+    mgr.cacheAlert(makeSessionAlert("sess-mtf", {"5m", "15m"}));
+    int fires = 0;
+    mgr.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++fires; });
+
+    auto higherFirst = structureFixture("15m", "2026-06-03T22:30:00");
+    feedCandles(mgr, higherFirst);
+    auto blocked = mgr.getAlert("sess-mtf");
+    CHECK(blocked && blocked->sessionStepIndex == 0);
+    CHECK(fires == 0);
+
+    alerts::AlertManager ordered;
+    ordered.cacheAlert(makeSessionAlert("sess-ord", {"5m", "15m"}));
+    int orderedFires = 0;
+    ordered.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++orderedFires; });
+    auto low = structureFixture("5m", "2026-06-03T22:00:00");
+    feedCandles(ordered, std::vector<Json::Value>(low.begin(), low.end() - 1));
+    const char *highWarm[] = {"2026-06-03T22:00:00", "2026-06-03T22:15:00", "2026-06-03T22:30:00",
+                              "2026-06-03T22:45:00", "2026-06-03T23:00:00", "2026-06-03T23:15:00"};
+    struct Bar {
+        double o, h, l, c;
+    };
+    const Bar shape[] = {
+        {100, 101, 99, 100}, {100, 105, 100, 104}, {104, 104.2, 102, 103},
+        {103, 103, 98, 99},  {99, 100, 95, 96},    {96, 98, 96, 97},
+    };
+    for (int i = 0; i < 6; ++i) {
+        ordered.checkCandleAlerts(
+            {testCandle("EURUSD", "15m", highWarm[i], shape[i].o, shape[i].h, shape[i].l,
+                        shape[i].c)});
+    }
+    CHECK(ordered.getAlert("sess-ord")->sessionStepIndex == 0);
+    ordered.checkCandleAlerts({low.back()});
+    auto stepped = ordered.getAlert("sess-ord");
+    CHECK(stepped && stepped->sessionStepIndex == 1);
+    CHECK(orderedFires == 0);
+    CHECK(stepped->stepFiredAt && *stepped->stepFiredAt == "2026-06-03T22:00:00");
+
+    ordered.checkCandleAlerts(
+        {testCandle("EURUSD", "15m", "2026-06-03T23:30:00", 97, 108, 97, 107)});
+    CHECK(orderedFires == 1);
+    auto done = ordered.getAlert("sess-ord");
+    CHECK(done && done->status == "active" && done->lastFiredSession.has_value());
+
+    ordered.checkCandleAlerts(
+        {testCandle("EURUSD", "5m", "2026-06-05T22:30:00", 100, 101, 99, 100)});
+    auto weekend = ordered.getAlert("sess-ord");
+    CHECK(weekend && weekend->sessionStepIndex == done->sessionStepIndex);
+    CHECK(orderedFires == 1);
+
+    alerts::AlertManager partial;
+    partial.cacheAlert(makeSessionAlert("sess-partial", {"5m", "15m"}));
+    feedCandles(partial, low);
+    CHECK(partial.getAlert("sess-partial")->sessionStepIndex == 1);
+    partial.checkCandleAlerts(
+        {testCandle("EURUSD", "5m", "2026-06-04T22:05:00", 100, 101, 99, 100)});
+    auto reset = partial.getAlert("sess-partial");
+    CHECK(reset && reset->sessionStepIndex == 0);
+    CHECK(!reset->stepFiredAt);
+}
+
+static void testMarketStructureUnchangedBySession() {
+    alerts::AlertManager mgr;
+    alerts::Alert a;
+    a.id = "struct-old";
+    a.userId = "user";
+    a.pair = "EURUSD";
+    a.alertType = "market_structure";
+    a.status = "active";
+    a.createdAt = "2026-06-03T20:00:00";
+    a.interval = "5m";
+    a.structureEvents = {"bos", "choch", "sweep"};
+    a.structureDirection = "bull";
+    a.minSwingAtr = 0;
+    a.breakK = 0;
+    a.channels = {"sound"};
+    a.normalizeChannels();
+    mgr.cacheAlert(a);
+    int fires = 0;
+    mgr.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
+        ++fires;
+        CHECK(t.alertTypeLabel == "market_structure");
+        CHECK(t.alert.status == "triggered");
+    });
+    feedCandles(mgr, structureFixture("5m", "2026-06-03T22:00:00"));
+    CHECK(fires == 1);
+    auto got = mgr.getAlert("struct-old");
+    CHECK(got && got->status == "triggered");
+}
+
 static void testAlertReplayFiresOnce() {
     alerts::AlertManager mgr;
     alerts::Alert a;
@@ -363,6 +578,7 @@ int main() {
     testPairNormalizer();
     testIntervals();
     testMarketHours();
+    testForexSessionStart();
     testTimeRoundTrip();
     testKenyaDateTime();
     testSymbolClassification();
@@ -376,6 +592,9 @@ int main() {
     testMarketStructureBosChoch();
     testIncrementalMatchesFull();
     testAlertReplayFiresOnce();
+    testStructureSessionAlert();
+    testStructureSessionSteps();
+    testMarketStructureUnchangedBySession();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

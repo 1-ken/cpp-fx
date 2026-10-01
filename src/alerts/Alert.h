@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <optional>
 #include <string>
 #include <vector>
@@ -17,7 +18,7 @@ struct Alert {
     std::string pair;
     std::string status = "active";  // active, waiting, triggered, disabled, expired
     std::string createdAt;
-    std::string alertType = "price";  // price | candle_close | prev_day_level | market_structure
+    std::string alertType = "price";  // price | candle_close | prev_day_level | market_structure | structure_session
     std::string channel = "email";    // primary / legacy single channel
     std::vector<std::string> channels;  // email | sms | call | sound
     std::string email;
@@ -51,6 +52,14 @@ struct Alert {
     std::optional<std::string> structureDirection;  // bull | bear | any
     std::optional<double> minSwingAtr;
     std::optional<double> breakK;
+
+    // structure_session: first matching structure event of each 22:00 UTC forex day.
+    // intervals are lowest timeframe first. Status stays active across days.
+    std::vector<std::string> intervals;
+    std::optional<std::string> sessionStart;
+    int sessionStepIndex = 0;
+    std::optional<std::string> stepFiredAt;
+    std::optional<std::string> lastFiredSession;
 
     bool hasDolTrigger(const std::string &trig) const {
         if (dolTriggers.empty()) return trig == "sweep";
@@ -165,6 +174,14 @@ struct Alert {
             structureDirection ? Json::Value(*structureDirection) : Json::Value::null;
         v["min_swing_atr"] = minSwingAtr ? Json::Value(*minSwingAtr) : Json::Value::null;
         v["break_k"] = breakK ? Json::Value(*breakK) : Json::Value::null;
+        Json::Value ivArr(Json::arrayValue);
+        for (const auto &iv : intervals) ivArr.append(iv);
+        v["intervals"] = intervals.empty() ? Json::Value::null : ivArr;
+        v["session_start"] = sessionStart ? Json::Value(*sessionStart) : Json::Value::null;
+        v["session_step_index"] = sessionStepIndex;
+        v["step_fired_at"] = stepFiredAt ? Json::Value(*stepFiredAt) : Json::Value::null;
+        v["last_fired_session"] =
+            lastFiredSession ? Json::Value(*lastFiredSession) : Json::Value::null;
         v["depends_on_alert_id"] =
             dependsOnAlertId ? Json::Value(*dependsOnAlertId) : Json::Value::null;
         v["chain_id"] = chainId ? Json::Value(*chainId) : Json::Value::null;
@@ -240,6 +257,15 @@ struct Alert {
         a.structureDirection = optStr("structure_direction");
         a.minSwingAtr = optNum("min_swing_atr");
         a.breakK = optNum("break_k");
+        a.intervals = parseStringList("intervals");
+        for (auto &iv : a.intervals) {
+            std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+        }
+        a.sessionStart = optStr("session_start");
+        a.stepFiredAt = optStr("step_fired_at");
+        a.lastFiredSession = optStr("last_fired_session");
+        if (v.isMember("session_step_index") && v["session_step_index"].isNumeric())
+            a.sessionStepIndex = v["session_step_index"].asInt();
         a.dependsOnAlertId = optStr("depends_on_alert_id");
         a.chainId = optStr("chain_id");
         a.sequenceIndex = optInt("sequence_index");

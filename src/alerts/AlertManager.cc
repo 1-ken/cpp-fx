@@ -20,6 +20,7 @@
 #include "market/StructureEngine.h"
 #include "services/PostgresService.h"
 #include "services/RedisService.h"
+#include "util/ForexMarketHours.h"
 #include "util/PairNormalizer.h"
 #include "util/TimeUtil.h"
 
@@ -275,6 +276,13 @@ void AlertManager::rebuildIndexes() {
             std::string iv = *a.interval;
             std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
             activeCandleIndex_[candleIndexKey(key, iv)].push_back(a.id);
+        } else if (a.alertType == "structure_session") {
+            for (const auto &raw : a.intervals) {
+                std::string iv = raw;
+                std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+                if (iv.empty()) continue;
+                activeCandleIndex_[candleIndexKey(key, iv)].push_back(a.id);
+            }
         } else if (a.alertType == "prev_day_level") {
             // An alert can select both live and daily-close triggers.
             if (a.wantsDailyDolClose()) {
@@ -692,6 +700,106 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
     return a;
 }
 
+Alert AlertManager::createStructureSessionAlert(
+    const std::string &pair, const std::vector<std::string> &intervals,
+    const std::vector<std::string> &structureEvents, const std::string &structureDirection,
+    const std::string &userId, const std::string &email, const std::vector<std::string> &channels,
+    const std::string &phone, const std::string &customMessage, const std::string &expiresAt,
+    std::optional<double> minSwingAtr, std::optional<double> breakK) {
+    if (!postgres_) throw std::runtime_error("Database unavailable");
+    if (intervals.empty())
+        throw std::invalid_argument("intervals must include at least one timeframe");
+    std::vector<std::string> normalizedIntervals;
+    for (const auto &raw : intervals) {
+        std::string iv = raw;
+        std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+        if (iv == "1d" || intervalSeconds(iv) == 0 || intervalSeconds(iv) > intervalSeconds("4h"))
+            throw std::invalid_argument(
+                "Invalid interval. Session alerts support 1m, 5m, 15m, 30m, 1h, 4h");
+        if (std::find(normalizedIntervals.begin(), normalizedIntervals.end(), iv) ==
+            normalizedIntervals.end())
+            normalizedIntervals.push_back(iv);
+    }
+    std::sort(normalizedIntervals.begin(), normalizedIntervals.end(),
+              [](const std::string &lhs, const std::string &rhs) {
+                  return intervalSeconds(lhs) < intervalSeconds(rhs);
+              });
+    if (structureEvents.empty())
+        throw std::invalid_argument("structure_event must include at least one event");
+    std::vector<std::string> normalizedEvents;
+    for (const auto &raw : structureEvents) {
+        std::string ev = raw;
+        std::transform(ev.begin(), ev.end(), ev.begin(), ::tolower);
+        if (ev == "any") {
+            normalizedEvents = {"bos", "choch", "sweep"};
+            break;
+        }
+        if (ev != "bos" && ev != "choch" && ev != "sweep")
+            throw std::invalid_argument("structure_event must be bos, choch, or sweep");
+        if (std::find(normalizedEvents.begin(), normalizedEvents.end(), ev) ==
+            normalizedEvents.end())
+            normalizedEvents.push_back(ev);
+    }
+    std::string dir = structureDirection;
+    std::transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
+    if (dir != "bull" && dir != "bear" && dir != "any")
+        throw std::invalid_argument("structure_direction must be bull, bear, or any");
+    if (normalizedIntervals.size() > 1 && dir == "any")
+        throw std::invalid_argument(
+            "structure_direction must be bull or bear when more than one timeframe is selected");
+
+    Alert a;
+    a.id = newUuid();
+    a.userId = userId;
+    std::string canon = util::canonicalPair(pair);
+    a.pair = canon.empty() ? pair : canon;
+    a.alertType = "structure_session";
+    a.intervals = normalizedIntervals;
+    a.interval = normalizedIntervals.front();
+    a.structureEvents = normalizedEvents;
+    a.structureDirection = dir;
+    a.minSwingAtr = minSwingAtr.value_or(0);
+    a.breakK = breakK.value_or(0.25);
+    a.sessionStepIndex = 0;
+    const std::time_t now = std::time(nullptr);
+    if (auto sess = util::forexSessionStart(now)) {
+        a.sessionStart = util::toIso8601(*sess);
+    } else {
+        const long long wait = util::secondsUntilMarketOpens(now);
+        a.sessionStart = util::toIso8601(now + static_cast<std::time_t>(wait));
+    }
+    a.email = email;
+    a.channels = channels;
+    a.normalizeChannels();
+    a.phone = phone;
+    a.customMessage = customMessage;
+    a.expiresAt = expiresAt;
+    a.createdAt = util::nowIso8601();
+    a.status = "active";
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_[a.id] = a;
+        rebuildIndexes();
+    }
+    if (!persistAlertSync(a)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.erase(a.id);
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
+    }
+    bumpUserRevision(a.userId);
+    notifySubscriptionChange();
+    std::string ivLog;
+    for (size_t i = 0; i < normalizedIntervals.size(); ++i) {
+        if (i) ivLog += ">";
+        ivLog += normalizedIntervals[i];
+    }
+    LOG_INFO << "Created structure_session alert " << a.id << " " << a.pair << " " << ivLog
+             << " " << dir << " session=" << a.sessionStart.value_or("");
+    return a;
+}
+
 void AlertManager::ingestStructureHistory(const std::string &pair, const std::string &interval,
                                           const std::vector<Json::Value> &candles) {
     std::string iv = interval;
@@ -856,6 +964,18 @@ std::optional<Alert> AlertManager::updateAlert(const std::string &id,
                 a.normalizeChannels();
             } else {
                 setStr("channel", a.channel);
+                a.normalizeChannels();
+            }
+            setStr("email", a.email);
+            setStr("phone", a.phone);
+            setStr("custom_message", a.customMessage);
+            setStr("status", a.status);
+        } else {
+            if (updates.isMember("channels") && updates["channels"].isArray()) {
+                a.channels.clear();
+                for (const auto &c : updates["channels"]) {
+                    if (c.isString() && !c.asString().empty()) a.channels.push_back(c.asString());
+                }
                 a.normalizeChannels();
             }
             setStr("email", a.email);
@@ -1206,6 +1326,82 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
     return notified;
 }
 
+AlertManager::SessionStepResult AlertManager::evalStructureSessionLocked(
+    Alert &a, const std::string &interval, const Json::Value &candle,
+    const std::string &candleTsStr, StructureTrack &track) {
+    if (a.intervals.empty()) return SessionStepResult::Unchanged;
+    auto candleStart = parseCandleTs(candle["timestamp"]);
+    if (!candleStart) return SessionStepResult::Unchanged;
+    const int ivSec = intervalSeconds(interval);
+    auto createdAt = util::parseIso8601(a.createdAt);
+    if (ivSec > 0 && createdAt && *candleStart + ivSec <= *createdAt)
+        return SessionStepResult::Unchanged;
+
+    auto candleSession = util::forexSessionStart(*candleStart);
+    if (!candleSession) return SessionStepResult::Unchanged;
+    auto stored = a.sessionStart ? util::parseIso8601(*a.sessionStart) : std::nullopt;
+    bool rolled = false;
+    if (!stored || *candleSession > *stored) {
+        a.sessionStart = util::toIso8601(*candleSession);
+        a.sessionStepIndex = 0;
+        a.stepFiredAt.reset();
+        stored = candleSession;
+        rolled = true;
+    } else if (*candleSession < *stored) {
+        return SessionStepResult::Unchanged;
+    }
+    if (a.lastFiredSession) {
+        auto fired = util::parseIso8601(*a.lastFiredSession);
+        if (fired && stored && *fired == *stored)
+            return rolled ? SessionStepResult::Updated : SessionStepResult::Unchanged;
+    }
+    if (a.sessionStepIndex < 0 ||
+        a.sessionStepIndex >= static_cast<int>(a.intervals.size())) {
+        return rolled ? SessionStepResult::Updated : SessionStepResult::Unchanged;
+    }
+    std::string want = a.intervals[static_cast<size_t>(a.sessionStepIndex)];
+    std::transform(want.begin(), want.end(), want.begin(), ::tolower);
+    if (want != interval) return rolled ? SessionStepResult::Updated : SessionStepResult::Unchanged;
+    if (a.stepFiredAt) {
+        auto prev = util::parseIso8601(*a.stepFiredAt);
+        if (prev && *candleStart <= *prev)
+            return rolled ? SessionStepResult::Updated : SessionStepResult::Unchanged;
+    }
+    if (track.candles.size() < 5) return rolled ? SessionStepResult::Updated : SessionStepResult::Unchanged;
+
+    market::StructureOptions opt;
+    opt.minSwingAtr = a.minSwingAtr.value_or(0);
+    opt.breakK = a.breakK.value_or(0.25);
+    auto &engine = structureEngine(track, opt);
+    bool matched = false;
+    for (const auto &ev : engine.events()) {
+        if (ev.timestamp != candleTsStr) continue;
+        const std::string keyKind = market::structureKindKey(ev.kind);
+        if (!a.matchesStructureEvent(keyKind)) continue;
+        const std::string dir = a.structureDirection.value_or("any");
+        if (dir != "any" && dir != ev.dir) continue;
+        matched = true;
+        break;
+    }
+    if (!matched) return rolled ? SessionStepResult::Updated : SessionStepResult::Unchanged;
+
+    a.stepFiredAt = candleTsStr;
+    const bool lastStep = a.sessionStepIndex + 1 >= static_cast<int>(a.intervals.size());
+    if (!lastStep) {
+        a.sessionStepIndex += 1;
+        if (!a.intervals.empty())
+            a.interval = a.intervals[static_cast<size_t>(a.sessionStepIndex)];
+        return SessionStepResult::Updated;
+    }
+    const double close = candle.get("close", 0.0).asDouble();
+    a.lastFiredSession = a.sessionStart;
+    a.triggeredAt = util::nowIso8601();
+    a.lastCheckedPrice = close;
+    a.closePrice = close;
+    a.sessionStepIndex = static_cast<int>(a.intervals.size());
+    return SessionStepResult::Triggered;
+}
+
 std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
     const std::vector<Json::Value> &candles) {
     std::vector<TriggeredAlert> triggered;
@@ -1232,6 +1428,7 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
         Alert before;
         Alert after;
         bool isTrigger = false;
+        bool durable = false;
     };
     std::vector<PersistBatch> toPersist;
     {
@@ -1345,6 +1542,40 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                     auto it = alerts_.find(alertId);
                     if (it == alerts_.end()) continue;
                     Alert &a = it->second;
+                    if (a.status == "active" && a.alertType == "structure_session") {
+                        if (isPastExpiry(a)) {
+                            Alert before = a;
+                            a.status = "expired";
+                            toPersist.push_back({before, a, true, true});
+                            LOG_INFO << "Expired structure_session alert " << a.id << " "
+                                     << a.pair << " (past expires_at)";
+                            continue;
+                        }
+                        Alert before = a;
+                        const auto step = evalStructureSessionLocked(a, k.interval, candle,
+                                                                     candleTsStr, track);
+                        if (step == SessionStepResult::Unchanged) continue;
+                        const double close = candle.get("close", 0.0).asDouble();
+                        if (step == SessionStepResult::Triggered) {
+                            TriggeredAlert t;
+                            t.alert = a;
+                            t.currentPrice = close;
+                            t.alertTypeLabel = "structure_session";
+                            std::string tf;
+                            for (size_t i = 0; i < a.intervals.size(); ++i) {
+                                if (i) tf += ">";
+                                tf += a.intervals[i];
+                            }
+                            t.timeframe = tf;
+                            triggered.push_back(t);
+                            toPersist.push_back({before, a, true, true});
+                            LOG_INFO << "Triggered structure_session alert " << a.id << " "
+                                     << a.pair << " close=" << close;
+                        } else {
+                            toPersist.push_back({before, a, false, true});
+                        }
+                        continue;
+                    }
                     if (a.status != "active" || a.alertType != "market_structure") continue;
                     if (isPastExpiry(a)) {
                         Alert before = a;
@@ -1440,6 +1671,19 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                 bumpUserRevision(after.userId);
                 if (!onTriggered_) return;
                 for (const auto &t : mine) onTriggered_(t);
+            });
+        } else if (batch.durable) {
+            Alert before = batch.before;
+            Alert after = batch.after;
+            persistAlertThen(after, [this, before, after](bool ok) {
+                if (!ok) {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    alerts_[after.id] = before;
+                    rebuildIndexes();
+                    LOG_ERROR << "Failed to persist structure session step " << after.id;
+                    return;
+                }
+                bumpUserRevision(after.userId);
             });
         } else {
             persistAlert(batch.after);

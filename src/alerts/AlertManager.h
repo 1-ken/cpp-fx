@@ -86,6 +86,16 @@ class AlertManager {
                           const std::optional<std::string> &batchId,
                           const std::string &expiresAt,
                           std::optional<std::string> dependsOnAlertId = std::nullopt);
+    Alert createStructureSessionAlert(const std::string &pair,
+                                      const std::vector<std::string> &intervals,
+                                      const std::vector<std::string> &structureEvents,
+                                      const std::string &structureDirection,
+                                      const std::string &userId, const std::string &email,
+                                      const std::vector<std::string> &channels,
+                                      const std::string &phone, const std::string &customMessage,
+                                      const std::string &expiresAt,
+                                      std::optional<double> minSwingAtr = std::nullopt,
+                                      std::optional<double> breakK = std::nullopt);
     Alert createStructureAlert(const std::string &pair, const std::string &interval,
                                const std::vector<std::string> &structureEvents,
                                const std::string &structureDirection,
@@ -160,6 +170,13 @@ class AlertManager {
                                                   const market::StructureOptions &opt);
 
     static int intervalSeconds(const std::string &interval);
+
+    enum class SessionStepResult { Unchanged, Updated, Triggered };
+    // Caller holds mu_. Mutates a when the session day rolls or a step matches.
+    SessionStepResult evalStructureSessionLocked(Alert &a, const std::string &interval,
+                                                 const Json::Value &candle,
+                                                 const std::string &candleTsStr,
+                                                 StructureTrack &track);
 
     // Same-day 1m lookback: if PDH/PDL already touched today, fire with that time.
     void scheduleSweepLookback(const std::string &alertId, int attempt,

@@ -72,14 +72,16 @@ CandleAlertMonitor::requiredSubscriptions() const {
     if (!alerts_) return needed;
     for (const auto &a : alerts_->getActiveAlerts()) {
         if (!registry_) continue;
-        std::string interval;
+        std::vector<std::string> intervals;
         if (a.alertType == "candle_close" && a.interval) {
-            interval = *a.interval;
+            intervals.push_back(*a.interval);
         } else if (a.alertType == "market_structure" && a.interval) {
-            interval = *a.interval;
+            intervals.push_back(*a.interval);
+        } else if (a.alertType == "structure_session") {
+            intervals = a.intervals;
         } else if (a.alertType == "prev_day_level") {
             if (!a.wantsDailyDolClose()) continue;
-            interval = "1d";  // displacement/reversal confirm on the daily close
+            intervals.push_back("1d");  // displacement/reversal confirm on the daily close
         } else {
             continue;
         }
@@ -88,9 +90,11 @@ CandleAlertMonitor::requiredSubscriptions() const {
             continue;
         auto symId = registry_->resolveId(a.pair);
         if (!symId) continue;
-        int period = util::intervalToTrendbarPeriod(interval);
-        if (period == 0) continue;
-        needed.insert(SubKey{*symId, period});
+        for (const auto &interval : intervals) {
+            int period = util::intervalToTrendbarPeriod(interval);
+            if (period == 0) continue;
+            needed.insert(SubKey{*symId, period});
+        }
     }
     return needed;
 }
@@ -283,19 +287,22 @@ void CandleAlertMonitor::pollFallback() {
     auto active = alerts_->getActiveAlerts();
     std::unordered_set<SubKey, SubKeyHash> seen;
     for (const auto &a : active) {
-        std::string interval;
+        std::vector<std::string> intervals;
         if (a.alertType == "candle_close" && a.interval) {
-            interval = *a.interval;
+            intervals.push_back(*a.interval);
         } else if (a.alertType == "market_structure" && a.interval) {
-            interval = *a.interval;
+            intervals.push_back(*a.interval);
+        } else if (a.alertType == "structure_session") {
+            intervals = a.intervals;
         } else if (a.alertType == "prev_day_level") {
             if (!a.wantsDailyDolClose()) continue;
-            interval = "1d";
+            intervals.push_back("1d");
         } else {
             continue;
         }
         auto symId = registry_->idForCanonical(a.pair);
         if (!symId) continue;
+        for (const auto &interval : intervals) {
         int period = util::intervalToTrendbarPeriod(interval);
         int ivSec = util::intervalToSeconds(interval);
         if (period == 0 || ivSec == 0) continue;
@@ -315,6 +322,7 @@ void CandleAlertMonitor::pollFallback() {
                 if (auto candle = candleJsonFromBar(canon, ivStr, *closed))
                     evaluateCandles({*candle});
             });
+        }
     }
 }
 
