@@ -473,6 +473,298 @@ static void testSessionAlertsStayIndependentPerPair() {
     CHECK(eurAfter->batchId == eur.batchId);
 }
 
+static alerts::Alert makeSweepAlert(const std::string &id, const std::vector<std::string> &kinds) {
+    alerts::Alert a;
+    a.id = id;
+    a.userId = "user";
+    a.pair = "EURUSD";
+    a.alertType = "sweep_confirm";
+    a.status = "active";
+    a.createdAt = "2026-06-03T20:00:00";
+    a.interval = "5m";
+    a.structureEvents = kinds;
+    a.structureDirection = "bear";
+    a.minSwingAtr = 0;
+    a.breakK = 0;
+    a.channels = {"sound"};
+    a.normalizeChannels();
+    return a;
+}
+
+static std::string barTime(int index) {
+    auto start = util::parseIso8601("2026-06-03T22:00:00");
+    return util::toIso8601(*start + static_cast<std::time_t>(index) * 300);
+}
+
+static Json::Value sweepBar(int index, double o, double h, double l, double c) {
+    const std::string ts = barTime(index);
+    return testCandle("EURUSD", "5m", ts.c_str(), o, h, l, c);
+}
+
+static std::vector<Json::Value> hourSwingBars(const char *pair) {
+    const double bars[][4] = {
+        {100, 101, 90, 100}, {100, 130, 100, 120}, {120, 125, 80, 115}, {115, 118, 100, 110},
+    };
+    auto origin = util::parseIso8601("2026-06-03T18:00:00");
+    std::vector<Json::Value> out;
+    for (int i = 0; i < 4; ++i) {
+        const std::string ts = util::toIso8601(*origin + static_cast<std::time_t>(i) * 3600);
+        out.push_back(testCandle(pair, "1h", ts.c_str(), bars[i][0], bars[i][1], bars[i][2], bars[i][3]));
+    }
+    return out;
+}
+
+static void seedHourSwings(alerts::AlertManager &mgr, const char *pair = "EURUSD") {
+    mgr.ingestStructureHistory(pair, "1h", hourSwingBars(pair));
+}
+
+static void testSweepConfirm() {
+    const double setup[][4] = {
+        {100, 101, 99, 100}, {100, 110, 100, 108}, {108, 109, 100, 102},
+        {102, 108, 95, 97},  {97, 100, 96, 99},    {99, 135, 98, 105},
+    };
+    alerts::AlertManager mgr;
+    mgr.cacheAlert(makeSweepAlert("sweep-1", {"bos", "choch", "cisd"}));
+    seedHourSwings(mgr);
+    int fires = 0;
+    mgr.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
+        ++fires;
+        CHECK(t.alert.status == "active");
+        CHECK(t.alertTypeLabel == "sweep_confirm");
+    });
+    for (int i = 0; i < 6; ++i) mgr.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    CHECK(fires == 0);
+    auto armed = mgr.getAlert("sweep-1");
+    CHECK(armed && armed->pendingDir && *armed->pendingDir == "bear");
+    CHECK(armed->pendingBars == 1);
+    CHECK(armed->pendingSweepLevel && *armed->pendingSweepLevel == 130);
+    CHECK(armed->sweptHighAt.has_value());
+
+    mgr.checkCandleAlerts({sweepBar(6, 105, 106, 90, 92)});
+    CHECK(fires == 1);
+    auto done = mgr.getAlert("sweep-1");
+    CHECK(done && done->status == "active");
+    CHECK(!done->pendingDir);
+    CHECK(done->triggeredAt.has_value());
+    mgr.checkCandleAlerts({sweepBar(6, 105, 106, 90, 92)});
+    CHECK(fires == 1);
+
+    alerts::AlertManager restarted;
+    int firesRestart = 0;
+    restarted.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++firesRestart; });
+    restarted.cacheAlert(alerts::Alert::fromJson(armed->toJson()));
+    seedHourSwings(restarted);
+    for (int i = 0; i < 6; ++i)
+        restarted.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    CHECK(firesRestart == 0);
+    restarted.checkCandleAlerts({sweepBar(6, 105, 106, 90, 92)});
+    CHECK(firesRestart == 1);
+
+    alerts::AlertManager wrongWay;
+    wrongWay.cacheAlert(makeSweepAlert("sweep-bull", {"bos", "choch"}));
+    seedHourSwings(wrongWay);
+    int wrongFires = 0;
+    wrongWay.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++wrongFires; });
+    for (int i = 0; i < 6; ++i)
+        wrongWay.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    wrongWay.checkCandleAlerts({sweepBar(6, 105, 115, 104, 111)});
+    CHECK(wrongFires == 0);
+    CHECK(!wrongWay.getAlert("sweep-bull")->pendingDir);
+
+    alerts::AlertManager cisd;
+    cisd.cacheAlert(makeSweepAlert("sweep-cisd", {"cisd"}));
+    seedHourSwings(cisd);
+    alerts::Alert bosOnly;
+    bosOnly.id = "bos-only";
+    bosOnly.userId = "user";
+    bosOnly.pair = "EURUSD";
+    bosOnly.alertType = "market_structure";
+    bosOnly.status = "active";
+    bosOnly.createdAt = "2026-06-03T20:00:00";
+    bosOnly.interval = "5m";
+    bosOnly.structureEvents = {"bos"};
+    bosOnly.structureDirection = "bear";
+    bosOnly.minSwingAtr = 0;
+    bosOnly.breakK = 0;
+    bosOnly.channels = {"sound"};
+    bosOnly.normalizeChannels();
+    cisd.cacheAlert(bosOnly);
+    int cisdFires = 0, bosFires = 0;
+    cisd.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
+        if (t.alert.id == "sweep-cisd") ++cisdFires;
+        if (t.alert.id == "bos-only") ++bosFires;
+    });
+    for (int i = 0; i < 6; ++i)
+        cisd.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    cisd.checkCandleAlerts({sweepBar(6, 100, 100.5, 96, 96)});
+    CHECK(cisdFires == 1);
+    CHECK(bosFires == 0);
+
+    alerts::AlertManager sameBar;
+    sameBar.cacheAlert(makeSweepAlert("sweep-same", {"bos"}));
+    seedHourSwings(sameBar);
+    int sameFires = 0;
+    sameBar.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++sameFires; });
+    for (int i = 0; i < 5; ++i)
+        sameBar.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    sameBar.checkCandleAlerts({sweepBar(5, 99, 135, 90, 90)});
+    sameBar.checkCandleAlerts({sweepBar(5, 99, 135, 90, 90)});
+    CHECK(sameFires == 1);
+
+    alerts::AlertManager late;
+    late.cacheAlert(makeSweepAlert("sweep-late", {"bos"}));
+    seedHourSwings(late);
+    int lateFires = 0;
+    late.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++lateFires; });
+    for (int i = 0; i < 6; ++i)
+        late.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    for (int i = 6; i < 18; ++i)
+        late.checkCandleAlerts({sweepBar(i, 105, 106, 100, 104)});
+    late.checkCandleAlerts({sweepBar(18, 104, 105, 90, 92)});
+    CHECK(lateFires == 0);
+
+    alerts::AlertManager inWindow;
+    inWindow.cacheAlert(makeSweepAlert("sweep-window", {"bos"}));
+    seedHourSwings(inWindow);
+    int windowFires = 0;
+    inWindow.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++windowFires; });
+    for (int i = 0; i < 6; ++i)
+        inWindow.checkCandleAlerts(
+            {sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    for (int i = 6; i < 16; ++i)
+        inWindow.checkCandleAlerts({sweepBar(i, 105, 106, 100, 104)});
+    inWindow.checkCandleAlerts({sweepBar(16, 104, 105, 90, 92)});
+    CHECK(windowFires == 1);
+
+    alerts::Alert eur = makeSweepAlert("sweep-eur", {"bos"});
+    alerts::Alert gbp = makeSweepAlert("sweep-gbp", {"bos"});
+    gbp.pair = "GBPUSD";
+    alerts::AlertManager pairs;
+    pairs.cacheAlert(eur);
+    pairs.cacheAlert(gbp);
+    seedHourSwings(pairs);
+    int pairFires = 0;
+    pairs.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
+        ++pairFires;
+        CHECK(t.alert.pair == "EURUSD");
+    });
+    for (int i = 0; i < 5; ++i)
+        pairs.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    pairs.checkCandleAlerts({sweepBar(5, 99, 135, 90, 90)});
+    CHECK(pairFires == 1);
+    CHECK(!pairs.getAlert("sweep-gbp")->pendingDir);
+
+    alerts::Alert gapAlert = makeSweepAlert("sweep-gap", {"bos"});
+    gapAlert.triggeredAt = barTime(6);
+    alerts::AlertManager gap;
+    gap.cacheAlert(gapAlert);
+    seedHourSwings(gap);
+    int gapFires = 0;
+    gap.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++gapFires; });
+    for (int i = 0; i < 5; ++i)
+        gap.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    gap.checkCandleAlerts({sweepBar(5, 99, 135, 90, 90)});
+    CHECK(gapFires == 0);
+    CHECK(!gap.getAlert("sweep-gap")->pendingDir);
+
+    alerts::AlertManager again;
+    again.cacheAlert(makeSweepAlert("sweep-again", {"bos"}));
+    seedHourSwings(again);
+    int againFires = 0;
+    again.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++againFires; });
+    for (int i = 0; i < 6; ++i)
+        again.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    auto armedAgain = again.getAlert("sweep-again");
+    auto firstSweepAt = armedAgain->pendingSweepAt;
+    again.checkCandleAlerts({sweepBar(6, 105, 140, 100, 110)});
+    CHECK(againFires == 0);
+    auto still = again.getAlert("sweep-again");
+    CHECK(still && still->pendingSweepAt == firstSweepAt);
+    CHECK(still->pendingBars == 2);
+
+    alerts::AlertManager restartedSweep;
+    restartedSweep.cacheAlert(alerts::Alert::fromJson(armedAgain->toJson()));
+    seedHourSwings(restartedSweep);
+    std::vector<Json::Value> prior;
+    for (int i = 0; i < 6; ++i)
+        prior.push_back(sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3]));
+    restartedSweep.ingestStructureHistory("EURUSD", "5m", prior);
+    restartedSweep.checkCandleAlerts({sweepBar(6, 105, 140, 100, 110)});
+    auto kept = restartedSweep.getAlert("sweep-again");
+    CHECK(kept && kept->pendingSweepAt == firstSweepAt);
+    CHECK(kept->pendingBars == 2);
+    CHECK(kept->pendingDir && *kept->pendingDir == "bear");
+
+    alerts::Alert anyDir = makeSweepAlert("sweep-replace", {"bos"});
+    anyDir.structureDirection = "any";
+    alerts::AlertManager replaced;
+    replaced.cacheAlert(anyDir);
+    seedHourSwings(replaced);
+    for (int i = 0; i < 6; ++i)
+        replaced.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    replaced.checkCandleAlerts({sweepBar(6, 99, 100, 70, 98)});
+    auto pending = replaced.getAlert("sweep-replace");
+    CHECK(pending && pending->pendingDir && *pending->pendingDir == "bull");
+    CHECK(pending->pendingSweepLevel && *pending->pendingSweepLevel == 80);
+
+    alerts::AlertManager fiveOnly;
+    fiveOnly.cacheAlert(makeSweepAlert("sweep-five", {"bos"}));
+    seedHourSwings(fiveOnly);
+    for (int i = 0; i < 5; ++i)
+        fiveOnly.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    fiveOnly.checkCandleAlerts({sweepBar(5, 99, 112, 98, 105)});
+    CHECK(!fiveOnly.getAlert("sweep-five")->pendingDir);
+
+    alerts::AlertManager unconfirmed;
+    unconfirmed.cacheAlert(makeSweepAlert("sweep-open-hour", {"bos"}));
+    auto partialHours = hourSwingBars("EURUSD");
+    partialHours.resize(2);
+    unconfirmed.ingestStructureHistory("EURUSD", "1h", partialHours);
+    for (int i = 0; i < 5; ++i)
+        unconfirmed.checkCandleAlerts(
+            {sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    unconfirmed.checkCandleAlerts({sweepBar(5, 99, 135, 98, 105)});
+    CHECK(!unconfirmed.getAlert("sweep-open-hour")->pendingDir);
+
+    alerts::AlertManager broken;
+    broken.cacheAlert(makeSweepAlert("sweep-broken", {"bos"}));
+    seedHourSwings(broken);
+    for (int i = 0; i < 4; ++i)
+        broken.checkCandleAlerts({sweepBar(i, 100, 101, 99, 100)});
+    broken.checkCandleAlerts({sweepBar(4, 100, 140, 99, 135)});
+    broken.checkCandleAlerts({sweepBar(5, 135, 145, 120, 125)});
+    CHECK(!broken.getAlert("sweep-broken")->pendingDir);
+
+    alerts::Alert bull = makeSweepAlert("sweep-bullish", {"bos"});
+    bull.structureDirection = "bull";
+    alerts::AlertManager bullish;
+    bullish.cacheAlert(bull);
+    seedHourSwings(bullish);
+    int bullFires = 0;
+    bullish.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++bullFires; });
+    const double bullBars[][4] = {
+        {100, 101, 99, 100}, {100, 110, 100, 108}, {108, 109, 100, 102},
+        {102, 103, 99, 101}, {101, 102, 70, 100},
+    };
+    for (int i = 0; i < 5; ++i)
+        bullish.checkCandleAlerts(
+            {sweepBar(i, bullBars[i][0], bullBars[i][1], bullBars[i][2], bullBars[i][3])});
+    CHECK(bullish.getAlert("sweep-bullish")->pendingDir &&
+          *bullish.getAlert("sweep-bullish")->pendingDir == "bull");
+    bullish.checkCandleAlerts({sweepBar(5, 100, 115, 99, 112)});
+    CHECK(bullFires == 1);
+
+    alerts::AlertManager liveHours;
+    liveHours.cacheAlert(makeSweepAlert("sweep-live-hour", {"bos"}));
+    for (const auto &bar : hourSwingBars("EURUSD")) liveHours.checkCandleAlerts({bar});
+    int liveFires = 0;
+    liveHours.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++liveFires; });
+    for (int i = 0; i < 6; ++i)
+        liveHours.checkCandleAlerts({sweepBar(i, setup[i][0], setup[i][1], setup[i][2], setup[i][3])});
+    liveHours.checkCandleAlerts({sweepBar(6, 105, 106, 90, 92)});
+    CHECK(liveFires == 1);
+}
+
 static void testStructureSessionSteps() {
     alerts::AlertManager mgr;
     mgr.cacheAlert(makeSessionAlert("sess-mtf", {"5m", "15m"}));
@@ -622,6 +914,7 @@ int main() {
     testAlertReplayFiresOnce();
     testStructureSessionAlert();
     testSessionAlertsStayIndependentPerPair();
+    testSweepConfirm();
     testStructureSessionSteps();
     testMarketStructureUnchangedBySession();
     if (g_failures == 0) {

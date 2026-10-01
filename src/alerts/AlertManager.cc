@@ -276,6 +276,9 @@ void AlertManager::rebuildIndexes() {
             std::string iv = *a.interval;
             std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
             activeCandleIndex_[candleIndexKey(key, iv)].push_back(a.id);
+        } else if (a.alertType == "sweep_confirm") {
+            activeCandleIndex_[candleIndexKey(key, "5m")].push_back(a.id);
+            activeCandleIndex_[candleIndexKey(key, "1h")].push_back(a.id);
         } else if (a.alertType == "structure_session") {
             for (const auto &raw : a.intervals) {
                 std::string iv = raw;
@@ -808,27 +811,7 @@ std::vector<Alert> AlertManager::createStructureSessionAlerts(
         built.push_back(std::move(a));
     }
 
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (const auto &a : built) alerts_[a.id] = a;
-        rebuildIndexes();
-    }
-
-    std::vector<std::string> persisted;
-    for (const auto &a : built) {
-        if (!persistAlertSync(a)) {
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                for (const auto &made : built) alerts_.erase(made.id);
-                rebuildIndexes();
-            }
-            for (const auto &id : persisted) persistDeleteSync(id);
-            throw std::runtime_error("Alert not persisted");
-        }
-        persisted.push_back(a.id);
-    }
-    bumpUserRevision(userId);
-    notifySubscriptionChange();
+    commitCreatedAlerts(built);
     std::string ivLog;
     for (size_t i = 0; i < spec.intervals.size(); ++i) {
         if (i) ivLog += ">";
@@ -850,6 +833,88 @@ Alert AlertManager::createStructureSessionAlert(
                                              userId, email, channels, phone, customMessage,
                                              expiresAt, minSwingAtr, breakK);
     return made.front();
+}
+
+void AlertManager::commitCreatedAlerts(const std::vector<Alert> &built) {
+    if (built.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const auto &a : built) alerts_[a.id] = a;
+        rebuildIndexes();
+    }
+    std::vector<std::string> persisted;
+    for (const auto &a : built) {
+        if (!persistAlertSync(a)) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                for (const auto &made : built) alerts_.erase(made.id);
+                rebuildIndexes();
+            }
+            for (const auto &id : persisted) persistDeleteSync(id);
+            throw std::runtime_error("Alert not persisted");
+        }
+        persisted.push_back(a.id);
+    }
+    bumpUserRevision(built.front().userId);
+    notifySubscriptionChange();
+}
+
+std::vector<Alert> AlertManager::createSweepConfirmAlerts(
+    const std::vector<std::string> &pairs, const std::vector<std::string> &confirmations,
+    const std::string &direction, const std::string &userId, const std::string &email,
+    const std::vector<std::string> &channels, const std::string &phone,
+    const std::string &customMessage, const std::string &expiresAt,
+    std::optional<double> minSwingAtr, std::optional<double> breakK) {
+    if (!postgres_) throw std::runtime_error("Database unavailable");
+    if (confirmations.empty())
+        throw std::invalid_argument("Select at least one confirmation");
+    std::vector<std::string> kinds;
+    for (const auto &raw : confirmations) {
+        std::string ev = raw;
+        std::transform(ev.begin(), ev.end(), ev.begin(), ::tolower);
+        if (ev != "bos" && ev != "choch" && ev != "cisd")
+            throw std::invalid_argument("confirmation must be bos, choch, or cisd");
+        if (std::find(kinds.begin(), kinds.end(), ev) == kinds.end()) kinds.push_back(ev);
+    }
+    std::string dir = direction;
+    std::transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
+    if (dir != "bull" && dir != "bear" && dir != "any")
+        throw std::invalid_argument("structure_direction must be bull, bear, or any");
+    const std::vector<std::string> unique = util::uniqueCanonicalPairs(pairs);
+    if (unique.empty()) throw std::invalid_argument("At least one pair is required");
+    if (unique.size() > 20) throw std::invalid_argument("Select at most 20 pairs");
+
+    const std::string createdAt = util::nowIso8601();
+    std::optional<std::string> batchId;
+    if (unique.size() > 1) batchId = newUuid();
+    std::vector<Alert> built;
+    built.reserve(unique.size());
+    for (const auto &pair : unique) {
+        Alert a;
+        a.id = newUuid();
+        a.userId = userId;
+        a.pair = pair;
+        a.alertType = "sweep_confirm";
+        a.interval = "5m";
+        a.structureEvents = kinds;
+        a.structureDirection = dir;
+        a.minSwingAtr = minSwingAtr.value_or(0);
+        a.breakK = breakK.value_or(0.25);
+        a.batchId = batchId;
+        a.email = email;
+        a.channels = channels;
+        a.normalizeChannels();
+        a.phone = phone;
+        a.customMessage = customMessage;
+        a.expiresAt = expiresAt;
+        a.createdAt = createdAt;
+        a.status = "active";
+        built.push_back(std::move(a));
+    }
+    commitCreatedAlerts(built);
+    LOG_INFO << "Created " << built.size() << " sweep_confirm alert(s) dir=" << dir
+             << (batchId ? (" batch=" + *batchId) : "");
+    return built;
 }
 
 void AlertManager::ingestStructureHistory(const std::string &pair, const std::string &interval,
@@ -1378,6 +1443,236 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
     return notified;
 }
 
+namespace {
+constexpr int kSweepConfirmWindow = 12;
+constexpr int kSweepConfirmGapSec = 15 * 60;
+
+double deliveryRunOpen(const std::vector<market::StructureCandle> &candles,
+                       const std::string &sweepTs, bool upRun) {
+    int idx = -1;
+    for (int i = static_cast<int>(candles.size()) - 1; i >= 0; --i) {
+        if (candles[static_cast<size_t>(i)].timestamp == sweepTs) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) return 0;
+    int run = idx;
+    for (int i = idx - 1; i >= 0; --i) {
+        const auto &bar = candles[static_cast<size_t>(i)];
+        const bool up = bar.close > bar.open;
+        const bool down = bar.close < bar.open;
+        if (upRun ? up : down)
+            run = i;
+        else
+            break;
+    }
+    return candles[static_cast<size_t>(run)].open;
+}
+
+struct HourSwing {
+    bool ok = false;
+    double price = 0;
+    std::string at;
+};
+
+struct HourSwings {
+    HourSwing high;
+    HourSwing low;
+};
+
+// Latest 1h fractal swing that no later close has broken. Hours that are still
+// open at fiveOpen are ignored, so the swing exists only after its confirming
+// hour has closed.
+HourSwings latestUnbrokenHourSwings(const std::vector<market::StructureCandle> &hours,
+                                    const std::vector<market::StructureCandle> &fives,
+                                    std::time_t fiveOpen) {
+    struct ClosedHour {
+        market::StructureCandle bar;
+        std::time_t start = 0;
+    };
+    std::vector<ClosedHour> closed;
+    closed.reserve(hours.size());
+    for (const auto &bar : hours) {
+        auto start = util::parseIso8601(bar.timestamp);
+        if (!start || *start + 3600 > fiveOpen) continue;
+        closed.push_back({bar, *start});
+    }
+    auto brokenAfter = [&](std::size_t pivot, double price, bool highLevel, std::time_t confirmedClose) {
+        for (std::size_t j = pivot + 1; j < closed.size(); ++j) {
+            const double c = closed[j].bar.close;
+            if (highLevel ? c > price : c < price) return true;
+        }
+        for (const auto &bar : fives) {
+            auto start = util::parseIso8601(bar.timestamp);
+            if (!start || *start + 300 <= confirmedClose) continue;
+            if (highLevel ? bar.close > price : bar.close < price) return true;
+        }
+        return false;
+    };
+    HourSwings out;
+    for (std::size_t i = 1; i + 1 < closed.size(); ++i) {
+        const auto &prev = closed[i - 1].bar;
+        const auto &mid = closed[i].bar;
+        const auto &next = closed[i + 1].bar;
+        const std::time_t confirmedClose = closed[i + 1].start + 3600;
+        if (mid.high > prev.high && mid.high > next.high &&
+            !brokenAfter(i, mid.high, true, confirmedClose)) {
+            out.high = {true, mid.high, mid.timestamp};
+        }
+        if (mid.low < prev.low && mid.low < next.low &&
+            !brokenAfter(i, mid.low, false, confirmedClose)) {
+            out.low = {true, mid.low, mid.timestamp};
+        }
+    }
+    return out;
+}
+
+bool wantsKind(const Alert &a, const std::string &kind) {
+    return std::find(a.structureEvents.begin(), a.structureEvents.end(), kind) !=
+           a.structureEvents.end();
+}
+}  // namespace
+
+AlertManager::SessionStepResult AlertManager::evalSweepConfirmLocked(
+    Alert &a, const Json::Value &candle, const std::string &candleTsStr, StructureTrack &track) {
+    if (a.lastEvaluatedCandleTime && *a.lastEvaluatedCandleTime == candleTsStr)
+        return SessionStepResult::Unchanged;
+    auto candleStart = parseCandleTs(candle["timestamp"]);
+    const int ivSec = intervalSeconds("5m");
+    auto createdAt = util::parseIso8601(a.createdAt);
+    if (candleStart && createdAt && *candleStart + ivSec <= *createdAt) {
+        a.lastEvaluatedCandleTime = candleTsStr;
+        return SessionStepResult::Unchanged;
+    }
+    a.lastEvaluatedCandleTime = candleTsStr;
+    if (track.candles.size() < 5) return SessionStepResult::Unchanged;
+
+    market::StructureOptions opt;
+    opt.minSwingAtr = a.minSwingAtr.value_or(0);
+    opt.breakK = a.breakK.value_or(0.25);
+    auto &engine = structureEngine(track, opt);
+    bool sweepBear = false, sweepBull = false;
+    bool bosBear = false, bosBull = false, chochBear = false, chochBull = false;
+    double sweepLevelBear = 0, sweepLevelBull = 0;
+    std::string sweepHighAt, sweepLowAt;
+    for (const auto &ev : engine.events()) {
+        if (ev.timestamp != candleTsStr) continue;
+        const std::string kind = market::structureKindKey(ev.kind);
+        if (kind == "bos" && ev.dir == "bear") {
+            bosBear = true;
+        } else if (kind == "bos" && ev.dir == "bull") {
+            bosBull = true;
+        } else if (kind == "choch" && ev.dir == "bear") {
+            chochBear = true;
+        } else if (kind == "choch" && ev.dir == "bull") {
+            chochBull = true;
+        }
+    }
+    const double high = candle.get("high", 0.0).asDouble();
+    const double low = candle.get("low", 0.0).asDouble();
+    const double close = candle.get("close", 0.0).asDouble();
+    if (candleStart) {
+        const std::string hourKey = candleIndexKey(util::canonicalPair(a.pair), "1h");
+        auto hourIt = structureTracks_.find(hourKey);
+        if (hourIt != structureTracks_.end()) {
+            const auto levels =
+                latestUnbrokenHourSwings(hourIt->second.candles, track.candles, *candleStart);
+            if (levels.high.ok && high > levels.high.price && close < levels.high.price &&
+                (!a.sweptHighAt || *a.sweptHighAt != levels.high.at)) {
+                sweepBear = true;
+                sweepLevelBear = levels.high.price;
+                sweepHighAt = levels.high.at;
+            }
+            if (levels.low.ok && low < levels.low.price && close > levels.low.price &&
+                (!a.sweptLowAt || *a.sweptLowAt != levels.low.at)) {
+                sweepBull = true;
+                sweepLevelBull = levels.low.price;
+                sweepLowAt = levels.low.at;
+            }
+        }
+    }
+    const std::string want = a.structureDirection.value_or("any");
+    bool changed = false;
+    bool fired = false;
+
+    auto clearPending = [&]() {
+        if (!a.pendingDir && !a.pendingSweepAt && a.pendingBars == 0) return;
+        a.pendingDir.reset();
+        a.pendingSweepAt.reset();
+        a.pendingSweepLevel.reset();
+        a.pendingRunOpen.reset();
+        a.pendingBars = 0;
+        changed = true;
+    };
+    auto confirmed = [&](const std::string &dir) {
+        if (dir == "bear") {
+            if (wantsKind(a, "bos") && bosBear) return true;
+            if (wantsKind(a, "choch") && chochBear) return true;
+            if (wantsKind(a, "cisd") && a.pendingRunOpen && close < *a.pendingRunOpen) return true;
+        } else if (dir == "bull") {
+            if (wantsKind(a, "bos") && bosBull) return true;
+            if (wantsKind(a, "choch") && chochBull) return true;
+            if (wantsKind(a, "cisd") && a.pendingRunOpen && close > *a.pendingRunOpen) return true;
+        }
+        return false;
+    };
+    auto oppositeBreak = [&](const std::string &dir) {
+        if (dir == "bear") return bosBull || chochBull;
+        if (dir == "bull") return bosBear || chochBear;
+        return false;
+    };
+    auto tryFire = [&]() {
+        if (fired || !a.pendingDir) return;
+        if (a.triggeredAt && candleStart) {
+            auto last = util::parseIso8601(*a.triggeredAt);
+            if (last && *candleStart + ivSec < *last + kSweepConfirmGapSec) {
+                clearPending();
+                return;
+            }
+        }
+        if (candleStart)
+            a.triggeredAt = util::toIso8601(*candleStart + ivSec);
+        else
+            a.triggeredAt = util::nowIso8601();
+        a.lastCheckedPrice = close;
+        a.closePrice = close;
+        clearPending();
+        fired = true;
+    };
+
+    if (a.pendingDir && a.pendingSweepAt && *a.pendingSweepAt != candleTsStr) {
+        a.pendingBars += 1;
+        changed = true;
+        if (a.pendingBars > kSweepConfirmWindow) clearPending();
+    }
+    if (a.pendingDir && a.pendingBars <= kSweepConfirmWindow) {
+        if (oppositeBreak(*a.pendingDir))
+            clearPending();
+        else if (confirmed(*a.pendingDir))
+            tryFire();
+    }
+    const bool allowBear = want == "any" || want == "bear";
+    const bool allowBull = want == "any" || want == "bull";
+    if (!fired && ((sweepBear && allowBear) || (sweepBull && allowBull))) {
+        const bool bear = sweepBear && allowBear;
+        a.pendingDir = bear ? "bear" : "bull";
+        a.pendingSweepAt = candleTsStr;
+        a.pendingSweepLevel = bear ? sweepLevelBear : sweepLevelBull;
+        a.pendingRunOpen = deliveryRunOpen(track.candles, candleTsStr, bear);
+        a.pendingBars = 1;
+        if (bear)
+            a.sweptHighAt = sweepHighAt;
+        else
+            a.sweptLowAt = sweepLowAt;
+        changed = true;
+        if (confirmed(*a.pendingDir)) tryFire();
+    }
+    if (fired) return SessionStepResult::Triggered;
+    if (changed) return SessionStepResult::Updated;
+    return SessionStepResult::Unchanged;
+}
+
 AlertManager::SessionStepResult AlertManager::evalStructureSessionLocked(
     Alert &a, const std::string &interval, const Json::Value &candle,
     const std::string &candleTsStr, StructureTrack &track) {
@@ -1594,6 +1889,35 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                     auto it = alerts_.find(alertId);
                     if (it == alerts_.end()) continue;
                     Alert &a = it->second;
+                    if (a.status == "active" && a.alertType == "sweep_confirm") {
+                        if (k.interval != "5m") continue;
+                        if (isPastExpiry(a)) {
+                            Alert before = a;
+                            a.status = "expired";
+                            toPersist.push_back({before, a, true, true});
+                            LOG_INFO << "Expired sweep_confirm alert " << a.id << " " << a.pair
+                                     << " (past expires_at)";
+                            continue;
+                        }
+                        Alert before = a;
+                        const auto step =
+                            evalSweepConfirmLocked(a, candle, candleTsStr, track);
+                        if (step == SessionStepResult::Unchanged) continue;
+                        if (step == SessionStepResult::Triggered) {
+                            TriggeredAlert t;
+                            t.alert = a;
+                            t.currentPrice = candle.get("close", 0.0).asDouble();
+                            t.alertTypeLabel = "sweep_confirm";
+                            t.timeframe = "5m";
+                            triggered.push_back(t);
+                            toPersist.push_back({before, a, true, true});
+                            LOG_INFO << "Triggered sweep_confirm alert " << a.id << " " << a.pair
+                                     << " close=" << t.currentPrice;
+                        } else {
+                            toPersist.push_back({before, a, false, true});
+                        }
+                        continue;
+                    }
                     if (a.status == "active" && a.alertType == "structure_session") {
                         if (isPastExpiry(a)) {
                             Alert before = a;

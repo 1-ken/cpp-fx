@@ -18,7 +18,7 @@ struct Alert {
     std::string pair;
     std::string status = "active";  // active, waiting, triggered, disabled, expired
     std::string createdAt;
-    std::string alertType = "price";  // price | candle_close | prev_day_level | market_structure | structure_session
+    std::string alertType = "price";  // price | candle_close | prev_day_level | market_structure | structure_session | sweep_confirm
     std::string channel = "email";    // primary / legacy single channel
     std::vector<std::string> channels;  // email | sms | call | sound
     std::string email;
@@ -60,6 +60,16 @@ struct Alert {
     int sessionStepIndex = 0;
     std::optional<std::string> stepFiredAt;
     std::optional<std::string> lastFiredSession;
+
+    // sweep_confirm: sweep of the latest unbroken 1h swing, then a same-direction
+    // 5m BOS, CHoCH, or CISD within 12 candles. Status stays active.
+    std::optional<std::string> pendingDir;  // bull | bear
+    std::optional<std::string> pendingSweepAt;
+    std::optional<double> pendingSweepLevel;
+    std::optional<double> pendingRunOpen;
+    int pendingBars = 0;
+    std::optional<std::string> sweptHighAt;
+    std::optional<std::string> sweptLowAt;
 
     bool hasDolTrigger(const std::string &trig) const {
         if (dolTriggers.empty()) return trig == "sweep";
@@ -182,6 +192,14 @@ struct Alert {
         v["step_fired_at"] = stepFiredAt ? Json::Value(*stepFiredAt) : Json::Value::null;
         v["last_fired_session"] =
             lastFiredSession ? Json::Value(*lastFiredSession) : Json::Value::null;
+        v["pending_dir"] = pendingDir ? Json::Value(*pendingDir) : Json::Value::null;
+        v["pending_sweep_at"] = pendingSweepAt ? Json::Value(*pendingSweepAt) : Json::Value::null;
+        v["pending_sweep_level"] =
+            pendingSweepLevel ? Json::Value(*pendingSweepLevel) : Json::Value::null;
+        v["pending_run_open"] = pendingRunOpen ? Json::Value(*pendingRunOpen) : Json::Value::null;
+        v["pending_bars"] = pendingBars;
+        v["swept_high_at"] = sweptHighAt ? Json::Value(*sweptHighAt) : Json::Value::null;
+        v["swept_low_at"] = sweptLowAt ? Json::Value(*sweptLowAt) : Json::Value::null;
         v["depends_on_alert_id"] =
             dependsOnAlertId ? Json::Value(*dependsOnAlertId) : Json::Value::null;
         v["chain_id"] = chainId ? Json::Value(*chainId) : Json::Value::null;
@@ -266,6 +284,14 @@ struct Alert {
         a.lastFiredSession = optStr("last_fired_session");
         if (v.isMember("session_step_index") && v["session_step_index"].isNumeric())
             a.sessionStepIndex = v["session_step_index"].asInt();
+        a.pendingDir = optStr("pending_dir");
+        a.pendingSweepAt = optStr("pending_sweep_at");
+        a.pendingSweepLevel = optNum("pending_sweep_level");
+        a.pendingRunOpen = optNum("pending_run_open");
+        if (v.isMember("pending_bars") && v["pending_bars"].isNumeric())
+            a.pendingBars = v["pending_bars"].asInt();
+        a.sweptHighAt = optStr("swept_high_at");
+        a.sweptLowAt = optStr("swept_low_at");
         a.dependsOnAlertId = optStr("depends_on_alert_id");
         a.chainId = optStr("chain_id");
         a.sequenceIndex = optInt("sequence_index");

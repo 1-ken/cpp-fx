@@ -1272,6 +1272,108 @@ void createAlert(const HttpRequestPtr &req,
         }
         return;
     }
+    if (b.get("alert_type", "").asString() == "sweep_confirm") {
+        std::string parseErr;
+        auto channels = parseChannels(b, parseErr);
+        if (channels.empty()) {
+            cb(errResp("detail", parseErr.empty() ? "Invalid channels" : parseErr, 400));
+            return;
+        }
+        std::string email = b.get("email", "").asString();
+        std::string phone = b.get("phone", "").asString();
+        std::string customMessage = trimStr(b.get("custom_message", "").asString());
+        if (channelsRequireEmail(channels) && email.empty()) {
+            cb(errResp("detail", "Email is required for email alerts", 400));
+            return;
+        }
+        if (channelsRequirePhone(channels) && phone.empty()) {
+            cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
+            return;
+        }
+        if (channelsRequireCustomMessage(channels, customMessage)) {
+            cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
+            return;
+        }
+        std::string expiresErr;
+        auto expiresAt = requireExpiresAt(b, expiresErr);
+        if (!expiresAt) {
+            cb(errResp("detail", expiresErr, 400));
+            return;
+        }
+        std::vector<std::string> rawPairs;
+        if (b.isMember("pairs") && b["pairs"].isArray()) {
+            for (const auto &p : b["pairs"]) {
+                if (!p.isString()) continue;
+                std::string v = trimStr(p.asString());
+                if (!v.empty()) rawPairs.push_back(v);
+            }
+        }
+        if (rawPairs.empty()) {
+            std::string v = trimStr(b.get("pair", "").asString());
+            if (!v.empty()) rawPairs.push_back(v);
+        }
+        std::vector<std::string> pairs = util::uniqueCanonicalPairs(rawPairs);
+        if (pairs.empty()) {
+            cb(errResp("detail", "At least one pair is required", 400));
+            return;
+        }
+        if (pairs.size() > 20) {
+            cb(errResp("detail", "Select at most 20 pairs", 400));
+            return;
+        }
+        if (app.postgres && app.postgres->available()) {
+            services::SubscriptionService sub(*app.postgres);
+            int openCount = 0;
+            if (app.alerts) {
+                for (const auto &existing : app.alerts->getAllAlertsForUser(uid)) {
+                    if (existing.status == "active" || existing.status == "waiting") ++openCount;
+                }
+            }
+            for (size_t i = 0; i < pairs.size(); ++i) {
+                auto check = sub.canCreateAlert(uid, channels, openCount + static_cast<int>(i));
+                if (!check.allowed) {
+                    cb(subscriptionErrResp(check));
+                    return;
+                }
+            }
+        }
+        auto confirmations = parseStringListField(b, "structure_event", "");
+        std::string structureDir = b.get("structure_direction", "any").asString();
+        std::optional<double> minSwing;
+        std::optional<double> breakK;
+        if (b.isMember("min_swing_atr") && b["min_swing_atr"].isNumeric())
+            minSwing = b["min_swing_atr"].asDouble();
+        if (b.isMember("break_k") && b["break_k"].isNumeric()) breakK = b["break_k"].asDouble();
+        try {
+            auto made = app.alerts->createSweepConfirmAlerts(
+                pairs, confirmations, structureDir, uid, email, channels, phone, customMessage,
+                *expiresAt, minSwing, breakK);
+            Json::Value created(Json::arrayValue);
+            for (const auto &a : made) {
+                created.append(a.toJson());
+                Json::Value meta;
+                meta["pair"] = a.pair;
+                meta["alert_id"] = a.id;
+                meta["type"] = "sweep_confirm";
+                logActivityAsync(uid, "alert_create", clientIp(req), clientUserAgent(req), meta);
+            }
+            maybeSaveUserPhoneFromAlert(uid, phone, channels);
+            core::logApiOutcome("alerts", "create", true, 200,
+                                "sweep_confirm pairs=" + std::to_string(made.size()), uid);
+            Json::Value v;
+            v["success"] = true;
+            v["alerts"] = created;
+            if (!created.empty()) v["alert"] = created[0];
+            cb(jsonResp(v));
+        } catch (const std::runtime_error &e) {
+            const std::string msg = e.what();
+            cb(errResp("detail", msg,
+                       msg == "Alert not persisted" || msg == "Database unavailable" ? 503 : 400));
+        } catch (const std::exception &e) {
+            cb(errResp("detail", e.what(), 400));
+        }
+        return;
+    }
     if (b.get("alert_type", "").asString() == "market_structure") {
         std::string pair = trimStr(b.get("pair", "").asString());
         if (pair.empty()) {
