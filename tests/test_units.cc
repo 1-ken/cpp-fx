@@ -45,6 +45,11 @@ static void testPairNormalizer() {
         if (s == "EUR/USD") hasSlash = true;
     }
     CHECK(hasCompact && hasSlash);
+
+    auto unique = util::uniqueCanonicalPairs({"EUR/USD", "eurusd", "GBPUSD", "  ", "GBP/USD"});
+    CHECK(unique.size() == 2);
+    CHECK(unique[0] == "EURUSD");
+    CHECK(unique[1] == "GBPUSD");
 }
 
 static void testIntervals() {
@@ -445,6 +450,29 @@ static void testStructureSessionAlert() {
     CHECK(kept && kept->status == "active" && kept->lastFiredSession == fired->lastFiredSession);
 }
 
+static void testSessionAlertsStayIndependentPerPair() {
+    alerts::AlertManager mgr;
+    auto eur = makeSessionAlert("sess-eur", {"5m"});
+    auto gbp = makeSessionAlert("sess-gbp", {"5m"});
+    gbp.pair = "GBPUSD";
+    mgr.cacheAlert(eur);
+    mgr.cacheAlert(gbp);
+    std::vector<std::string> firedPairs;
+    mgr.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
+        firedPairs.push_back(t.alert.pair);
+    });
+    feedCandles(mgr, structureFixture("5m", "2026-06-03T22:00:00"));
+    CHECK(firedPairs.size() == 1);
+    CHECK(firedPairs[0] == "EURUSD");
+    auto gbpAfter = mgr.getAlert("sess-gbp");
+    CHECK(gbpAfter && gbpAfter->status == "active");
+    CHECK(gbpAfter->sessionStepIndex == 0);
+    CHECK(!gbpAfter->lastFiredSession);
+    auto eurAfter = mgr.getAlert("sess-eur");
+    CHECK(eurAfter && eurAfter->lastFiredSession.has_value());
+    CHECK(eurAfter->batchId == eur.batchId);
+}
+
 static void testStructureSessionSteps() {
     alerts::AlertManager mgr;
     mgr.cacheAlert(makeSessionAlert("sess-mtf", {"5m", "15m"}));
@@ -593,6 +621,7 @@ int main() {
     testIncrementalMatchesFull();
     testAlertReplayFiresOnce();
     testStructureSessionAlert();
+    testSessionAlertsStayIndependentPerPair();
     testStructureSessionSteps();
     testMarketStructureUnchangedBySession();
     if (g_failures == 0) {

@@ -96,6 +96,16 @@ class AlertManager {
                                       const std::string &expiresAt,
                                       std::optional<double> minSwingAtr = std::nullopt,
                                       std::optional<double> breakK = std::nullopt);
+    // One independent session alert per pair. Same settings, shared batch id when
+    // there is more than one pair. Saves all of them or none.
+    std::vector<Alert> createStructureSessionAlerts(
+        const std::vector<std::string> &pairs, const std::vector<std::string> &intervals,
+        const std::vector<std::string> &structureEvents, const std::string &structureDirection,
+        const std::string &userId, const std::string &email,
+        const std::vector<std::string> &channels, const std::string &phone,
+        const std::string &customMessage, const std::string &expiresAt,
+        std::optional<double> minSwingAtr = std::nullopt,
+        std::optional<double> breakK = std::nullopt);
     Alert createStructureAlert(const std::string &pair, const std::string &interval,
                                const std::vector<std::string> &structureEvents,
                                const std::string &structureDirection,

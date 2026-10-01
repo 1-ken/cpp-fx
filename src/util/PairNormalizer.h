@@ -17,6 +17,9 @@ std::string canonicalPair(const std::string &value);
 // pair_variants: every equivalent spelling for a DB lookup.
 std::vector<std::string> pairVariants(const std::string &value);
 
+// Canonical form of each value, blanks dropped, first spelling kept.
+std::vector<std::string> uniqueCanonicalPairs(const std::vector<std::string> &values);
+
 bool isCanonical(const std::string &value);
 
 }  // namespace ctraderplus::util

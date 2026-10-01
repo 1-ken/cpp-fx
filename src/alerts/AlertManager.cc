@@ -700,104 +700,156 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
     return a;
 }
 
+namespace {
+constexpr int kMaxSessionPairs = 20;
+
+struct SessionSpec {
+    std::vector<std::string> intervals;
+    std::vector<std::string> events;
+    std::string direction;
+};
+
+SessionSpec normalizeSessionSpec(const std::vector<std::string> &intervals,
+                                 const std::vector<std::string> &structureEvents,
+                                 const std::string &structureDirection) {
+    if (intervals.empty())
+        throw std::invalid_argument("intervals must include at least one timeframe");
+    SessionSpec spec;
+    for (const auto &raw : intervals) {
+        std::string iv = raw;
+        std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+        if (iv == "1d" || util::intervalToSeconds(iv) == 0 ||
+            util::intervalToSeconds(iv) > util::intervalToSeconds("4h"))
+            throw std::invalid_argument(
+                "Invalid interval. Session alerts support 1m, 5m, 15m, 30m, 1h, 4h");
+        if (std::find(spec.intervals.begin(), spec.intervals.end(), iv) == spec.intervals.end())
+            spec.intervals.push_back(iv);
+    }
+    std::sort(spec.intervals.begin(), spec.intervals.end(),
+              [](const std::string &lhs, const std::string &rhs) {
+                  return util::intervalToSeconds(lhs) < util::intervalToSeconds(rhs);
+              });
+    if (structureEvents.empty())
+        throw std::invalid_argument("structure_event must include at least one event");
+    for (const auto &raw : structureEvents) {
+        std::string ev = raw;
+        std::transform(ev.begin(), ev.end(), ev.begin(), ::tolower);
+        if (ev == "any") {
+            spec.events = {"bos", "choch", "sweep"};
+            break;
+        }
+        if (ev != "bos" && ev != "choch" && ev != "sweep")
+            throw std::invalid_argument("structure_event must be bos, choch, or sweep");
+        if (std::find(spec.events.begin(), spec.events.end(), ev) == spec.events.end())
+            spec.events.push_back(ev);
+    }
+    spec.direction = structureDirection;
+    std::transform(spec.direction.begin(), spec.direction.end(), spec.direction.begin(),
+                   ::tolower);
+    if (spec.direction != "bull" && spec.direction != "bear" && spec.direction != "any")
+        throw std::invalid_argument("structure_direction must be bull, bear, or any");
+    if (spec.intervals.size() > 1 && spec.direction == "any")
+        throw std::invalid_argument(
+            "structure_direction must be bull or bear when more than one timeframe is selected");
+    return spec;
+}
+}  // namespace
+
+std::vector<Alert> AlertManager::createStructureSessionAlerts(
+    const std::vector<std::string> &pairs, const std::vector<std::string> &intervals,
+    const std::vector<std::string> &structureEvents, const std::string &structureDirection,
+    const std::string &userId, const std::string &email, const std::vector<std::string> &channels,
+    const std::string &phone, const std::string &customMessage, const std::string &expiresAt,
+    std::optional<double> minSwingAtr, std::optional<double> breakK) {
+    if (!postgres_) throw std::runtime_error("Database unavailable");
+    const SessionSpec spec = normalizeSessionSpec(intervals, structureEvents, structureDirection);
+    const std::vector<std::string> unique = util::uniqueCanonicalPairs(pairs);
+    if (unique.empty()) throw std::invalid_argument("At least one pair is required");
+    if (static_cast<int>(unique.size()) > kMaxSessionPairs)
+        throw std::invalid_argument("Select at most 20 pairs");
+
+    const std::string createdAt = util::nowIso8601();
+    const std::time_t now = std::time(nullptr);
+    std::string sessionStart;
+    if (auto sess = util::forexSessionStart(now)) {
+        sessionStart = util::toIso8601(*sess);
+    } else {
+        const long long wait = util::secondsUntilMarketOpens(now);
+        sessionStart = util::toIso8601(now + static_cast<std::time_t>(wait));
+    }
+    std::optional<std::string> batchId;
+    if (unique.size() > 1) batchId = newUuid();
+
+    std::vector<Alert> built;
+    built.reserve(unique.size());
+    for (const auto &pair : unique) {
+        Alert a;
+        a.id = newUuid();
+        a.userId = userId;
+        a.pair = pair;
+        a.alertType = "structure_session";
+        a.intervals = spec.intervals;
+        a.interval = spec.intervals.front();
+        a.structureEvents = spec.events;
+        a.structureDirection = spec.direction;
+        a.minSwingAtr = minSwingAtr.value_or(0);
+        a.breakK = breakK.value_or(0.25);
+        a.sessionStepIndex = 0;
+        a.sessionStart = sessionStart;
+        a.batchId = batchId;
+        a.email = email;
+        a.channels = channels;
+        a.normalizeChannels();
+        a.phone = phone;
+        a.customMessage = customMessage;
+        a.expiresAt = expiresAt;
+        a.createdAt = createdAt;
+        a.status = "active";
+        built.push_back(std::move(a));
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const auto &a : built) alerts_[a.id] = a;
+        rebuildIndexes();
+    }
+
+    std::vector<std::string> persisted;
+    for (const auto &a : built) {
+        if (!persistAlertSync(a)) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                for (const auto &made : built) alerts_.erase(made.id);
+                rebuildIndexes();
+            }
+            for (const auto &id : persisted) persistDeleteSync(id);
+            throw std::runtime_error("Alert not persisted");
+        }
+        persisted.push_back(a.id);
+    }
+    bumpUserRevision(userId);
+    notifySubscriptionChange();
+    std::string ivLog;
+    for (size_t i = 0; i < spec.intervals.size(); ++i) {
+        if (i) ivLog += ">";
+        ivLog += spec.intervals[i];
+    }
+    LOG_INFO << "Created " << built.size() << " structure_session alert(s) " << ivLog << " "
+             << spec.direction << " session=" << sessionStart
+             << (batchId ? (" batch=" + *batchId) : "");
+    return built;
+}
+
 Alert AlertManager::createStructureSessionAlert(
     const std::string &pair, const std::vector<std::string> &intervals,
     const std::vector<std::string> &structureEvents, const std::string &structureDirection,
     const std::string &userId, const std::string &email, const std::vector<std::string> &channels,
     const std::string &phone, const std::string &customMessage, const std::string &expiresAt,
     std::optional<double> minSwingAtr, std::optional<double> breakK) {
-    if (!postgres_) throw std::runtime_error("Database unavailable");
-    if (intervals.empty())
-        throw std::invalid_argument("intervals must include at least one timeframe");
-    std::vector<std::string> normalizedIntervals;
-    for (const auto &raw : intervals) {
-        std::string iv = raw;
-        std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
-        if (iv == "1d" || intervalSeconds(iv) == 0 || intervalSeconds(iv) > intervalSeconds("4h"))
-            throw std::invalid_argument(
-                "Invalid interval. Session alerts support 1m, 5m, 15m, 30m, 1h, 4h");
-        if (std::find(normalizedIntervals.begin(), normalizedIntervals.end(), iv) ==
-            normalizedIntervals.end())
-            normalizedIntervals.push_back(iv);
-    }
-    std::sort(normalizedIntervals.begin(), normalizedIntervals.end(),
-              [](const std::string &lhs, const std::string &rhs) {
-                  return intervalSeconds(lhs) < intervalSeconds(rhs);
-              });
-    if (structureEvents.empty())
-        throw std::invalid_argument("structure_event must include at least one event");
-    std::vector<std::string> normalizedEvents;
-    for (const auto &raw : structureEvents) {
-        std::string ev = raw;
-        std::transform(ev.begin(), ev.end(), ev.begin(), ::tolower);
-        if (ev == "any") {
-            normalizedEvents = {"bos", "choch", "sweep"};
-            break;
-        }
-        if (ev != "bos" && ev != "choch" && ev != "sweep")
-            throw std::invalid_argument("structure_event must be bos, choch, or sweep");
-        if (std::find(normalizedEvents.begin(), normalizedEvents.end(), ev) ==
-            normalizedEvents.end())
-            normalizedEvents.push_back(ev);
-    }
-    std::string dir = structureDirection;
-    std::transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
-    if (dir != "bull" && dir != "bear" && dir != "any")
-        throw std::invalid_argument("structure_direction must be bull, bear, or any");
-    if (normalizedIntervals.size() > 1 && dir == "any")
-        throw std::invalid_argument(
-            "structure_direction must be bull or bear when more than one timeframe is selected");
-
-    Alert a;
-    a.id = newUuid();
-    a.userId = userId;
-    std::string canon = util::canonicalPair(pair);
-    a.pair = canon.empty() ? pair : canon;
-    a.alertType = "structure_session";
-    a.intervals = normalizedIntervals;
-    a.interval = normalizedIntervals.front();
-    a.structureEvents = normalizedEvents;
-    a.structureDirection = dir;
-    a.minSwingAtr = minSwingAtr.value_or(0);
-    a.breakK = breakK.value_or(0.25);
-    a.sessionStepIndex = 0;
-    const std::time_t now = std::time(nullptr);
-    if (auto sess = util::forexSessionStart(now)) {
-        a.sessionStart = util::toIso8601(*sess);
-    } else {
-        const long long wait = util::secondsUntilMarketOpens(now);
-        a.sessionStart = util::toIso8601(now + static_cast<std::time_t>(wait));
-    }
-    a.email = email;
-    a.channels = channels;
-    a.normalizeChannels();
-    a.phone = phone;
-    a.customMessage = customMessage;
-    a.expiresAt = expiresAt;
-    a.createdAt = util::nowIso8601();
-    a.status = "active";
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        alerts_[a.id] = a;
-        rebuildIndexes();
-    }
-    if (!persistAlertSync(a)) {
-        std::lock_guard<std::mutex> lk(mu_);
-        alerts_.erase(a.id);
-        rebuildIndexes();
-        throw std::runtime_error("Alert not persisted");
-    }
-    bumpUserRevision(a.userId);
-    notifySubscriptionChange();
-    std::string ivLog;
-    for (size_t i = 0; i < normalizedIntervals.size(); ++i) {
-        if (i) ivLog += ">";
-        ivLog += normalizedIntervals[i];
-    }
-    LOG_INFO << "Created structure_session alert " << a.id << " " << a.pair << " " << ivLog
-             << " " << dir << " session=" << a.sessionStart.value_or("");
-    return a;
+    auto made = createStructureSessionAlerts({pair}, intervals, structureEvents, structureDirection,
+                                             userId, email, channels, phone, customMessage,
+                                             expiresAt, minSwingAtr, breakK);
+    return made.front();
 }
 
 void AlertManager::ingestStructureHistory(const std::string &pair, const std::string &interval,

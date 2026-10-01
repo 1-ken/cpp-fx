@@ -1078,19 +1078,19 @@ void createDrawAlertBatch(const HttpRequestPtr &req,
     const std::string levelRef = b.get("level_ref", "both").asString();
     const auto dolTriggers = parseStringListField(b, "dol_trigger", "sweep");
 
-    std::vector<std::string> pairs;
+    std::vector<std::string> rawPairs;
     if (b.isMember("pairs") && b["pairs"].isArray()) {
         for (const auto &p : b["pairs"]) {
             if (!p.isString()) continue;
             std::string v = trimStr(p.asString());
-            if (!v.empty() && std::find(pairs.begin(), pairs.end(), v) == pairs.end())
-                pairs.push_back(v);
+            if (!v.empty()) rawPairs.push_back(v);
         }
     }
-    if (pairs.empty()) {
+    if (rawPairs.empty()) {
         std::string v = trimStr(b.get("pair", "").asString());
-        if (!v.empty()) pairs.push_back(v);
+        if (!v.empty()) rawPairs.push_back(v);
     }
+    std::vector<std::string> pairs = util::uniqueCanonicalPairs(rawPairs);
     if (pairs.empty()) {
         cb(errResp("detail", "At least one pair is required", 400));
         return;
@@ -1114,11 +1114,13 @@ void createDrawAlertBatch(const HttpRequestPtr &req,
     auto dependsOn = parseDependsOnAlertId(b);
 
     Json::Value created(Json::arrayValue);
+    std::vector<std::string> createdIds;
     try {
         for (const auto &p : pairs) {
             auto a = app.alerts->createDrawAlert(p, levelRef, dolTriggers, uid, email, channels,
                                                  phone, customMessage, batchId, *expiresAt,
                                                  dependsOn);
+            createdIds.push_back(a.id);
             created.append(a.toJson());
             Json::Value meta;
             meta["pair"] = a.pair;
@@ -1127,9 +1129,13 @@ void createDrawAlertBatch(const HttpRequestPtr &req,
             logActivityAsync(uid, "alert_create", clientIp(req), clientUserAgent(req), meta);
         }
     } catch (const std::invalid_argument &e) {
+        for (auto it = createdIds.rbegin(); it != createdIds.rend(); ++it)
+            app.alerts->deleteAlert(*it, std::nullopt);
         cb(errResp("detail", e.what(), 400));
         return;
     } catch (const std::runtime_error &e) {
+        for (auto it = createdIds.rbegin(); it != createdIds.rend(); ++it)
+            app.alerts->deleteAlert(*it, std::nullopt);
         const std::string msg = e.what();
         if (msg == "Alert not persisted" || msg == "Database unavailable")
             cb(errResp("detail", msg, 503));
@@ -1164,11 +1170,6 @@ void createAlert(const HttpRequestPtr &req,
         return;
     }
     if (b.get("alert_type", "").asString() == "structure_session") {
-        std::string pair = trimStr(b.get("pair", "").asString());
-        if (pair.empty()) {
-            cb(errResp("detail", "Pair name cannot be empty", 400));
-            return;
-        }
         std::string parseErr;
         auto channels = parseChannels(b, parseErr);
         if (channels.empty()) {
@@ -1196,7 +1197,43 @@ void createAlert(const HttpRequestPtr &req,
             cb(errResp("detail", expiresErr, 400));
             return;
         }
-        if (rejectIfSubscriptionBlocksCreate(app, uid, channels, cb)) return;
+        std::vector<std::string> rawPairs;
+        if (b.isMember("pairs") && b["pairs"].isArray()) {
+            for (const auto &p : b["pairs"]) {
+                if (!p.isString()) continue;
+                std::string v = trimStr(p.asString());
+                if (!v.empty()) rawPairs.push_back(v);
+            }
+        }
+        if (rawPairs.empty()) {
+            std::string v = trimStr(b.get("pair", "").asString());
+            if (!v.empty()) rawPairs.push_back(v);
+        }
+        std::vector<std::string> pairs = util::uniqueCanonicalPairs(rawPairs);
+        if (pairs.empty()) {
+            cb(errResp("detail", "At least one pair is required", 400));
+            return;
+        }
+        if (pairs.size() > 20) {
+            cb(errResp("detail", "Select at most 20 pairs", 400));
+            return;
+        }
+        if (app.postgres && app.postgres->available()) {
+            services::SubscriptionService sub(*app.postgres);
+            int openCount = 0;
+            if (app.alerts) {
+                for (const auto &a : app.alerts->getAllAlertsForUser(uid)) {
+                    if (a.status == "active" || a.status == "waiting") ++openCount;
+                }
+            }
+            for (size_t i = 0; i < pairs.size(); ++i) {
+                auto check = sub.canCreateAlert(uid, channels, openCount + static_cast<int>(i));
+                if (!check.allowed) {
+                    cb(subscriptionErrResp(check));
+                    return;
+                }
+            }
+        }
         auto intervals = parseStringListField(b, "intervals", "");
         auto structureEvents = parseStringListField(b, "structure_event", "");
         std::string structureDir = b.get("structure_direction", "").asString();
@@ -1206,14 +1243,25 @@ void createAlert(const HttpRequestPtr &req,
             minSwing = b["min_swing_atr"].asDouble();
         if (b.isMember("break_k") && b["break_k"].isNumeric()) breakK = b["break_k"].asDouble();
         try {
-            auto a = app.alerts->createStructureSessionAlert(
-                pair, intervals, structureEvents, structureDir, uid, email, channels, phone,
+            auto made = app.alerts->createStructureSessionAlerts(
+                pairs, intervals, structureEvents, structureDir, uid, email, channels, phone,
                 customMessage, *expiresAt, minSwing, breakK);
+            Json::Value created(Json::arrayValue);
+            for (const auto &a : made) {
+                created.append(a.toJson());
+                Json::Value meta;
+                meta["pair"] = a.pair;
+                meta["alert_id"] = a.id;
+                meta["type"] = "structure_session";
+                logActivityAsync(uid, "alert_create", clientIp(req), clientUserAgent(req), meta);
+            }
+            maybeSaveUserPhoneFromAlert(uid, phone, channels);
             core::logApiOutcome("alerts", "create", true, 200,
-                                "pair=" + pair + " type=structure_session", uid);
+                                "structure_session pairs=" + std::to_string(made.size()), uid);
             Json::Value v;
             v["success"] = true;
-            v["alert"] = a.toJson();
+            v["alerts"] = created;
+            if (!created.empty()) v["alert"] = created[0];
             cb(jsonResp(v));
         } catch (const std::runtime_error &e) {
             const std::string msg = e.what();

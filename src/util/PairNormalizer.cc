@@ -96,4 +96,15 @@ bool isCanonical(const std::string &value) {
     return !value.empty() && canonicalPair(value) == value;
 }
 
+std::vector<std::string> uniqueCanonicalPairs(const std::vector<std::string> &values) {
+    std::vector<std::string> out;
+    for (const auto &value : values) {
+        std::string canon = canonicalPair(value);
+        if (canon.empty()) continue;
+        if (std::find(out.begin(), out.end(), canon) != out.end()) continue;
+        out.push_back(std::move(canon));
+    }
+    return out;
+}
+
 }  // namespace ctraderplus::util
