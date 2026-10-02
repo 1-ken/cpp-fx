@@ -4,6 +4,7 @@
 #include <iostream>
 #include <vector>
 
+#include "alerts/AlertEventLedger.h"
 #include "alerts/AlertManager.h"
 #include "core/Config.h"
 #include "ctrader/SymbolRegistry.h"
@@ -894,6 +895,36 @@ static void testAlertReplayFiresOnce() {
     CHECK(services::NotificationQueue::idempotencyKey(again) == key);
 }
 
+static void testAlertEventLedger() {
+    alerts::AlertEventLedger ledger;
+    alerts::TriggeredAlert first;
+    first.alert.id = "sweep-1";
+    first.alert.userId = "user";
+    first.alert.pair = "EURUSD";
+    first.alert.alertType = "sweep_confirm";
+    first.alert.status = "active";
+    first.alert.triggeredAt = "2026-06-03T22:35:00+00:00";
+    first.currentPrice = 1.1;
+    first.timeframe = "5m";
+    first.alertTypeLabel = "sweep_confirm";
+
+    alerts::TriggeredAlert second = first;
+    second.alert.triggeredAt = "2026-06-03T23:10:00+00:00";
+    second.currentPrice = 1.08;
+
+    CHECK(ledger.record(first));
+    CHECK(ledger.record(second));
+    CHECK(ledger.size() == 2);
+    CHECK(ledger.events()[0].triggeredAt != ledger.events()[1].triggeredAt);
+
+    CHECK(!ledger.record(first));
+    CHECK(ledger.size() == 2);
+    CHECK(ledger.events()[0].alertId == "sweep-1");
+    CHECK(ledger.events()[1].alertId == "sweep-1");
+    CHECK(alerts::AlertEventLedger::keyFor(first.alert.id, *first.alert.triggeredAt) !=
+          alerts::AlertEventLedger::keyFor(second.alert.id, *second.alert.triggeredAt));
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -917,6 +948,7 @@ int main() {
     testSweepConfirm();
     testStructureSessionSteps();
     testMarketStructureUnchangedBySession();
+    testAlertEventLedger();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

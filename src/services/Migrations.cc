@@ -13,7 +13,7 @@ namespace ctraderplus::services {
 
 namespace {
 
-constexpr int kSchemaReconcileVersion = 7;
+constexpr int kSchemaReconcileVersion = 8;
 
 bool columnExists(const DbClientPtr &client, const std::string &table,
                   const std::string &column) {
@@ -317,6 +317,27 @@ void reconcileApplicationSchema(const DbClientPtr &client) {
 
     reconcileLegacyPricingUsers(client);
     reconcileGoogleUsernames(client);
+
+    client->execSqlSync(
+        "CREATE TABLE IF NOT EXISTS alert_events ("
+        "id UUID PRIMARY KEY,"
+        "user_id VARCHAR(128) NOT NULL,"
+        "alert_id VARCHAR(64) NOT NULL,"
+        "pair VARCHAR(32) NOT NULL,"
+        "alert_type VARCHAR(64) NOT NULL,"
+        "timeframe VARCHAR(64),"
+        "price DOUBLE PRECISION,"
+        "triggered_at TIMESTAMPTZ NOT NULL,"
+        "read_at TIMESTAMPTZ,"
+        "data JSONB NOT NULL DEFAULT '{}'::jsonb,"
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+        "UNIQUE (alert_id, triggered_at))");
+    client->execSqlSync(
+        "CREATE INDEX IF NOT EXISTS ix_alert_events_user_triggered "
+        "ON alert_events(user_id, triggered_at DESC)");
+    client->execSqlSync(
+        "CREATE INDEX IF NOT EXISTS ix_alert_events_user_unread "
+        "ON alert_events(user_id, triggered_at DESC) WHERE read_at IS NULL");
 }
 
 void validateApplicationSchema(const DbClientPtr &client) {
@@ -353,6 +374,9 @@ void validateApplicationSchema(const DbClientPtr &client) {
     }
     if (!tableExists(client, "user_feedback")) {
         throw std::runtime_error("Schema validation failed: user_feedback table missing");
+    }
+    if (!tableExists(client, "alert_events")) {
+        throw std::runtime_error("Schema validation failed: alert_events table missing");
     }
     LOG_INFO << "PostgreSQL schema validated (reconcile compatible)";
 }

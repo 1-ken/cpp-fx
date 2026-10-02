@@ -808,6 +808,123 @@ bool PostgresService::removeFavorite(const std::string &userId, const std::strin
     }
 }
 
+bool PostgresService::insertAlertEvent(const std::string &id, const std::string &userId,
+                                       const std::string &alertId, const std::string &pair,
+                                       const std::string &alertType, const std::string &timeframe,
+                                       double price, const std::string &triggeredAt,
+                                       const Json::Value &data) {
+    if (!client_ || userId.empty() || alertId.empty() || id.empty() || triggeredAt.empty())
+        return false;
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    const std::string payload = Json::writeString(wb, data.isObject() ? data : Json::Value());
+    try {
+        auto inserted = client_->execSqlSync(
+            "INSERT INTO alert_events(id, user_id, alert_id, pair, alert_type, timeframe, price, "
+            "triggered_at, data, created_at) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8::timestamptz,$9::jsonb,NOW()) "
+            "ON CONFLICT (alert_id, triggered_at) DO NOTHING",
+            id, userId, alertId, pair, alertType, timeframe, price, triggeredAt, payload);
+        pruneAlertEvents(userId);
+        return inserted.affectedRows() > 0;
+    } catch (const std::exception &e) {
+        LOG_WARN << "insertAlertEvent failed: " << e.what();
+        return false;
+    }
+}
+
+void PostgresService::pruneAlertEvents(const std::string &userId) {
+    if (!client_ || userId.empty()) return;
+    try {
+        client_->execSqlSync(
+            "DELETE FROM alert_events WHERE user_id=$1 AND read_at IS NOT NULL "
+            "AND read_at < NOW() - INTERVAL '30 days'",
+            userId);
+        client_->execSqlSync(
+            "DELETE FROM alert_events WHERE user_id=$1 AND id IN ("
+            "SELECT id FROM alert_events WHERE user_id=$1 "
+            "ORDER BY triggered_at DESC OFFSET 500)",
+            userId);
+    } catch (const std::exception &e) {
+        LOG_WARN << "pruneAlertEvents failed: " << e.what();
+    }
+}
+
+Json::Value PostgresService::listAlertEvents(const std::string &userId, int limit,
+                                             bool unreadOnly) {
+    Json::Value out(Json::objectValue);
+    out["events"] = Json::Value(Json::arrayValue);
+    out["unread_count"] = 0;
+    if (!client_ || userId.empty()) return out;
+    if (limit < 1) limit = 1;
+    if (limit > 500) limit = 500;
+    try {
+        auto count = client_->execSqlSync(
+            "SELECT COUNT(*)::int AS n FROM alert_events WHERE user_id=$1 AND read_at IS NULL",
+            userId);
+        if (count.size() > 0) out["unread_count"] = count[0]["n"].as<int>();
+        const char *sql =
+            "SELECT id::text AS id, user_id, alert_id, pair, alert_type, "
+            "COALESCE(timeframe, '') AS timeframe, COALESCE(price, 0) AS price, "
+            "to_char(triggered_at AT TIME ZONE 'UTC', "
+            "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS triggered_at, "
+            "CASE WHEN read_at IS NULL THEN NULL ELSE to_char(read_at AT TIME ZONE 'UTC', "
+            "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS read_at, "
+            "data::text AS data "
+            "FROM alert_events WHERE user_id=$1 AND ($2::int = 0 OR read_at IS NULL) "
+            "ORDER BY triggered_at DESC LIMIT $3";
+        auto rows = client_->execSqlSync(sql, userId, unreadOnly ? 1 : 0, limit);
+        Json::Value events(Json::arrayValue);
+        for (const auto &row : rows) {
+            Json::Value ev(Json::objectValue);
+            ev["id"] = row["id"].as<std::string>();
+            ev["user_id"] = row["user_id"].as<std::string>();
+            ev["alert_id"] = row["alert_id"].as<std::string>();
+            ev["pair"] = row["pair"].as<std::string>();
+            ev["alert_type"] = row["alert_type"].as<std::string>();
+            ev["timeframe"] = row["timeframe"].as<std::string>();
+            ev["price"] = row["price"].as<double>();
+            ev["triggered_at"] = row["triggered_at"].as<std::string>();
+            if (row["read_at"].isNull())
+                ev["read_at"] = Json::Value::null;
+            else
+                ev["read_at"] = row["read_at"].as<std::string>();
+            ev["data"] = parseJson(row["data"].as<std::string>());
+            events.append(ev);
+        }
+        out["events"] = events;
+    } catch (const std::exception &e) {
+        LOG_WARN << "listAlertEvents failed: " << e.what();
+    }
+    return out;
+}
+
+bool PostgresService::markAlertEventRead(const std::string &userId, const std::string &eventId) {
+    if (!client_ || userId.empty() || eventId.empty()) return false;
+    try {
+        auto r = client_->execSqlSync(
+            "UPDATE alert_events SET read_at=NOW() "
+            "WHERE id=$1::uuid AND user_id=$2 AND read_at IS NULL",
+            eventId, userId);
+        return r.affectedRows() > 0;
+    } catch (const std::exception &e) {
+        LOG_WARN << "markAlertEventRead failed: " << e.what();
+        return false;
+    }
+}
+
+int PostgresService::markAllAlertEventsRead(const std::string &userId) {
+    if (!client_ || userId.empty()) return 0;
+    try {
+        auto r = client_->execSqlSync(
+            "UPDATE alert_events SET read_at=NOW() WHERE user_id=$1 AND read_at IS NULL", userId);
+        return static_cast<int>(r.affectedRows());
+    } catch (const std::exception &e) {
+        LOG_WARN << "markAllAlertEventsRead failed: " << e.what();
+        return 0;
+    }
+}
+
 void PostgresService::logActivity(const std::string &userId, const std::string &eventType,
                                   const std::string &ipAddress,
                                   const std::string &userAgent,

@@ -122,6 +122,15 @@ class PostgresService {
     void addFavorite(const std::string &userId, const std::string &pair);
     bool removeFavorite(const std::string &userId, const std::string &pair);
 
+    // One row per alert firing. Duplicate (alert_id, triggered_at) is ignored.
+    bool insertAlertEvent(const std::string &id, const std::string &userId,
+                          const std::string &alertId, const std::string &pair,
+                          const std::string &alertType, const std::string &timeframe, double price,
+                          const std::string &triggeredAt, const Json::Value &data);
+    Json::Value listAlertEvents(const std::string &userId, int limit, bool unreadOnly);
+    bool markAlertEventRead(const std::string &userId, const std::string &eventId);
+    int markAllAlertEventsRead(const std::string &userId);
+
     // Activity log
     void logActivity(const std::string &userId, const std::string &eventType,
                      const std::string &ipAddress, const std::string &userAgent,
@@ -144,6 +153,8 @@ class PostgresService {
     Json::Value adminListFeedback(int limit);
 
   private:
+    void pruneAlertEvents(const std::string &userId);
+
     const core::Config &cfg_;
     drogon::orm::DbClientPtr client_;
     int64_t alertUpsertFailures_ = 0;

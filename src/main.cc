@@ -36,6 +36,7 @@
 #include "util/ForexMarketHours.h"
 #include "util/PairNormalizer.h"
 #include "util/TimeUtil.h"
+#include "util/Uuid.h"
 
 using namespace ctraderplus;
 
@@ -185,13 +186,24 @@ int main() {
     alertManager.setSubscriptionChangeCallback(refreshSubscriptions);
     alertManager.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
         notificationQueue.enqueue(t);
+        std::string eventId = util::generateUuid();
+        if (eventId.empty()) eventId = t.alert.id + "-" + t.alert.triggeredAt.value_or("");
         Json::Value frame(Json::objectValue);
         frame["type"] = "alert_triggered";
+        frame["event_id"] = eventId;
         frame["alert"] = t.alert.toJson();
         frame["current_price"] = t.currentPrice;
         frame["timeframe"] = t.timeframe;
         frame["alert_type"] = t.alertTypeLabel;
-        controllers::WsObserveController::pushTriggered(t.alert.userId, std::move(frame));
+        controllers::WsObserveController::pushTriggered(t.alert.userId, frame);
+        if (pgPtr && t.alert.triggeredAt && !t.alert.triggeredAt->empty()) {
+            auto fired = t;
+            dbExec([pgPtr, eventId, fired]() {
+                pgPtr->insertAlertEvent(eventId, fired.alert.userId, fired.alert.id, fired.alert.pair,
+                                        fired.alert.alertType, fired.timeframe, fired.currentPrice,
+                                        *fired.alert.triggeredAt, fired.alert.toJson());
+            });
+        }
     });
 
     ctrader.setSymbolsCallback([&](std::vector<ctrader::SymbolInfo> symbols) {

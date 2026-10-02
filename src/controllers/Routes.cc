@@ -1708,6 +1708,66 @@ void updateAlert(const HttpRequestPtr &req, std::function<void(const HttpRespons
     }
 }
 
+void listAlertEvents(const HttpRequestPtr &req,
+                     std::function<void(const HttpResponsePtr &)> &&cb) {
+    auto &app = AppContext::instance();
+    std::string uid;
+    if (!authOrReject(req, cb, uid)) return;
+    if (rejectAlertsWithoutDb(cb)) return;
+    int limit = 50;
+    if (!req->getParameter("limit").empty())
+        limit = clampInt(std::atoi(req->getParameter("limit").c_str()), 1, 500);
+    const bool unreadOnly = req->getParameter("unread") == "1";
+    auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    app.dbExec([&app, uid, limit, unreadOnly, callback]() {
+        try {
+            (*callback)(jsonResp(app.postgres->listAlertEvents(uid, limit, unreadOnly)));
+        } catch (const std::exception &e) {
+            (*callback)(errResp("detail", e.what(), 503));
+        }
+    });
+}
+
+void markOneAlertEventRead(const HttpRequestPtr &req,
+                           std::function<void(const HttpResponsePtr &)> &&cb,
+                           std::string eventId) {
+    auto &app = AppContext::instance();
+    std::string uid;
+    if (!authOrReject(req, cb, uid)) return;
+    if (rejectAlertsWithoutDb(cb)) return;
+    auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    app.dbExec([&app, uid, eventId, callback]() {
+        try {
+            const bool updated = app.postgres->markAlertEventRead(uid, eventId);
+            Json::Value v;
+            v["success"] = true;
+            v["updated"] = updated;
+            (*callback)(jsonResp(v));
+        } catch (const std::exception &e) {
+            (*callback)(errResp("detail", e.what(), 503));
+        }
+    });
+}
+
+void markAllAlertEventsRead(const HttpRequestPtr &req,
+                            std::function<void(const HttpResponsePtr &)> &&cb) {
+    auto &app = AppContext::instance();
+    std::string uid;
+    if (!authOrReject(req, cb, uid)) return;
+    if (rejectAlertsWithoutDb(cb)) return;
+    auto callback = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    app.dbExec([&app, uid, callback]() {
+        try {
+            Json::Value v;
+            v["success"] = true;
+            v["updated"] = app.postgres->markAllAlertEventsRead(uid);
+            (*callback)(jsonResp(v));
+        } catch (const std::exception &e) {
+            (*callback)(errResp("detail", e.what(), 503));
+        }
+    });
+}
+
 }  // namespace
 
 void registerRoutes() {
@@ -1755,6 +1815,9 @@ void registerRoutes() {
     fw.registerHandler("/api/v1/alerts/{1}", &getAlert, {Get});
     fw.registerHandler("/api/v1/alerts/{1}", &deleteAlert, {Delete});
     fw.registerHandler("/api/v1/alerts/{1}", &updateAlert, {Put});
+    fw.registerHandler("/api/v1/alert-events", &listAlertEvents, {Get});
+    fw.registerHandler("/api/v1/alert-events/read-all", &markAllAlertEventsRead, {Post});
+    fw.registerHandler("/api/v1/alert-events/{1}/read", &markOneAlertEventRead, {Post});
 
     registerCors();
     registerAuthRoutes();
