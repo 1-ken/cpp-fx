@@ -1,7 +1,9 @@
 #include "services/PostgresService.h"
 
 #include <cctype>
+#include <cmath>
 #include <memory>
+#include <string>
 #include <optional>
 #include <sstream>
 
@@ -863,17 +865,20 @@ Json::Value PostgresService::listAlertEvents(const std::string &userId, int limi
             "SELECT COUNT(*)::int AS n FROM alert_events WHERE user_id=$1 AND read_at IS NULL",
             userId);
         if (count.size() > 0) out["unread_count"] = count[0]["n"].as<int>();
-        const char *sql =
+        // limit and unreadOnly are inlined (limit is clamped above) so the only bound
+        // parameter is the text user id; drogon binds ints as untyped binary values.
+        const std::string sql =
             "SELECT id::text AS id, user_id, alert_id, pair, alert_type, "
-            "COALESCE(timeframe, '') AS timeframe, COALESCE(price, 0) AS price, "
+            "COALESCE(timeframe, '') AS timeframe, COALESCE(price, 0)::text AS price, "
             "to_char(triggered_at AT TIME ZONE 'UTC', "
             "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS triggered_at, "
             "CASE WHEN read_at IS NULL THEN NULL ELSE to_char(read_at AT TIME ZONE 'UTC', "
             "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS read_at, "
-            "data::text AS data "
-            "FROM alert_events WHERE user_id=$1 AND ($2::int = 0 OR read_at IS NULL) "
-            "ORDER BY triggered_at DESC LIMIT $3::int";
-        auto rows = client_->execSqlSync(sql, userId, unreadOnly ? 1 : 0, limit);
+            "COALESCE(data::text, '{}') AS data "
+            "FROM alert_events WHERE user_id=$1" +
+            std::string(unreadOnly ? " AND read_at IS NULL" : "") +
+            " ORDER BY triggered_at DESC LIMIT " + std::to_string(limit);
+        auto rows = client_->execSqlSync(sql, userId);
         Json::Value events(Json::arrayValue);
         for (const auto &row : rows) {
             Json::Value ev(Json::objectValue);
@@ -883,7 +888,13 @@ Json::Value PostgresService::listAlertEvents(const std::string &userId, int limi
             ev["pair"] = row["pair"].as<std::string>();
             ev["alert_type"] = row["alert_type"].as<std::string>();
             ev["timeframe"] = row["timeframe"].as<std::string>();
-            ev["price"] = row["price"].as<double>();
+            double price = 0;
+            try {
+                price = std::stod(row["price"].as<std::string>());
+            } catch (const std::exception &) {
+                price = 0;
+            }
+            ev["price"] = std::isfinite(price) ? price : 0.0;
             ev["triggered_at"] = row["triggered_at"].as<std::string>();
             if (row["read_at"].isNull())
                 ev["read_at"] = Json::Value::null;
@@ -895,6 +906,7 @@ Json::Value PostgresService::listAlertEvents(const std::string &userId, int limi
         out["events"] = events;
     } catch (const std::exception &e) {
         LOG_ERROR << "listAlertEvents failed: " << e.what();
+        throw;
     }
     return out;
 }
