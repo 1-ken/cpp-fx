@@ -1095,6 +1095,11 @@ void createDrawAlertBatch(const HttpRequestPtr &req,
         cb(errResp("detail", "At least one pair is required", 400));
         return;
     }
+    if (static_cast<int>(pairs.size()) > alerts::kMaxBatchPairs) {
+        cb(errResp("detail",
+                   "Select at most " + std::to_string(alerts::kMaxBatchPairs) + " pairs", 400));
+        return;
+    }
 
     if (app.postgres && app.postgres->available()) {
         services::SubscriptionService sub(*app.postgres);
@@ -1214,8 +1219,10 @@ void createAlert(const HttpRequestPtr &req,
             cb(errResp("detail", "At least one pair is required", 400));
             return;
         }
-        if (pairs.size() > 20) {
-            cb(errResp("detail", "Select at most 20 pairs", 400));
+        if (static_cast<int>(pairs.size()) > alerts::kMaxBatchPairs) {
+            cb(errResp("detail",
+                       "Select at most " + std::to_string(alerts::kMaxBatchPairs) + " pairs",
+                       400));
             return;
         }
         if (app.postgres && app.postgres->available()) {
@@ -1317,8 +1324,10 @@ void createAlert(const HttpRequestPtr &req,
             cb(errResp("detail", "At least one pair is required", 400));
             return;
         }
-        if (pairs.size() > 20) {
-            cb(errResp("detail", "Select at most 20 pairs", 400));
+        if (static_cast<int>(pairs.size()) > alerts::kMaxBatchPairs) {
+            cb(errResp("detail",
+                       "Select at most " + std::to_string(alerts::kMaxBatchPairs) + " pairs",
+                       400));
             return;
         }
         if (app.postgres && app.postgres->available()) {

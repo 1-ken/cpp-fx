@@ -872,7 +872,7 @@ Json::Value PostgresService::listAlertEvents(const std::string &userId, int limi
             "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS read_at, "
             "data::text AS data "
             "FROM alert_events WHERE user_id=$1 AND ($2::int = 0 OR read_at IS NULL) "
-            "ORDER BY triggered_at DESC LIMIT $3";
+            "ORDER BY triggered_at DESC LIMIT $3::int";
         auto rows = client_->execSqlSync(sql, userId, unreadOnly ? 1 : 0, limit);
         Json::Value events(Json::arrayValue);
         for (const auto &row : rows) {
@@ -894,7 +894,7 @@ Json::Value PostgresService::listAlertEvents(const std::string &userId, int limi
         }
         out["events"] = events;
     } catch (const std::exception &e) {
-        LOG_WARN << "listAlertEvents failed: " << e.what();
+        LOG_ERROR << "listAlertEvents failed: " << e.what();
     }
     return out;
 }

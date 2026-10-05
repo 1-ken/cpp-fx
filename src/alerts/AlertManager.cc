@@ -704,8 +704,6 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
 }
 
 namespace {
-constexpr int kMaxSessionPairs = 20;
-
 struct SessionSpec {
     std::vector<std::string> intervals;
     std::vector<std::string> events;
@@ -768,8 +766,8 @@ std::vector<Alert> AlertManager::createStructureSessionAlerts(
     const SessionSpec spec = normalizeSessionSpec(intervals, structureEvents, structureDirection);
     const std::vector<std::string> unique = util::uniqueCanonicalPairs(pairs);
     if (unique.empty()) throw std::invalid_argument("At least one pair is required");
-    if (static_cast<int>(unique.size()) > kMaxSessionPairs)
-        throw std::invalid_argument("Select at most 20 pairs");
+    if (static_cast<int>(unique.size()) > kMaxBatchPairs)
+        throw std::invalid_argument("Select at most " + std::to_string(kMaxBatchPairs) + " pairs");
 
     const std::string createdAt = util::nowIso8601();
     const std::time_t now = std::time(nullptr);
@@ -882,7 +880,8 @@ std::vector<Alert> AlertManager::createSweepConfirmAlerts(
         throw std::invalid_argument("structure_direction must be bull, bear, or any");
     const std::vector<std::string> unique = util::uniqueCanonicalPairs(pairs);
     if (unique.empty()) throw std::invalid_argument("At least one pair is required");
-    if (unique.size() > 20) throw std::invalid_argument("Select at most 20 pairs");
+    if (static_cast<int>(unique.size()) > kMaxBatchPairs)
+        throw std::invalid_argument("Select at most " + std::to_string(kMaxBatchPairs) + " pairs");
 
     const std::string createdAt = util::nowIso8601();
     std::optional<std::string> batchId;

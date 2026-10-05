@@ -39,6 +39,9 @@ struct TriggeredAlert {
     std::string alertTypeLabel = "price";
 };
 
+// Upper bound for multi-pair alert creates (prev_day_level, structure_session, sweep_confirm).
+constexpr int kMaxBatchPairs = 100;
+
 // Port of app/services/alert_service.py AlertManager.
 class AlertManager {
   public:
