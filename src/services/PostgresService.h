@@ -130,6 +130,9 @@ class PostgresService {
     Json::Value listAlertEvents(const std::string &userId, int limit, bool unreadOnly);
     bool markAlertEventRead(const std::string &userId, const std::string &eventId);
     int markAllAlertEventsRead(const std::string &userId);
+    void updateAlertEventDelivery(const std::string &eventId, const std::string &userId,
+                                  const std::string &channel, const std::string &status,
+                                  const std::string &reason);
 
     // Activity log
     void logActivity(const std::string &userId, const std::string &eventType,

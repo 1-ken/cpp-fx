@@ -18,6 +18,7 @@
 #include "core/ApiLog.h"
 #include "core/AppContext.h"
 #include "core/Auth.h"
+#include "util/Phone.h"
 #include "core/Config.h"
 #include "core/DbReady.h"
 #include "ctrader/CTraderClient.h"
@@ -39,15 +40,7 @@ using ::ctraderplus::controllers::isValidMarketerCodeFormat;
 using ::ctraderplus::controllers::jsonResp;
 using ::ctraderplus::controllers::normalizeMarketerCode;
 using ::ctraderplus::controllers::trim;
-
-std::string normalizePhone(const std::string &phone) {
-    std::string out;
-    for (char c : phone) {
-        if (std::isdigit(static_cast<unsigned char>(c))) out.push_back(c);
-        else if (c == '+') out.push_back(c);
-    }
-    return out;
-}
+using ::ctraderplus::util::normalizePhone;
 
 std::mutex g_otpMu;
 std::map<std::string, std::pair<std::string, std::time_t>> g_otpMemory;

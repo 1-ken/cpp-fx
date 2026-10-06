@@ -37,6 +37,7 @@ struct TriggeredAlert {
     double currentPrice = 0;
     std::string timeframe;
     std::string alertTypeLabel = "price";
+    std::string eventId;
 };
 
 // Upper bound for multi-pair alert creates (prev_day_level, structure_session, sweep_confirm).

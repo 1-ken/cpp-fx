@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "alerts/AlertEventLedger.h"
+#include "alerts/ChannelDispatch.h"
 #include "alerts/AlertManager.h"
 #include "core/Config.h"
 #include "ctrader/SymbolRegistry.h"
@@ -14,6 +15,7 @@
 #include "services/Notifier.h"
 #include "util/ForexMarketHours.h"
 #include "util/PairNormalizer.h"
+#include "util/Phone.h"
 #include "util/FormingCandle.h"
 #include "market/StructureEngine.h"
 #include "util/TimeUtil.h"
@@ -923,6 +925,34 @@ static void testAlertEventLedger() {
     CHECK(ledger.events()[1].alertId == "sweep-1");
     CHECK(alerts::AlertEventLedger::keyFor(first.alert.id, *first.alert.triggeredAt) !=
           alerts::AlertEventLedger::keyFor(second.alert.id, *second.alert.triggeredAt));
+
+    CHECK(ledger.recordDelivery(first.alert.id, *first.alert.triggeredAt, "sound", "sent"));
+    CHECK(ledger.recordDelivery(first.alert.id, *first.alert.triggeredAt, "call", "failed"));
+    CHECK(ledger.events()[0].delivery.at("call") == "failed");
+
+    std::vector<alerts::ChannelReport> reports = {
+        {"sound", "sent", "", false},
+        {"call", "failed", "provider rejected the call", true},
+    };
+    auto retry = alerts::channelsToRetry(reports);
+    CHECK(retry.size() == 1);
+    CHECK(retry[0] == "call");
+
+    auto failed = alerts::AlertEventLedger::failedList("select failed");
+    CHECK(!failed.ok);
+    CHECK(failed.events.empty());
+    CHECK(!alerts::AlertEventLedger::isEmptyInbox(failed));
+    auto emptyOk = alerts::AlertEventLedger::ListResult{};
+    emptyOk.ok = true;
+    CHECK(alerts::AlertEventLedger::isEmptyInbox(emptyOk));
+}
+
+static void testPhoneE164() {
+    CHECK(util::normalizePhone(" +254 712-345-678 ") == "+254712345678");
+    CHECK(util::normalizePhone("00254712345678") == "+254712345678");
+    CHECK(util::isE164(util::normalizePhone("+254712345678")));
+    CHECK(!util::isE164("0712345678"));
+    CHECK(!util::isE164(util::normalizePhone("0712345678")));
 }
 
 int main() {
@@ -949,6 +979,7 @@ int main() {
     testStructureSessionSteps();
     testMarketStructureUnchangedBySession();
     testAlertEventLedger();
+    testPhoneE164();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

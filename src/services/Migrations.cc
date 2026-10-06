@@ -13,7 +13,7 @@ namespace ctraderplus::services {
 
 namespace {
 
-constexpr int kSchemaReconcileVersion = 8;
+constexpr int kSchemaReconcileVersion = 9;
 
 bool columnExists(const DbClientPtr &client, const std::string &table,
                   const std::string &column) {
@@ -330,8 +330,12 @@ void reconcileApplicationSchema(const DbClientPtr &client) {
         "triggered_at TIMESTAMPTZ NOT NULL,"
         "read_at TIMESTAMPTZ,"
         "data JSONB NOT NULL DEFAULT '{}'::jsonb,"
+        "delivery JSONB NOT NULL DEFAULT '{}'::jsonb,"
         "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
         "UNIQUE (alert_id, triggered_at))");
+    client->execSqlSync(
+        "ALTER TABLE alert_events ADD COLUMN IF NOT EXISTS delivery JSONB NOT NULL "
+        "DEFAULT '{}'::jsonb");
     client->execSqlSync(
         "CREATE INDEX IF NOT EXISTS ix_alert_events_user_triggered "
         "ON alert_events(user_id, triggered_at DESC)");
@@ -377,6 +381,9 @@ void validateApplicationSchema(const DbClientPtr &client) {
     }
     if (!tableExists(client, "alert_events")) {
         throw std::runtime_error("Schema validation failed: alert_events table missing");
+    }
+    if (!columnExists(client, "alert_events", "delivery")) {
+        throw std::runtime_error("Schema validation failed: alert_events.delivery missing");
     }
     LOG_INFO << "PostgreSQL schema validated (reconcile compatible)";
 }

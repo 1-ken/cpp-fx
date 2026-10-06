@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -20,7 +21,24 @@ class AlertEventLedger {
         std::string alertType;
         std::string timeframe;
         double price = 0;
+        std::unordered_map<std::string, std::string> delivery;
     };
+
+    struct ListResult {
+        bool ok = false;
+        std::string error;
+        std::vector<Event> events;
+        int unreadCount = 0;
+    };
+
+    static ListResult failedList(const std::string &error) {
+        ListResult result;
+        result.ok = false;
+        result.error = error;
+        return result;
+    }
+
+    static bool isEmptyInbox(const ListResult &result) { return result.ok && result.events.empty(); }
 
     static std::string keyFor(const std::string &alertId, const std::string &triggeredAt) {
         return alertId + "|" + triggeredAt;
@@ -39,6 +57,17 @@ class AlertEventLedger {
         ev.price = t.currentPrice;
         events_.push_back(std::move(ev));
         return true;
+    }
+
+    bool recordDelivery(const std::string &alertId, const std::string &triggeredAt,
+                        const std::string &channel, const std::string &status) {
+        const std::string key = keyFor(alertId, triggeredAt);
+        for (auto &event : events_) {
+            if (keyFor(event.alertId, event.triggeredAt) != key) continue;
+            event.delivery[channel] = status;
+            return true;
+        }
+        return false;
     }
 
     std::size_t size() const { return events_.size(); }

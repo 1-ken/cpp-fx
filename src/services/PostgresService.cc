@@ -872,9 +872,9 @@ Json::Value PostgresService::listAlertEvents(const std::string &userId, int limi
             "COALESCE(timeframe, '') AS timeframe, COALESCE(price, 0)::text AS price, "
             "to_char(triggered_at AT TIME ZONE 'UTC', "
             "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS triggered_at, "
-            "CASE WHEN read_at IS NULL THEN NULL ELSE to_char(read_at AT TIME ZONE 'UTC', "
+            "CASE WHEN read_at IS NULL THEN '' ELSE to_char(read_at AT TIME ZONE 'UTC', "
             "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS read_at, "
-            "COALESCE(data::text, '{}') AS data "
+            "COALESCE(data::text, '{}') AS data, COALESCE(delivery, '{}'::jsonb)::text AS delivery "
             "FROM alert_events WHERE user_id=$1" +
             std::string(unreadOnly ? " AND read_at IS NULL" : "") +
             " ORDER BY triggered_at DESC LIMIT " + std::to_string(limit);
@@ -896,11 +896,10 @@ Json::Value PostgresService::listAlertEvents(const std::string &userId, int limi
             }
             ev["price"] = std::isfinite(price) ? price : 0.0;
             ev["triggered_at"] = row["triggered_at"].as<std::string>();
-            if (row["read_at"].isNull())
-                ev["read_at"] = Json::Value::null;
-            else
-                ev["read_at"] = row["read_at"].as<std::string>();
+            const std::string readAt = row["read_at"].as<std::string>();
+            ev["read_at"] = readAt.empty() ? Json::Value::null : Json::Value(readAt);
             ev["data"] = parseJson(row["data"].as<std::string>());
+            ev["delivery"] = parseJson(row["delivery"].as<std::string>());
             events.append(ev);
         }
         out["events"] = events;
@@ -934,6 +933,28 @@ int PostgresService::markAllAlertEventsRead(const std::string &userId) {
     } catch (const std::exception &e) {
         LOG_WARN << "markAllAlertEventsRead failed: " << e.what();
         return 0;
+    }
+}
+
+void PostgresService::updateAlertEventDelivery(const std::string &eventId,
+                                               const std::string &userId,
+                                               const std::string &channel,
+                                               const std::string &status,
+                                               const std::string &reason) {
+    if (!client_ || eventId.empty() || userId.empty() || channel.empty()) return;
+    Json::Value node(Json::objectValue);
+    node["status"] = status;
+    if (!reason.empty()) node["reason"] = reason;
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    const std::string payload = Json::writeString(wb, node);
+    try {
+        client_->execSqlSync(
+            "UPDATE alert_events SET delivery = jsonb_set(COALESCE(delivery, '{}'::jsonb), "
+            "ARRAY[$3::text], $4::jsonb, true) WHERE id=$1::uuid AND user_id=$2",
+            eventId, userId, channel, payload);
+    } catch (const std::exception &e) {
+        LOG_WARN << "updateAlertEventDelivery failed: " << e.what();
     }
 }
 

@@ -11,6 +11,7 @@
 #include <trantor/net/EventLoop.h>
 
 #include "alerts/AlertManager.h"
+#include "alerts/ChannelDispatch.h"
 #include "core/Config.h"
 #include "services/RedisService.h"
 
@@ -38,6 +39,7 @@ class NotificationQueue {
         int attempts = 0;
         std::string idem;
         bool mirrored = false;
+        std::vector<std::string> onlyChannels;
     };
 
     struct CallGate {
@@ -61,8 +63,10 @@ class NotificationQueue {
     bool shouldSkipCallLocked(const std::string &key) const;
     bool tryMergeCallIntoPendingLocked(alerts::TriggeredAlert &incoming);
     void dispatchOneChannel(const alerts::TriggeredAlert &t, const std::string &channel,
-                            std::function<void(bool)> onDone);
-    void dispatchAllChannels(const alerts::TriggeredAlert &t, std::function<void(bool)> onDone);
+                            std::function<void(alerts::ChannelReport)> onDone);
+    void dispatchAllChannels(const alerts::TriggeredAlert &t,
+                            const std::vector<std::string> &channels,
+                            std::function<void(std::vector<alerts::ChannelReport>)> onDone);
 
     const core::Config *cfg_ = nullptr;
     Notifier *notifier_ = nullptr;

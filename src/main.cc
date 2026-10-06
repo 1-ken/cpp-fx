@@ -185,9 +185,10 @@ int main() {
 
     alertManager.setSubscriptionChangeCallback(refreshSubscriptions);
     alertManager.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
-        notificationQueue.enqueue(t);
         std::string eventId = util::generateUuid();
         if (eventId.empty()) eventId = t.alert.id + "-" + t.alert.triggeredAt.value_or("");
+        auto fired = t;
+        fired.eventId = eventId;
         Json::Value frame(Json::objectValue);
         frame["type"] = "alert_triggered";
         frame["event_id"] = eventId;
@@ -195,15 +196,17 @@ int main() {
         frame["current_price"] = t.currentPrice;
         frame["timeframe"] = t.timeframe;
         frame["alert_type"] = t.alertTypeLabel;
-        controllers::WsObserveController::pushTriggered(t.alert.userId, frame);
-        if (pgPtr && t.alert.triggeredAt && !t.alert.triggeredAt->empty()) {
-            auto fired = t;
-            dbExec([pgPtr, eventId, fired]() {
-                pgPtr->insertAlertEvent(eventId, fired.alert.userId, fired.alert.id, fired.alert.pair,
-                                        fired.alert.alertType, fired.timeframe, fired.currentPrice,
-                                        *fired.alert.triggeredAt, fired.alert.toJson());
-            });
-        }
+        auto *queue = &notificationQueue;
+        dbExec([pgPtr, eventId, fired, frame, queue]() {
+            if (pgPtr && fired.alert.triggeredAt && !fired.alert.triggeredAt->empty()) {
+                pgPtr->insertAlertEvent(eventId, fired.alert.userId, fired.alert.id,
+                                        fired.alert.pair, fired.alert.alertType, fired.timeframe,
+                                        fired.currentPrice, *fired.alert.triggeredAt,
+                                        fired.alert.toJson());
+            }
+            queue->enqueue(fired);
+            controllers::WsObserveController::pushTriggered(fired.alert.userId, frame);
+        });
     });
 
     ctrader.setSymbolsCallback([&](std::vector<ctrader::SymbolInfo> symbols) {

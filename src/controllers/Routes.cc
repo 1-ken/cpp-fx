@@ -45,6 +45,7 @@
 #include "util/ForexMarketHours.h"
 #include "util/FormingCandle.h"
 #include "util/PairNormalizer.h"
+#include "util/Phone.h"
 #include "util/TimeUtil.h"
 
 using namespace drogon;
@@ -244,6 +245,21 @@ bool channelsRequireEmail(const std::vector<std::string> &channels) {
 bool channelsRequirePhone(const std::vector<std::string> &channels) {
     return std::any_of(channels.begin(), channels.end(),
                        [](const std::string &c) { return channelRequiresPhone(c); });
+}
+
+bool prepareAlertPhone(std::string &phone, const std::vector<std::string> &channels,
+                       std::string &err) {
+    phone = util::normalizePhone(phone);
+    if (!channelsRequirePhone(channels)) return true;
+    if (phone.empty()) {
+        err = "Phone is required for SMS/call alerts";
+        return false;
+    }
+    if (!util::isE164(phone)) {
+        err = "Phone must be in international format, for example +254712345678";
+        return false;
+    }
+    return true;
 }
 
 bool channelsRequireCustomMessage(const std::vector<std::string> &channels,
@@ -1059,9 +1075,12 @@ void createDrawAlertBatch(const HttpRequestPtr &req,
         cb(errResp("detail", "Email is required for email alerts", 400));
         return;
     }
-    if (channelsRequirePhone(channels) && phone.empty()) {
-        cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
-        return;
+    {
+        std::string phoneErr;
+        if (!prepareAlertPhone(phone, channels, phoneErr)) {
+            cb(errResp("detail", phoneErr, 400));
+            return;
+        }
     }
     if (channelsRequireCustomMessage(channels, customMessage)) {
         cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
@@ -1188,9 +1207,12 @@ void createAlert(const HttpRequestPtr &req,
             cb(errResp("detail", "Email is required for email alerts", 400));
             return;
         }
-        if (channelsRequirePhone(channels) && phone.empty()) {
-            cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
-            return;
+        {
+            std::string phoneErr;
+            if (!prepareAlertPhone(phone, channels, phoneErr)) {
+                cb(errResp("detail", phoneErr, 400));
+                return;
+            }
         }
         if (channelsRequireCustomMessage(channels, customMessage)) {
             cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
@@ -1293,9 +1315,12 @@ void createAlert(const HttpRequestPtr &req,
             cb(errResp("detail", "Email is required for email alerts", 400));
             return;
         }
-        if (channelsRequirePhone(channels) && phone.empty()) {
-            cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
-            return;
+        {
+            std::string phoneErr;
+            if (!prepareAlertPhone(phone, channels, phoneErr)) {
+                cb(errResp("detail", phoneErr, 400));
+                return;
+            }
         }
         if (channelsRequireCustomMessage(channels, customMessage)) {
             cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
@@ -1402,9 +1427,12 @@ void createAlert(const HttpRequestPtr &req,
             cb(errResp("detail", "Email is required for email alerts", 400));
             return;
         }
-        if (channelsRequirePhone(channels) && phone.empty()) {
-            cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
-            return;
+        {
+            std::string phoneErr;
+            if (!prepareAlertPhone(phone, channels, phoneErr)) {
+                cb(errResp("detail", phoneErr, 400));
+                return;
+            }
         }
         if (channelsRequireCustomMessage(channels, customMessage)) {
             cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
@@ -1481,9 +1509,12 @@ void createAlert(const HttpRequestPtr &req,
         cb(errResp("detail", "Email is required for email alerts", 400));
         return;
     }
-    if (channelsRequirePhone(channels) && phone.empty()) {
-        cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
-        return;
+    {
+        std::string phoneErr;
+        if (!prepareAlertPhone(phone, channels, phoneErr)) {
+            cb(errResp("detail", phoneErr, 400));
+            return;
+        }
     }
     if (channelsRequireCustomMessage(channels, customMessage)) {
         cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
@@ -1682,9 +1713,13 @@ void updateAlert(const HttpRequestPtr &req, std::function<void(const HttpRespons
         cb(errResp("detail", "Email is required for email alerts", 400));
         return;
     }
-    if (channelsRequirePhone(channels) && phone.empty()) {
-        cb(errResp("detail", "Phone is required for SMS/call alerts", 400));
-        return;
+    {
+        std::string phoneErr;
+        if (!prepareAlertPhone(phone, channels, phoneErr)) {
+            cb(errResp("detail", phoneErr, 400));
+            return;
+        }
+        updates["phone"] = phone;
     }
     if (channelsRequireCustomMessage(channels, customMessage)) {
         cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));

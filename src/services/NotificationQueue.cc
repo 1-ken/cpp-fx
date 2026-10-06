@@ -1,4 +1,5 @@
 #include "services/NotificationQueue.h"
+#include "alerts/ChannelDispatch.h"
 
 #include <algorithm>
 #include <atomic>
@@ -48,6 +49,7 @@ void NotificationQueue::stripCallChannel(alerts::Alert &a) {
     if (a.channel == "call") {
         a.channel = a.channels.empty() ? "sound" : a.channels.front();
     }
+    a.channelsCached_ = false;
 }
 
 void NotificationQueue::appendCallMessage(alerts::Alert &dst, const alerts::Alert &src) {
@@ -99,11 +101,32 @@ bool NotificationQueue::tryMergeCallIntoPendingLocked(alerts::TriggeredAlert &in
 
 void NotificationQueue::dispatchOneChannel(const alerts::TriggeredAlert &t,
                                            const std::string &channel,
-                                           std::function<void(bool)> onDone) {
+                                           std::function<void(alerts::ChannelReport)> onDone) {
     alerts::Alert a = t.alert;
     a.channel = channel;
     alerts::TriggeredAlert copy = t;
     copy.alert = a;
+    const std::string eventId = t.eventId;
+    const std::string userId = a.userId;
+
+    auto finish = [onDone, eventId, userId, channel](const std::string &status,
+                                                     const std::string &reason, bool retryable) {
+        if (!eventId.empty() && alerts::isExternalChannel(channel)) {
+            auto &appNow = core::AppContext::instance();
+            if (appNow.dbExec && appNow.postgres) {
+                appNow.dbExec([eventId, userId, channel, status, reason, pg = appNow.postgres]() {
+                    if (!pg) return;
+                    pg->updateAlertEventDelivery(eventId, userId, channel, status, reason);
+                });
+            }
+        }
+        alerts::ChannelReport report;
+        report.channel = channel;
+        report.status = status;
+        report.reason = reason;
+        report.retryable = retryable;
+        onDone(std::move(report));
+    };
 
     double target = a.alertType == "candle_close" ? a.threshold.value_or(0)
                                                   : a.targetPrice.value_or(0);
@@ -125,18 +148,42 @@ void NotificationQueue::dispatchOneChannel(const alerts::TriggeredAlert &t,
 
     if (channel == "sound") {
         LOG_INFO << "[alerts] in-app sound alert triggered pair=" << a.pair << " id=" << a.id;
-        onDone(true);
+        finish("sent", "", false);
         return;
     }
 
     auto &app = core::AppContext::instance();
+    if ((channel == "sms" || channel == "call") && a.phone.empty()) {
+        finish("skipped", "Phone number is missing", false);
+        return;
+    }
+    if (channel == "email" && a.email.empty()) {
+        finish("skipped", "Email address is missing", false);
+        return;
+    }
+    if (channel == "call" && notifier_ && !notifier_->callEnabled()) {
+        LOG_WARN << "Twilio call skipped: TWILIO credentials not configured";
+        finish("skipped", "Call service is not configured", false);
+        return;
+    }
+    if (channel == "sms" && notifier_ && !notifier_->smsEnabled()) {
+        LOG_WARN << "SMS Gate send skipped: SMS_GATE credentials not configured";
+        finish("skipped", "SMS service is not configured", false);
+        return;
+    }
+    if (channel == "email" && notifier_ && !notifier_->emailEnabled()) {
+        LOG_WARN << "SendGrid email skipped: not configured";
+        finish("skipped", "Email service is not configured", false);
+        return;
+    }
+
     if ((channel == "sms" || channel == "call") && app.postgres && app.postgres->available()) {
         services::SubscriptionService sub(*app.postgres);
         auto check = sub.canSendNotification(a.userId, channel);
         if (!check.allowed) {
             LOG_WARN << "[alerts] notification skipped (" << check.code << "): " << check.message
                      << " pair=" << a.pair << " id=" << a.id << " channel=" << channel;
-            onDone(true);
+            finish("skipped", check.message, false);
             return;
         }
     }
@@ -153,14 +200,14 @@ void NotificationQueue::dispatchOneChannel(const alerts::TriggeredAlert &t,
     std::string subject = Notifier::formatAlertSubject(a.pair, a.alertType);
 
     if (channel == "sms") {
-        notifier_->sendSms(a.phone, smsBody, [a, onDone, postgres = app.postgres](bool ok) {
+        notifier_->sendSms(a.phone, smsBody, [a, finish, postgres = app.postgres](bool ok) {
             if (ok) {
                 LOG_INFO << "[alerts] SMS sent pair=" << a.pair << " phone=" << a.phone;
                 if (postgres && postgres->available()) postgres->incrementDailySms(a.userId);
             } else {
                 LOG_WARN << "[alerts] SMS failed pair=" << a.pair << " phone=" << a.phone;
             }
-            onDone(ok);
+            finish(ok ? "sent" : "failed", ok ? "" : "provider rejected the message", !ok);
         });
     } else if (channel == "call") {
         const std::string key = callCoalesceKey(a);
@@ -169,21 +216,20 @@ void NotificationQueue::dispatchOneChannel(const alerts::TriggeredAlert &t,
             if (shouldSkipCallLocked(key)) {
                 LOG_INFO << "[alerts] skipped duplicate call at dispatch phone=" << a.phone
                          << " pair=" << a.pair;
-                onDone(true);
+                finish("skipped", "Another call was just placed", false);
                 return;
             }
             callGates_[key].inFlight = true;
         }
 
-        const std::string callMessage = a.customMessage;
         notifier_->sendCall(
-            a.phone, callMessage,
-            [this, a, key, onDone, postgres = app.postgres](bool ok) {
+            a.phone, smsBody,
+            [this, a, key, finish, postgres = app.postgres](bool ok) {
                 {
                     std::lock_guard<std::mutex> lk(mu_);
                     auto &gate = callGates_[key];
                     gate.inFlight = false;
-                    gate.lastPlaced = std::chrono::steady_clock::now();
+                    if (ok) gate.lastPlaced = std::chrono::steady_clock::now();
                 }
                 if (ok) {
                     LOG_INFO << "[alerts] call placed pair=" << a.pair << " phone=" << a.phone;
@@ -191,40 +237,47 @@ void NotificationQueue::dispatchOneChannel(const alerts::TriggeredAlert &t,
                 } else {
                     LOG_WARN << "[alerts] call failed pair=" << a.pair << " phone=" << a.phone;
                 }
-                onDone(ok);
+                finish(ok ? "placed" : "failed", ok ? "" : "provider rejected the call", !ok);
             });
     } else {
-        notifier_->sendEmail(a.email, subject, emailBody, [a, onDone](bool ok) {
+        notifier_->sendEmail(a.email, subject, emailBody, [a, finish](bool ok) {
             if (ok) {
                 LOG_INFO << "[alerts] email sent pair=" << a.pair << " email=" << a.email;
             } else {
                 LOG_WARN << "[alerts] email failed pair=" << a.pair << " email=" << a.email;
             }
-            onDone(ok);
+            finish(ok ? "sent" : "failed", ok ? "" : "provider rejected the email", !ok);
         });
     }
 }
 
-void NotificationQueue::dispatchAllChannels(const alerts::TriggeredAlert &t,
-                                            std::function<void(bool)> onDone) {
-    auto channels = t.alert.effectiveChannels();
+void NotificationQueue::dispatchAllChannels(
+    const alerts::TriggeredAlert &t, const std::vector<std::string> &channels,
+    std::function<void(std::vector<alerts::ChannelReport>)> onDone) {
     if (channels.empty()) {
         LOG_ERROR << "[alerts] notification skipped: no channels id=" << t.alert.id;
-        onDone(false);
+        onDone({});
         return;
     }
     if (channels.size() == 1) {
-        dispatchOneChannel(t, channels.front(), std::move(onDone));
+        dispatchOneChannel(t, channels.front(), [onDone](alerts::ChannelReport report) {
+            onDone(std::vector<alerts::ChannelReport>{std::move(report)});
+        });
         return;
     }
 
     auto remaining = std::make_shared<std::atomic<size_t>>(channels.size());
-    auto anyOk = std::make_shared<std::atomic<bool>>(false);
+    auto reports = std::make_shared<std::vector<alerts::ChannelReport>>();
+    auto reportsMu = std::make_shared<std::mutex>();
     for (const auto &channel : channels) {
-        dispatchOneChannel(t, channel, [remaining, anyOk, onDone](bool ok) {
-            if (ok) anyOk->store(true);
-            if (remaining->fetch_sub(1) == 1) onDone(anyOk->load());
-        });
+        dispatchOneChannel(t, channel,
+                           [remaining, reports, reportsMu, onDone](alerts::ChannelReport report) {
+                               {
+                                   std::lock_guard<std::mutex> lk(*reportsMu);
+                                   reports->push_back(std::move(report));
+                               }
+                               if (remaining->fetch_sub(1) == 1) onDone(*reports);
+                           });
     }
 }
 
@@ -347,8 +400,11 @@ void NotificationQueue::processJob(Job job) {
     if (redis_ && redis_->connected() && job.attempts == 0) {
         redis_->setStringEx("fx:alerts:idem:" + idem, "done", 7 * 24 * 3600, [](bool) {});
     }
-    auto onDone = [this, job = std::move(job), triggered, idem](bool ok) mutable {
-        if (ok) {
+    auto channels = job.onlyChannels.empty() ? triggered.alert.effectiveChannels() : job.onlyChannels;
+    auto onDone = [this, job = std::move(job), triggered, idem](
+                      std::vector<alerts::ChannelReport> reports) mutable {
+        const auto retry = alerts::channelsToRetry(reports);
+        if (retry.empty()) {
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 deliveredIdems_.insert(idem);
@@ -365,6 +421,7 @@ void NotificationQueue::processJob(Job job) {
             const double jitter = 0.5 + (static_cast<double>(std::rand() % 1000) / 1000.0);
             delay = std::min(60.0, delay * jitter);
             job.triggered = triggered;
+            job.onlyChannels = retry;
             loop_->runAfter(delay, [this, j = std::move(job)]() mutable {
                 {
                     std::lock_guard<std::mutex> lk(mu_);
@@ -381,7 +438,7 @@ void NotificationQueue::processJob(Job job) {
         ackIdem(idem);
         pushDlq(triggered.alert);
     };
-    dispatchAllChannels(triggered, onDone);
+    dispatchAllChannels(triggered, channels, onDone);
 }
 
 void NotificationQueue::pushDlq(const alerts::Alert &a) {
