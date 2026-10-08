@@ -18,7 +18,7 @@ struct Alert {
     std::string pair;
     std::string status = "active";  // active, waiting, triggered, disabled, expired
     std::string createdAt;
-    std::string alertType = "price";  // price | candle_close | prev_day_level | market_structure | structure_session | sweep_confirm
+    std::string alertType = "price";  // price | candle_close | prev_day_level | market_structure | structure_session | sweep_confirm | hour_sweep_cisd
     std::string channel = "email";    // primary / legacy single channel
     std::vector<std::string> channels;  // email | sms | call | sound
     std::string email;
@@ -68,6 +68,8 @@ struct Alert {
     std::optional<double> pendingSweepLevel;
     std::optional<double> pendingRunOpen;
     int pendingBars = 0;
+    // hour_sweep_cisd reuses these: pendingSweepAt and swept*At hold the 1h open time
+    // (ISO) of the forming hour, pendingSweepLevel the previous 1h high/low.
     std::optional<std::string> sweptHighAt;
     std::optional<std::string> sweptLowAt;
 

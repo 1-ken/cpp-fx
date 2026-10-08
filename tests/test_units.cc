@@ -955,6 +955,195 @@ static void testPhoneE164() {
     CHECK(!util::isE164(util::normalizePhone("0712345678")));
 }
 
+static alerts::Alert makeHourSweepAlert(const std::string &id, const std::string &dir,
+                                        const char *pair = "EURUSD") {
+    alerts::Alert a;
+    a.id = id;
+    a.userId = "user";
+    a.pair = pair;
+    a.alertType = "hour_sweep_cisd";
+    a.status = "active";
+    a.createdAt = "2026-06-03T20:00:00";
+    a.interval = "5m";
+    a.structureEvents = {"cisd"};
+    a.structureDirection = dir;
+    a.channels = {"sound"};
+    a.normalizeChannels();
+    return a;
+}
+
+// Previous 1h candle (21:00) spans 90..110. mirror flips prices around 100.
+static void seedPrevHour(alerts::AlertManager &mgr, const char *pair = "EURUSD") {
+    std::vector<Json::Value> hours = {
+        testCandle(pair, "1h", "2026-06-03T19:00:00", 100, 101, 99, 100),
+        testCandle(pair, "1h", "2026-06-03T20:00:00", 100, 101, 99, 100),
+        testCandle(pair, "1h", "2026-06-03T21:00:00", 100, 110, 90, 105),
+    };
+    mgr.ingestStructureHistory(pair, "1h", hours);
+}
+
+struct HourBar {
+    double o, h, l, c;
+};
+
+static Json::Value hourBar(int index, HourBar b, bool mirror, const char *pair = "EURUSD") {
+    if (mirror) b = {200 - b.o, 200 - b.l, 200 - b.h, 200 - b.c};
+    const std::string ts = barTime(index);
+    return testCandle(pair, "5m", ts.c_str(), b.o, b.h, b.l, b.c);
+}
+
+static void testHourSweepCisd() {
+    // Bars 0..5 build an up run from 102 into the 110 high. Bar 5 is the sweep.
+    const HourBar setup[] = {
+        {100, 102, 99, 101},  {101, 104, 100, 103}, {103, 104, 101, 102},
+        {102, 106, 102, 105}, {105, 108, 104, 107}, {107, 111, 106, 110},
+    };
+    for (int mirror = 0; mirror < 2; ++mirror) {
+        const bool m = mirror == 1;
+        const std::string dir = m ? "bull" : "bear";
+        alerts::AlertManager mgr;
+        mgr.cacheAlert(makeHourSweepAlert("hs-1", dir));
+        seedPrevHour(mgr);
+        int fires = 0;
+        mgr.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
+            ++fires;
+            CHECK(t.alert.status == "active");
+            CHECK(t.alertTypeLabel == "hour_sweep_cisd");
+        });
+        for (int i = 0; i < 6; ++i) mgr.checkCandleAlerts({hourBar(i, setup[i], m)});
+        CHECK(fires == 0);
+        auto armed = mgr.getAlert("hs-1");
+        CHECK(armed && armed->pendingDir && *armed->pendingDir == (m ? "bull" : "bear"));
+        CHECK(armed->pendingSweepLevel && *armed->pendingSweepLevel == (m ? 90 : 110));
+        CHECK(armed->pendingRunOpen && *armed->pendingRunOpen == (m ? 98 : 102));
+        CHECK(m ? armed->sweptLowAt.has_value() : armed->sweptHighAt.has_value());
+
+        mgr.checkCandleAlerts({hourBar(6, {110, 110.5, 104, 105}, m)});  // no CISD yet
+        CHECK(fires == 0);
+        mgr.checkCandleAlerts({hourBar(7, {105, 106, 100, 101}, m)});  // closes through 102
+        CHECK(fires == 1);
+        auto done = mgr.getAlert("hs-1");
+        CHECK(done && done->status == "active" && !done->pendingDir);
+        CHECK(done->triggeredAt.has_value());
+
+        mgr.checkCandleAlerts({hourBar(7, {105, 106, 100, 101}, m)});  // same candle again
+        CHECK(fires == 1);
+        mgr.checkCandleAlerts({hourBar(8, {101, 112, 100, 111}, m)});  // same side, same hour
+        CHECK(!mgr.getAlert("hs-1")->pendingDir);
+        mgr.checkCandleAlerts({hourBar(9, {111, 111, 90, 95}, m)});
+        CHECK(fires == 1);
+    }
+
+    // A touch of the level arms. A close beyond it arms. Falling short does not.
+    {
+        alerts::AlertManager touch;
+        touch.cacheAlert(makeHourSweepAlert("hs-touch", "any"));
+        seedPrevHour(touch);
+        for (int i = 0; i < 5; ++i) touch.checkCandleAlerts({hourBar(i, setup[i], false)});
+        touch.checkCandleAlerts({hourBar(5, {107, 110, 106, 109}, false)});
+        CHECK(touch.getAlert("hs-touch")->pendingDir.has_value());
+
+        alerts::AlertManager closeBeyond;
+        closeBeyond.cacheAlert(makeHourSweepAlert("hs-close", "any"));
+        seedPrevHour(closeBeyond);
+        for (int i = 0; i < 5; ++i) closeBeyond.checkCandleAlerts({hourBar(i, setup[i], false)});
+        closeBeyond.checkCandleAlerts({hourBar(5, {107, 113, 106, 112}, false)});
+        auto cb = closeBeyond.getAlert("hs-close");
+        CHECK(cb->pendingDir && *cb->pendingDir == "bear");
+
+        alerts::AlertManager short_;
+        short_.cacheAlert(makeHourSweepAlert("hs-short", "any"));
+        seedPrevHour(short_);
+        for (int i = 0; i < 5; ++i) short_.checkCandleAlerts({hourBar(i, setup[i], false)});
+        short_.checkCandleAlerts({hourBar(5, {107, 109.9, 106, 109}, false)});
+        CHECK(!short_.getAlert("hs-short")->pendingDir);
+    }
+
+    // The sweep candle itself may close through the run open.
+    {
+        alerts::AlertManager same;
+        same.cacheAlert(makeHourSweepAlert("hs-same", "bear"));
+        seedPrevHour(same);
+        int fires = 0;
+        same.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++fires; });
+        for (int i = 0; i < 5; ++i) same.checkCandleAlerts({hourBar(i, setup[i], false)});
+        same.checkCandleAlerts({hourBar(5, {107, 111, 100, 101}, false)});
+        CHECK(fires == 1);
+    }
+
+    // Wrong direction never arms. A CISD after the hour ends never fires.
+    {
+        alerts::AlertManager wrong;
+        wrong.cacheAlert(makeHourSweepAlert("hs-wrong", "bull"));
+        seedPrevHour(wrong);
+        for (int i = 0; i < 6; ++i) wrong.checkCandleAlerts({hourBar(i, setup[i], false)});
+        CHECK(!wrong.getAlert("hs-wrong")->pendingDir);
+
+        alerts::AlertManager late;
+        late.cacheAlert(makeHourSweepAlert("hs-late", "bear"));
+        seedPrevHour(late);
+        int fires = 0;
+        late.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++fires; });
+        for (int i = 0; i < 6; ++i) late.checkCandleAlerts({hourBar(i, setup[i], false)});
+        CHECK(late.getAlert("hs-late")->pendingDir.has_value());
+        late.checkCandleAlerts({hourBar(12, {105, 106, 100, 101}, false)});  // 23:00 candle
+        CHECK(fires == 0);
+        CHECK(!late.getAlert("hs-late")->pendingDir);
+    }
+
+    // No previous 1h candle: nothing arms.
+    {
+        alerts::AlertManager gap;
+        gap.cacheAlert(makeHourSweepAlert("hs-gap", "any"));
+        int fires = 0;
+        gap.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++fires; });
+        for (int i = 0; i < 6; ++i) gap.checkCandleAlerts({hourBar(i, setup[i], false)});
+        CHECK(!gap.getAlert("hs-gap")->pendingDir);
+        CHECK(fires == 0);
+    }
+
+    // Restart: the armed state survives, replay does not fire, the CISD still does.
+    {
+        alerts::AlertManager first;
+        first.cacheAlert(makeHourSweepAlert("hs-r", "bear"));
+        seedPrevHour(first);
+        for (int i = 0; i < 6; ++i) first.checkCandleAlerts({hourBar(i, setup[i], false)});
+        auto armed = first.getAlert("hs-r");
+        CHECK(armed && armed->pendingDir.has_value());
+
+        alerts::AlertManager restarted;
+        int fires = 0;
+        restarted.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++fires; });
+        restarted.cacheAlert(alerts::Alert::fromJson(armed->toJson()));
+        seedPrevHour(restarted);
+        std::vector<Json::Value> prior;
+        for (int i = 0; i < 6; ++i) prior.push_back(hourBar(i, setup[i], false));
+        restarted.ingestStructureHistory("EURUSD", "5m", prior);
+        CHECK(fires == 0);
+        restarted.checkCandleAlerts({hourBar(6, {110, 110.5, 104, 105}, false)});
+        restarted.checkCandleAlerts({hourBar(7, {105, 106, 100, 101}, false)});
+        CHECK(fires == 1);
+    }
+
+    // Two pairs stay independent.
+    {
+        alerts::AlertManager two;
+        two.cacheAlert(makeHourSweepAlert("hs-eur", "bear", "EURUSD"));
+        two.cacheAlert(makeHourSweepAlert("hs-gbp", "bear", "GBPUSD"));
+        seedPrevHour(two, "EURUSD");
+        seedPrevHour(two, "GBPUSD");
+        std::vector<std::string> firedPairs;
+        two.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
+            firedPairs.push_back(t.alert.pair);
+        });
+        for (int i = 0; i < 6; ++i) two.checkCandleAlerts({hourBar(i, setup[i], false, "EURUSD")});
+        two.checkCandleAlerts({hourBar(6, {110, 110.5, 104, 105}, false, "EURUSD")});
+        two.checkCandleAlerts({hourBar(7, {105, 106, 100, 101}, false, "EURUSD")});
+        CHECK(firedPairs.size() == 1 && firedPairs[0] == "EURUSD");
+        CHECK(!two.getAlert("hs-gbp")->pendingDir);
+    }
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -976,6 +1165,7 @@ int main() {
     testStructureSessionAlert();
     testSessionAlertsStayIndependentPerPair();
     testSweepConfirm();
+    testHourSweepCisd();
     testStructureSessionSteps();
     testMarketStructureUnchangedBySession();
     testAlertEventLedger();

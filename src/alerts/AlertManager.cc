@@ -279,6 +279,9 @@ void AlertManager::rebuildIndexes() {
         } else if (a.alertType == "sweep_confirm") {
             activeCandleIndex_[candleIndexKey(key, "5m")].push_back(a.id);
             activeCandleIndex_[candleIndexKey(key, "1h")].push_back(a.id);
+        } else if (a.alertType == "hour_sweep_cisd") {
+            activeCandleIndex_[candleIndexKey(key, "5m")].push_back(a.id);
+            activeCandleIndex_[candleIndexKey(key, "1h")].push_back(a.id);
         } else if (a.alertType == "structure_session") {
             for (const auto &raw : a.intervals) {
                 std::string iv = raw;
@@ -912,6 +915,52 @@ std::vector<Alert> AlertManager::createSweepConfirmAlerts(
     }
     commitCreatedAlerts(built);
     LOG_INFO << "Created " << built.size() << " sweep_confirm alert(s) dir=" << dir
+             << (batchId ? (" batch=" + *batchId) : "");
+    return built;
+}
+
+std::vector<Alert> AlertManager::createHourSweepCisdAlerts(
+    const std::vector<std::string> &pairs, const std::string &direction,
+    const std::string &userId, const std::string &email,
+    const std::vector<std::string> &channels, const std::string &phone,
+    const std::string &customMessage, const std::string &expiresAt) {
+    if (!postgres_) throw std::runtime_error("Database unavailable");
+    std::string dir = direction;
+    std::transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
+    if (dir != "bull" && dir != "bear" && dir != "any")
+        throw std::invalid_argument("structure_direction must be bull, bear, or any");
+    const std::vector<std::string> unique = util::uniqueCanonicalPairs(pairs);
+    if (unique.empty()) throw std::invalid_argument("At least one pair is required");
+    if (static_cast<int>(unique.size()) > kMaxBatchPairs)
+        throw std::invalid_argument("Select at most " + std::to_string(kMaxBatchPairs) + " pairs");
+
+    const std::string createdAt = util::nowIso8601();
+    std::optional<std::string> batchId;
+    if (unique.size() > 1) batchId = newUuid();
+    std::vector<Alert> built;
+    built.reserve(unique.size());
+    for (const auto &pair : unique) {
+        Alert a;
+        a.id = newUuid();
+        a.userId = userId;
+        a.pair = pair;
+        a.alertType = "hour_sweep_cisd";
+        a.interval = "5m";
+        a.structureEvents = {"cisd"};
+        a.structureDirection = dir;
+        a.batchId = batchId;
+        a.email = email;
+        a.channels = channels;
+        a.normalizeChannels();
+        a.phone = phone;
+        a.customMessage = customMessage;
+        a.expiresAt = expiresAt;
+        a.createdAt = createdAt;
+        a.status = "active";
+        built.push_back(std::move(a));
+    }
+    commitCreatedAlerts(built);
+    LOG_INFO << "Created " << built.size() << " hour_sweep_cisd alert(s) dir=" << dir
              << (batchId ? (" batch=" + *batchId) : "");
     return built;
 }
@@ -1672,6 +1721,109 @@ AlertManager::SessionStepResult AlertManager::evalSweepConfirmLocked(
     return SessionStepResult::Unchanged;
 }
 
+// hour_sweep_cisd: inside the forming 1h candle, a 5m candle trades at or beyond the
+// previous closed 1h high (bear) or low (bull), then a 5m close crosses the open of the
+// candle run that pushed into the level (CISD). Wick, touch, and close beyond all arm it.
+// Each side arms once per hour and the pending state ends with the hour.
+AlertManager::SessionStepResult AlertManager::evalHourSweepCisdLocked(
+    Alert &a, const Json::Value &candle, const std::string &candleTsStr, StructureTrack &track) {
+    if (a.lastEvaluatedCandleTime && *a.lastEvaluatedCandleTime == candleTsStr)
+        return SessionStepResult::Unchanged;
+    auto candleStart = parseCandleTs(candle["timestamp"]);
+    const int ivSec = intervalSeconds("5m");
+    auto createdAt = util::parseIso8601(a.createdAt);
+    if (candleStart && createdAt && *candleStart + ivSec <= *createdAt) {
+        a.lastEvaluatedCandleTime = candleTsStr;
+        return SessionStepResult::Unchanged;
+    }
+    a.lastEvaluatedCandleTime = candleTsStr;
+    if (!candleStart) return SessionStepResult::Unchanged;
+
+    const std::time_t hourStart = *candleStart - (*candleStart % 3600);
+    const std::string hourKey = util::toIso8601(hourStart);
+    const double high = candle.get("high", 0.0).asDouble();
+    const double low = candle.get("low", 0.0).asDouble();
+    const double close = candle.get("close", 0.0).asDouble();
+    bool changed = false;
+    bool fired = false;
+
+    auto clearPending = [&]() {
+        if (!a.pendingDir && !a.pendingSweepAt && a.pendingBars == 0) return;
+        a.pendingDir.reset();
+        a.pendingSweepAt.reset();
+        a.pendingSweepLevel.reset();
+        a.pendingRunOpen.reset();
+        a.pendingBars = 0;
+        changed = true;
+    };
+    auto tryFire = [&]() {
+        if (fired || !a.pendingDir) return;
+        if (a.triggeredAt) {
+            auto last = util::parseIso8601(*a.triggeredAt);
+            if (last && *candleStart + ivSec < *last + kSweepConfirmGapSec) {
+                clearPending();
+                return;
+            }
+        }
+        a.triggeredAt = util::toIso8601(*candleStart + ivSec);
+        a.lastCheckedPrice = close;
+        a.closePrice = close;
+        clearPending();
+        fired = true;
+    };
+    auto cisdConfirmed = [&]() {
+        if (!a.pendingDir || !a.pendingRunOpen) return false;
+        return *a.pendingDir == "bear" ? close < *a.pendingRunOpen : close > *a.pendingRunOpen;
+    };
+
+    // A pending sweep belongs to one hour only.
+    if (a.pendingSweepAt && *a.pendingSweepAt != hourKey) clearPending();
+    if (a.pendingDir && cisdConfirmed()) tryFire();
+
+    // Previous closed 1h candle is the one that opened exactly an hour earlier.
+    const std::string hourTrackKey = candleIndexKey(util::canonicalPair(a.pair), "1h");
+    auto hourIt = structureTracks_.find(hourTrackKey);
+    bool havePrev = false;
+    double prevHigh = 0, prevLow = 0;
+    if (hourIt != structureTracks_.end()) {
+        for (const auto &bar : hourIt->second.candles) {
+            auto start = util::parseIso8601(bar.timestamp);
+            if (start && *start == hourStart - 3600) {
+                prevHigh = bar.high;
+                prevLow = bar.low;
+                havePrev = true;
+                break;
+            }
+        }
+    }
+    if (havePrev && !fired) {
+        const std::string want = a.structureDirection.value_or("any");
+        const bool allowBear = want == "any" || want == "bear";
+        const bool allowBull = want == "any" || want == "bull";
+        const bool sweepBear =
+            allowBear && high >= prevHigh && (!a.sweptHighAt || *a.sweptHighAt != hourKey);
+        const bool sweepBull =
+            allowBull && low <= prevLow && (!a.sweptLowAt || *a.sweptLowAt != hourKey);
+        if (sweepBear || sweepBull) {
+            const bool bear = sweepBear && (!sweepBull || close < candle.get("open", close).asDouble());
+            a.pendingDir = bear ? "bear" : "bull";
+            a.pendingSweepAt = hourKey;
+            a.pendingSweepLevel = bear ? prevHigh : prevLow;
+            a.pendingRunOpen = deliveryRunOpen(track.candles, candleTsStr, bear);
+            a.pendingBars = 1;
+            if (bear)
+                a.sweptHighAt = hourKey;
+            else
+                a.sweptLowAt = hourKey;
+            changed = true;
+            if (cisdConfirmed()) tryFire();
+        }
+    }
+    if (fired) return SessionStepResult::Triggered;
+    if (changed) return SessionStepResult::Updated;
+    return SessionStepResult::Unchanged;
+}
+
 AlertManager::SessionStepResult AlertManager::evalStructureSessionLocked(
     Alert &a, const std::string &interval, const Json::Value &candle,
     const std::string &candleTsStr, StructureTrack &track) {
@@ -1911,6 +2063,34 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                             triggered.push_back(t);
                             toPersist.push_back({before, a, true, true});
                             LOG_INFO << "Triggered sweep_confirm alert " << a.id << " " << a.pair
+                                     << " close=" << t.currentPrice;
+                        } else {
+                            toPersist.push_back({before, a, false, true});
+                        }
+                        continue;
+                    }
+                    if (a.status == "active" && a.alertType == "hour_sweep_cisd") {
+                        if (k.interval != "5m") continue;
+                        if (isPastExpiry(a)) {
+                            Alert before = a;
+                            a.status = "expired";
+                            toPersist.push_back({before, a, true, true});
+                            LOG_INFO << "Expired hour_sweep_cisd alert " << a.id << " " << a.pair
+                                     << " (past expires_at)";
+                            continue;
+                        }
+                        Alert before = a;
+                        const auto step = evalHourSweepCisdLocked(a, candle, candleTsStr, track);
+                        if (step == SessionStepResult::Unchanged) continue;
+                        if (step == SessionStepResult::Triggered) {
+                            TriggeredAlert t;
+                            t.alert = a;
+                            t.currentPrice = candle.get("close", 0.0).asDouble();
+                            t.alertTypeLabel = "hour_sweep_cisd";
+                            t.timeframe = "5m";
+                            triggered.push_back(t);
+                            toPersist.push_back({before, a, true, true});
+                            LOG_INFO << "Triggered hour_sweep_cisd alert " << a.id << " " << a.pair
                                      << " close=" << t.currentPrice;
                         } else {
                             toPersist.push_back({before, a, false, true});

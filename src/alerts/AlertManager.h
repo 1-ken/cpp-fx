@@ -109,6 +109,12 @@ class AlertManager {
         const std::string &customMessage, const std::string &expiresAt,
         std::optional<double> minSwingAtr = std::nullopt,
         std::optional<double> breakK = std::nullopt);
+    // hour_sweep_cisd: one independent alert per pair. direction is bull, bear, or any.
+    std::vector<Alert> createHourSweepCisdAlerts(
+        const std::vector<std::string> &pairs, const std::string &direction,
+        const std::string &userId, const std::string &email,
+        const std::vector<std::string> &channels, const std::string &phone,
+        const std::string &customMessage, const std::string &expiresAt);
     std::vector<Alert> createStructureSessionAlerts(
         const std::vector<std::string> &pairs, const std::vector<std::string> &intervals,
         const std::vector<std::string> &structureEvents, const std::string &structureDirection,
@@ -198,6 +204,9 @@ class AlertManager {
     SessionStepResult evalSweepConfirmLocked(Alert &a, const Json::Value &candle,
                                              const std::string &candleTsStr,
                                              StructureTrack &track);
+    SessionStepResult evalHourSweepCisdLocked(Alert &a, const Json::Value &candle,
+                                              const std::string &candleTsStr,
+                                              StructureTrack &track);
     // Caller holds mu_. Mutates a when the session day rolls or a step matches.
     SessionStepResult evalStructureSessionLocked(Alert &a, const std::string &interval,
                                                  const Json::Value &candle,
