@@ -40,12 +40,22 @@ class NotificationQueue {
         std::string idem;
         bool mirrored = false;
         std::vector<std::string> onlyChannels;
+        // Alerts whose call was merged into this job's call. They share its result.
+        struct MergedEvent {
+            std::string eventId;
+            std::string userId;
+        };
+        std::vector<MergedEvent> merged;
     };
 
     struct CallGate {
         bool inFlight = false;
         std::chrono::steady_clock::time_point lastPlaced{};
+        // Alerts that fired inside the minute. One summary call goes out when it ends.
+        std::vector<alerts::TriggeredAlert> held;
+        bool releaseScheduled = false;
     };
+    static constexpr std::size_t kMaxHeldCalls = 100;
 
     void pump();
     void processJob(Job job);
@@ -59,9 +69,15 @@ class NotificationQueue {
     static std::string callCoalesceKey(const alerts::Alert &a);
     static bool alertHasCallChannel(const alerts::Alert &a);
     static void stripCallChannel(alerts::Alert &a);
-    static void appendCallMessage(alerts::Alert &dst, const alerts::Alert &src);
     bool shouldSkipCallLocked(const std::string &key) const;
-    bool tryMergeCallIntoPendingLocked(alerts::TriggeredAlert &incoming);
+    // Seconds until the minute ends for this key (0 when no call was accepted yet).
+    double releaseDelayLocked(const CallGate &gate) const;
+    void scheduleReleaseLocked(const std::string &key, double delaySeconds);
+    // Sends the held alerts as one summary call once the minute has ended.
+    void releaseHeldCalls(const std::string &key);
+    // Merges into a pending call (it then shares that call's result) or returns why the
+    // incoming alert's call was dropped. Returns "" when merged or when it keeps its call.
+    std::string tryMergeCallIntoPendingLocked(alerts::TriggeredAlert &incoming);
     void dispatchOneChannel(const alerts::TriggeredAlert &t, const std::string &channel,
                             std::function<void(alerts::ChannelReport)> onDone);
     void dispatchAllChannels(const alerts::TriggeredAlert &t,
@@ -84,8 +100,6 @@ class NotificationQueue {
     std::string streamGroup_ = "notif";
     bool streamStarted_ = false;
     bool pumping_ = false;
-
-    static constexpr double kCallQuietWindowSeconds = 15.0;
 };
 
 }  // namespace ctraderplus::services

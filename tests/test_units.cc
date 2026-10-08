@@ -947,6 +947,44 @@ static void testAlertEventLedger() {
     CHECK(alerts::AlertEventLedger::isEmptyInbox(emptyOk));
 }
 
+static void testCallWindow() {
+    CHECK(alerts::kCallWindowSeconds == 60.0);
+    CHECK(!alerts::callWindowBlocks(false, false, 0));
+    CHECK(alerts::callWindowBlocks(true, false, 0));    // being placed
+    CHECK(alerts::callWindowBlocks(false, true, 10));   // inside the minute
+    CHECK(alerts::callWindowBlocks(false, true, 59.9));
+    CHECK(!alerts::callWindowBlocks(false, true, 60));  // a new minute places a new call
+    CHECK(!alerts::callWindowBlocks(false, true, 300));
+
+    const auto s = alerts::callSnippet("GBPUSD", "sweep_confirm", 1.27345, "watch the open");
+    CHECK(s == "GBPUSD sweep confirm at 1.27345: watch the open");
+    CHECK(alerts::callSnippet("USDJPY", "price", 151.234, "") == "USDJPY at 151.23");
+    CHECK(alerts::callSnippet("", "", 0, "") == "alert");
+
+    // Held alerts are released when the minute ends, or at once after a failed call.
+    CHECK(alerts::callReleaseDelaySeconds(false, 0) == 0.0);
+    CHECK(alerts::callReleaseDelaySeconds(true, 0) == 60.0);
+    CHECK(alerts::callReleaseDelaySeconds(true, 45) == 15.0);
+    CHECK(alerts::callReleaseDelaySeconds(true, 60) == 0.0);
+    CHECK(alerts::callReleaseDelaySeconds(true, 90) == 0.0);
+
+    const std::vector<std::string> three = {"A one", "B two", "C three"};
+    CHECK(alerts::callDigestMessage(three) == "A one. B two. C three");
+    std::vector<std::string> eight;
+    for (int i = 1; i <= 8; ++i) eight.push_back("P" + std::to_string(i));
+    CHECK(alerts::callDigestMessage(eight) == "P1. P2. P3. P4. P5. and 3 more, check the app");
+    CHECK(alerts::callDigestMessage({}) == "");
+
+    std::string msg = "first";
+    alerts::appendCallSnippet(msg, "GBPUSD sweep confirm");
+    alerts::appendCallSnippet(msg, "USDJPY session");
+    alerts::appendCallSnippet(msg, "GBPUSD sweep confirm");  // not repeated
+    CHECK(msg == "first. GBPUSD sweep confirm. USDJPY session");
+    std::string empty;
+    alerts::appendCallSnippet(empty, "EURUSD");
+    CHECK(empty == "EURUSD");
+}
+
 static void testPhoneE164() {
     CHECK(util::normalizePhone(" +254 712-345-678 ") == "+254712345678");
     CHECK(util::normalizePhone("00254712345678") == "+254712345678");
@@ -1170,6 +1208,7 @@ int main() {
     testMarketStructureUnchangedBySession();
     testAlertEventLedger();
     testPhoneE164();
+    testCallWindow();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

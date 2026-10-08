@@ -52,51 +52,117 @@ void NotificationQueue::stripCallChannel(alerts::Alert &a) {
     a.channelsCached_ = false;
 }
 
-void NotificationQueue::appendCallMessage(alerts::Alert &dst, const alerts::Alert &src) {
-    std::string snippet = src.customMessage;
-    if (snippet.empty()) {
-        snippet = src.pair.empty() ? "alert triggered" : (src.pair + " alert");
-    }
-    if (dst.customMessage.empty()) {
-        dst.customMessage = std::move(snippet);
-        return;
-    }
-    if (dst.customMessage.find(snippet) == std::string::npos) {
-        dst.customMessage += ". ";
-        dst.customMessage += snippet;
-    }
-}
-
 bool NotificationQueue::shouldSkipCallLocked(const std::string &key) const {
     auto it = callGates_.find(key);
     if (it == callGates_.end()) return false;
-    if (it->second.inFlight) return true;
-    if (it->second.lastPlaced.time_since_epoch().count() == 0) return false;
-    const auto elapsed = std::chrono::steady_clock::now() - it->second.lastPlaced;
-    return elapsed < std::chrono::duration<double>(kCallQuietWindowSeconds);
+    const bool everPlaced = it->second.lastPlaced.time_since_epoch().count() != 0;
+    const double elapsed =
+        everPlaced ? std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                    it->second.lastPlaced)
+                         .count()
+                   : 0.0;
+    return alerts::callWindowBlocks(it->second.inFlight, everPlaced, elapsed);
 }
 
-bool NotificationQueue::tryMergeCallIntoPendingLocked(alerts::TriggeredAlert &incoming) {
-    if (!alertHasCallChannel(incoming.alert) || incoming.alert.phone.empty()) return false;
+double NotificationQueue::releaseDelayLocked(const CallGate &gate) const {
+    const bool everPlaced = gate.lastPlaced.time_since_epoch().count() != 0;
+    const double elapsed =
+        everPlaced
+            ? std::chrono::duration<double>(std::chrono::steady_clock::now() - gate.lastPlaced).count()
+            : 0.0;
+    return alerts::callReleaseDelaySeconds(everPlaced, elapsed);
+}
+
+void NotificationQueue::scheduleReleaseLocked(const std::string &key, double delaySeconds) {
+    auto &gate = callGates_[key];
+    if (gate.releaseScheduled || gate.held.empty() || !loop_) return;
+    gate.releaseScheduled = true;
+    loop_->runAfter(std::max(0.05, delaySeconds), [this, key]() { releaseHeldCalls(key); });
+}
+
+void NotificationQueue::releaseHeldCalls(const std::string &key) {
+    Job job;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = callGates_.find(key);
+        if (it == callGates_.end()) return;
+        auto &gate = it->second;
+        gate.releaseScheduled = false;
+        if (gate.held.empty()) return;
+        if (gate.inFlight) return;  // the call's completion schedules the release
+        const double wait = releaseDelayLocked(gate);
+        if (wait > 0.0) {
+            scheduleReleaseLocked(key, wait);
+            return;
+        }
+        std::vector<alerts::TriggeredAlert> held = std::move(gate.held);
+        gate.held.clear();
+
+        std::vector<std::string> snippets;
+        snippets.reserve(held.size());
+        for (const auto &h : held) {
+            snippets.push_back(alerts::callSnippet(h.alert.pair, h.alertTypeLabel, h.currentPrice,
+                                                   h.alert.customMessage));
+        }
+        job.triggered = held.front();
+        job.triggered.alert.customMessage = alerts::callDigestMessage(snippets);
+        for (std::size_t i = 1; i < held.size(); ++i) {
+            if (!held[i].eventId.empty()) {
+                job.merged.push_back({held[i].eventId, held[i].alert.userId});
+            }
+        }
+        job.onlyChannels = {"call"};
+        job.idem = idempotencyKey(held.front().alert) + "|call-digest|" + util::generateUuid();
+        queuedIdems_.insert(job.idem);
+        pending_.push_back(job);
+        core::Metrics::instance().notificationQueueDepth.store(static_cast<int>(pending_.size()),
+                                                               std::memory_order_relaxed);
+        LOG_INFO << "[alerts] releasing summary call alerts=" << held.size() << " key=" << key;
+    }
+    if (redis_ && redis_->connected()) {
+        const std::string idem = job.idem;
+        redis_->streamAdd(streamKey_, jobPayload(job), idem, runId_,
+                          [this, idem](std::optional<std::string> id) {
+                              if (id) noteStreamId(idem, *id);
+                          });
+    }
+    loop_->queueInLoop([this]() { pump(); });
+}
+
+std::string NotificationQueue::tryMergeCallIntoPendingLocked(alerts::TriggeredAlert &incoming) {
+    if (!alertHasCallChannel(incoming.alert) || incoming.alert.phone.empty()) return "";
 
     const std::string key = callCoalesceKey(incoming.alert);
     for (auto &job : pending_) {
         if (!alertHasCallChannel(job.triggered.alert)) continue;
         if (callCoalesceKey(job.triggered.alert) != key) continue;
-        appendCallMessage(job.triggered.alert, incoming.alert);
+        alerts::appendCallSnippet(
+            job.triggered.alert.customMessage,
+            alerts::callSnippet(incoming.alert.pair, incoming.alertTypeLabel,
+                                incoming.currentPrice, incoming.alert.customMessage));
+        if (!incoming.eventId.empty()) {
+            job.merged.push_back({incoming.eventId, incoming.alert.userId});
+        }
         stripCallChannel(incoming.alert);
-        LOG_INFO << "[alerts] coalesced call into pending job phone=" << incoming.alert.phone
+        LOG_INFO << "[alerts] merged call into pending call phone=" << incoming.alert.phone
                  << " pair=" << incoming.alert.pair;
-        return true;
+        return "";
     }
 
     if (shouldSkipCallLocked(key)) {
+        auto &gate = callGates_[key];
+        if (gate.held.size() >= kMaxHeldCalls) {
+            stripCallChannel(incoming.alert);
+            return "Too many calls queued for this number; check the app";
+        }
+        gate.held.push_back(incoming);  // keeps its call channel for the summary call
         stripCallChannel(incoming.alert);
-        LOG_INFO << "[alerts] skipped call (in-flight or quiet window) phone=" << incoming.alert.phone
+        if (!gate.inFlight) scheduleReleaseLocked(key, releaseDelayLocked(gate));
+        LOG_INFO << "[alerts] queued call for next minute phone=" << incoming.alert.phone
                  << " pair=" << incoming.alert.pair;
-        return true;
+        return "queued";
     }
-    return false;
+    return "";
 }
 
 void NotificationQueue::dispatchOneChannel(const alerts::TriggeredAlert &t,
@@ -214,9 +280,18 @@ void NotificationQueue::dispatchOneChannel(const alerts::TriggeredAlert &t,
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (shouldSkipCallLocked(key)) {
-                LOG_INFO << "[alerts] skipped duplicate call at dispatch phone=" << a.phone
-                         << " pair=" << a.pair;
-                finish("skipped", "Another call was just placed", false);
+                // Another call won the race. Hold this one for the next minute's call.
+                auto &gate = callGates_[key];
+                if (gate.held.size() < kMaxHeldCalls) {
+                    gate.held.push_back(t);
+                    if (!gate.inFlight) scheduleReleaseLocked(key, releaseDelayLocked(gate));
+                    LOG_INFO << "[alerts] queued call at dispatch phone=" << a.phone
+                             << " pair=" << a.pair;
+                    finish("queued", "Queued for the next call", false);
+                } else {
+                    finish("skipped", "Too many calls queued for this number; check the app",
+                           false);
+                }
                 return;
             }
             callGates_[key].inFlight = true;
@@ -230,6 +305,11 @@ void NotificationQueue::dispatchOneChannel(const alerts::TriggeredAlert &t,
                     auto &gate = callGates_[key];
                     gate.inFlight = false;
                     if (ok) gate.lastPlaced = std::chrono::steady_clock::now();
+                    // Held alerts go out when the minute ends. A failed call opened no
+                    // minute, so they go out now.
+                    if (!gate.held.empty()) {
+                        scheduleReleaseLocked(key, ok ? alerts::kCallWindowSeconds : 0.0);
+                    }
                 }
                 if (ok) {
                     LOG_INFO << "[alerts] call placed pair=" << a.pair << " phone=" << a.phone;
@@ -335,10 +415,13 @@ void NotificationQueue::enqueue(alerts::TriggeredAlert triggered) {
     if (!loop_ || !notifier_) return;
     const std::string idem = idempotencyKey(triggered.alert);
     Job job;
+    std::string callNote;
+    const std::string noteEventId = triggered.eventId;
+    const std::string noteUserId = triggered.alert.userId;
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (deliveredIdems_.count(idem) || queuedIdems_.count(idem)) return;
-        tryMergeCallIntoPendingLocked(triggered);
+        callNote = tryMergeCallIntoPendingLocked(triggered);
         if (triggered.alert.effectiveChannels().empty()) return;
         queuedIdems_.insert(idem);
         job.triggered = std::move(triggered);
@@ -346,6 +429,22 @@ void NotificationQueue::enqueue(alerts::TriggeredAlert triggered) {
         pending_.push_back(job);
         core::Metrics::instance().notificationQueueDepth.store(static_cast<int>(pending_.size()),
                                                                std::memory_order_relaxed);
+    }
+    if (!callNote.empty() && !noteEventId.empty()) {
+        // The bell shows why this alert placed no call of its own.
+        auto &appNow = core::AppContext::instance();
+        if (appNow.dbExec && appNow.postgres) {
+            appNow.dbExec([noteEventId, noteUserId, callNote, pg = appNow.postgres]() {
+                if (!pg) return;
+                if (callNote == "queued") {
+                    pg->updateAlertEventDelivery(noteEventId, noteUserId, "call", "queued",
+                                                 "Queued for the next call");
+                } else {
+                    pg->updateAlertEventDelivery(noteEventId, noteUserId, "call", "skipped",
+                                                 callNote);
+                }
+            });
+        }
     }
     bool mirrorExternal = false;
     for (const auto &channel : job.triggered.alert.effectiveChannels()) {
@@ -403,6 +502,22 @@ void NotificationQueue::processJob(Job job) {
     auto channels = job.onlyChannels.empty() ? triggered.alert.effectiveChannels() : job.onlyChannels;
     auto onDone = [this, job = std::move(job), triggered, idem](
                       std::vector<alerts::ChannelReport> reports) mutable {
+        if (!job.merged.empty()) {
+            // Alerts merged into this call show the same call result as the call itself.
+            for (const auto &report : reports) {
+                if (report.channel != "call") continue;
+                auto &appNow = core::AppContext::instance();
+                if (!appNow.dbExec || !appNow.postgres) break;
+                for (const auto &m : job.merged) {
+                    appNow.dbExec([m, report, pg = appNow.postgres]() {
+                        if (pg) {
+                            pg->updateAlertEventDelivery(m.eventId, m.userId, "call", report.status,
+                                                         report.reason);
+                        }
+                    });
+                }
+            }
+        }
         const auto retry = alerts::channelsToRetry(reports);
         if (retry.empty()) {
             {
