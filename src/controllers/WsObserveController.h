@@ -48,6 +48,7 @@ class WsObserveController : public drogon::WebSocketController<WsObserveControll
     // enrichment). Invoked by MarketHub's broadcast sink.
     static void broadcastToAll(std::shared_ptr<Json::Value> grouped);
     static void pushTriggered(const std::string &userId, const Json::Value &frame);
+    static void broadcastFvgAlert(const Json::Value &fvgAlertFrame);
 
   private:
     static std::mutex connsMu_;

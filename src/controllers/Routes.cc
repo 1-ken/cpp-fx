@@ -37,6 +37,7 @@
 #include "core/DbReady.h"
 #include "ctrader/CTraderClient.h"
 #include "ctrader/SymbolRegistry.h"
+#include "fvg/FVGService.h"
 #include "market/MarketHub.h"
 #include "market/SymbolSubscriptionPlanner.h"
 #include "services/PostgresService.h"
@@ -1912,6 +1913,28 @@ void markAllAlertEventsRead(const HttpRequestPtr &req,
     });
 }
 
+void activeFvgZones(const HttpRequestPtr &req,
+                    std::function<void(const HttpResponsePtr &)> &&cb) {
+    auto &app = AppContext::instance();
+    Json::Value out(Json::objectValue);
+    out["enabled"] = app.config ? app.config->fvgDetectorEnabled : false;
+    Json::Value zonesArr(Json::arrayValue);
+
+    if (app.fvgService && out["enabled"].asBool()) {
+        std::string symbol = trimStr(req->getParameter("symbol"));
+        std::string timeframe = trimStr(req->getParameter("timeframe"));
+        if (!symbol.empty()) {
+            symbol = util::canonicalPair(symbol);
+        }
+        auto zones = app.fvgService->registry().getActiveZones(symbol, timeframe);
+        for (const auto &z : zones) {
+            zonesArr.append(fvg::FVGService::serializeZone(z, "FORMED"));
+        }
+    }
+    out["zones"] = zonesArr;
+    cb(jsonResp(out));
+}
+
 }  // namespace
 
 void registerRoutes() {
@@ -1931,6 +1954,7 @@ void registerRoutes() {
     fw.registerHandler("/snapshot", &snapshot, {Get});
     fw.registerHandler("/client-config", &clientConfig, {Get});
     fw.registerHandler("/stream-health", &streamHealth, {Get});
+    fw.registerHandler("/api/fvg/active", &activeFvgZones, {Get});
     fw.registerHandler("/me", &me, {Get});
     fw.registerHandler("/user/phone", &updateUserPhone, {Post});
     fw.registerHandler("/onboarding/complete", &onboardingComplete, {Post});

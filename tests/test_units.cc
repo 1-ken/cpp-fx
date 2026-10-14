@@ -20,6 +20,10 @@
 #include "market/StructureEngine.h"
 #include "util/TimeUtil.h"
 #include "ctrader/Types.h"
+#include "fvg/BarAggregator.h"
+#include "fvg/FVGDetector.h"
+#include "fvg/FVGRegistry.h"
+#include "fvg/FVGService.h"
 
 using namespace ctraderplus;
 
@@ -1182,6 +1186,112 @@ static void testHourSweepCisd() {
     }
 }
 
+static void testFvgDetection() {
+    using namespace ctraderplus::fvg;
+    // 1. Bullish FVG test: b1.high < b3.low
+    ClosedBar b1{"EURUSD", "M15", 1000, 1.0780, 1.0800, 1.0775, 1.0790, 100};
+    ClosedBar b2{"EURUSD", "M15", 1900, 1.0790, 1.0850, 1.0785, 1.0845, 250};
+    ClosedBar b3{"EURUSD", "M15", 2800, 1.0845, 1.0860, 1.0820, 1.0855, 120};
+
+    auto bullish = FVGDetector::detectFVG(b1, b2, b3, 1.5);
+    CHECK(bullish.has_value());
+    CHECK(bullish->is_bullish == true);
+    CHECK(bullish->top == 1.0820);
+    CHECK(bullish->bottom == 1.0800);
+    CHECK(bullish->id == "EURUSD_M15_2800");
+
+    // 2. Bearish FVG test: b1.low > b3.high
+    ClosedBar bb1{"EURUSD", "M15", 1000, 1.0920, 1.0930, 1.0900, 1.0910, 100};
+    ClosedBar bb2{"EURUSD", "M15", 1900, 1.0910, 1.0915, 1.0830, 1.0835, 300};
+    ClosedBar bb3{"EURUSD", "M15", 2800, 1.0835, 1.0870, 1.0820, 1.0840, 150};
+
+    auto bearish = FVGDetector::detectFVG(bb1, bb2, bb3, 1.5);
+    CHECK(bearish.has_value());
+    CHECK(bearish->is_bullish == false);
+    CHECK(bearish->top == 1.0900);
+    CHECK(bearish->bottom == 1.0870);
+    CHECK(bearish->id == "EURUSD_M15_2800");
+
+    // 3. Noise filter test (gap too small)
+    ClosedBar n1{"EURUSD", "M15", 1000, 1.0800, 1.08000, 1.0790, 1.0795, 100};
+    ClosedBar n2{"EURUSD", "M15", 1900, 1.0795, 1.08100, 1.0795, 1.0805, 100};
+    ClosedBar n3{"EURUSD", "M15", 2800, 1.0805, 1.08150, 1.08005, 1.0810, 100};
+    auto noise = FVGDetector::detectFVG(n1, n2, n3, 1.5);
+    CHECK(!noise.has_value());
+}
+
+static void testBarAggregatorMtf() {
+    using namespace ctraderplus::fvg;
+    std::vector<ClosedBar> completed;
+    BarAggregator agg([&](const ClosedBar &b) {
+        completed.push_back(b);
+    });
+
+    // Feed 5 1-minute bars covering bucket 0 to 300
+    agg.onClosed1mBar("EURUSD", 0,   1.0800, 1.0810, 1.0790, 1.0805, 10);
+    agg.onClosed1mBar("EURUSD", 60,  1.0805, 1.0820, 1.0800, 1.0815, 15);
+    agg.onClosed1mBar("EURUSD", 120, 1.0815, 1.0825, 1.0810, 1.0820, 20);
+    agg.onClosed1mBar("EURUSD", 180, 1.0820, 1.0830, 1.0815, 1.0825, 25);
+    agg.onClosed1mBar("EURUSD", 240, 1.0825, 1.0835, 1.0820, 1.0830, 30);
+
+    // 6th bar crosses into the next M5 bucket (timestamp 300)
+    agg.onClosed1mBar("EURUSD", 300, 1.0830, 1.0840, 1.0825, 1.0835, 10);
+
+    bool foundM5 = false;
+    for (const auto &b : completed) {
+        if (b.timeframe == "M5" && b.bucketStartSec == 0) {
+            foundM5 = true;
+            CHECK(b.open == 1.0800);
+            CHECK(b.high == 1.0835);
+            CHECK(b.low == 1.0790);
+            CHECK(b.close == 1.0830);
+            CHECK(b.volume == 100);
+        }
+    }
+    CHECK(foundM5);
+}
+
+static void testFvgMitigationAndPruning() {
+    using namespace ctraderplus::fvg;
+    FVGRegistry registry(FVGRegistry::Options{2, 100});
+
+    FVGZone z1;
+    z1.id = "EURUSD_M15_1000";
+    z1.symbol = "EURUSD";
+    z1.timeframe = "M15";
+    z1.top = 1.0850;
+    z1.bottom = 1.0800;
+    z1.is_bullish = true;
+    z1.formed_timestamp = 1000;
+    CHECK(registry.registerZone(z1));
+
+    // Subsequent bar that does not fill the gap (low = 1.0820 > bottom 1.0800)
+    ClosedBar barNoFill{"EURUSD", "M15", 2000, 1.0860, 1.0870, 1.0820, 1.0850, 100};
+    auto mit1 = registry.checkMitigation(barNoFill);
+    CHECK(mit1.empty());
+    CHECK(registry.getActiveZones("EURUSD", "M15").size() == 1);
+
+    // Subsequent bar that fills the gap (low = 1.0790 <= bottom 1.0800)
+    ClosedBar barFill{"EURUSD", "M15", 3000, 1.0830, 1.0840, 1.0790, 1.0800, 150};
+    auto mit2 = registry.checkMitigation(barFill);
+    CHECK(mit2.size() == 1);
+    CHECK(mit2[0].id == "EURUSD_M15_1000");
+    CHECK(mit2[0].mitigated == true);
+    CHECK(registry.getActiveZones("EURUSD", "M15").empty());
+
+    // Retention limit pruning (max 2)
+    FVGZone zA{"A", "EURUSD", "M15", 1.08, 1.07, true, 100, false, 0};
+    FVGZone zB{"B", "EURUSD", "M15", 1.08, 1.07, true, 200, false, 0};
+    FVGZone zC{"C", "EURUSD", "M15", 1.08, 1.07, true, 300, false, 0};
+    registry.registerZone(zA);
+    registry.registerZone(zB);
+    registry.registerZone(zC);
+    auto active = registry.getActiveZones("EURUSD", "M15");
+    CHECK(active.size() == 2);
+    CHECK(active[0].id == "B");
+    CHECK(active[1].id == "C");
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -1209,6 +1319,9 @@ int main() {
     testAlertEventLedger();
     testPhoneE164();
     testCallWindow();
+    testFvgDetection();
+    testBarAggregatorMtf();
+    testFvgMitigationAndPruning();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

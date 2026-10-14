@@ -21,6 +21,9 @@ class SymbolSubscriptionPlanner;
 namespace ctraderplus::alerts {
 class AlertManager;
 }
+namespace ctraderplus::fvg {
+class FVGService;
+}
 namespace ctraderplus::services {
 class PostgresService;
 class RedisService;
@@ -37,6 +40,7 @@ struct AppContext {
     ctrader::CTraderClient *ctrader = nullptr;
     market::MarketHub *hub = nullptr;
     alerts::AlertManager *alerts = nullptr;
+    fvg::FVGService *fvgService = nullptr;
     services::PostgresService *postgres = nullptr;  // may be null (degraded)
     services::RedisService *redis = nullptr;        // may be null (degraded)
     services::Notifier *notifier = nullptr;

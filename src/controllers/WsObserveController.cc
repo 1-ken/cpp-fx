@@ -451,4 +451,28 @@ void WsObserveController::pushTriggered(const std::string &userId, const Json::V
     }
 }
 
+void WsObserveController::broadcastFvgAlert(const Json::Value &fvgAlertFrame) {
+    std::string wire;
+    try {
+        wire = toJsonString(fvgAlertFrame);
+    } catch (const std::exception &e) {
+        LOG_WARN << "fvg alert frame encode failed: " << e.what();
+        return;
+    }
+    std::vector<WebSocketConnectionPtr> targets;
+    {
+        std::lock_guard<std::mutex> lk(connsMu_);
+        for (const auto &conn : conns_) {
+            if (conn && conn->connected()) targets.push_back(conn);
+        }
+    }
+    for (auto &conn : targets) {
+        try {
+            conn->send(wire);
+        } catch (const std::exception &e) {
+            LOG_WARN << "fvg alert frame send failed: " << e.what();
+        }
+    }
+}
+
 }  // namespace ctraderplus::controllers

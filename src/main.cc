@@ -26,6 +26,7 @@
 #include "ctrader/CTraderClient.h"
 #include "ctrader/CTraderTokenStore.h"
 #include "ctrader/SymbolRegistry.h"
+#include "fvg/FVGService.h"
 #include "market/MarketHub.h"
 #include "market/PrevDayLevelProvider.h"
 #include "market/SymbolSubscriptionPlanner.h"
@@ -55,6 +56,20 @@ int main() {
     static market::SymbolSubscriptionPlanner subscriptionPlanner(cfg, registry, alertManager);
     static market::PrevDayLevelProvider prevDayLevels;
     static services::NotificationQueue notificationQueue;
+
+    fvg::FVGService::Config fvgCfg;
+    fvgCfg.enabled = cfg.fvgDetectorEnabled;
+    fvgCfg.minGapPips = cfg.fvgMinGapPips;
+    fvgCfg.minAtrMultiplier = cfg.fvgMinAtrMultiplier;
+    fvgCfg.maxUnmitigatedPerTimeframe = cfg.fvgMaxUnmitigatedPerTimeframe;
+    fvgCfg.maxAgeBars = cfg.fvgMaxAgeBars;
+    static fvg::FVGService fvgService(fvgCfg);
+    fvgService.setBroadcastSink([](const Json::Value &frame) {
+        controllers::WsObserveController::broadcastFvgAlert(frame);
+    });
+    if (cfg.fvgDetectorEnabled) {
+        fvgService.start();
+    }
 
     static trantor::EventLoopThread workerThread("alert-persist");
     static trantor::EventLoopThread evalThread("alert-eval");
@@ -223,6 +238,24 @@ int main() {
     ctrader.setSpotCallback([&](const ctrader::SpotUpdate &u) {
         hub.onSpot(u);
         evalLoop->queueInLoop([u]() { candleMonitor.onSpot(u); });
+        if (cfg.fvgDetectorEnabled) {
+            std::string canon = registry.canonicalForId(u.symbolId);
+            if (!canon.empty()) {
+                double price = 0.0;
+                if (u.hasBid && u.hasAsk) {
+                    price = (u.bid + u.ask) / 2.0;
+                } else if (u.hasBid) {
+                    price = u.bid;
+                } else if (u.hasAsk) {
+                    price = u.ask;
+                }
+                if (price > 0.0) {
+                    int64_t tsSec = u.timestampMs > 0 ? (u.timestampMs / 1000)
+                                                       : static_cast<int64_t>(std::time(nullptr));
+                    fvgService.feedTick(canon, tsSec, price);
+                }
+            }
+        }
     });
 
     auto &app = core::AppContext::instance();
@@ -231,6 +264,7 @@ int main() {
     app.ctrader = &ctrader;
     app.hub = &hub;
     app.alerts = &alertManager;
+    app.fvgService = &fvgService;
     app.postgres = pgPtr;
     app.redis = redisPtr;
     app.notifier = &notifier;

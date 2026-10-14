@@ -86,6 +86,13 @@ struct Config {
     double notificationRetryDelaySeconds = 1.0;
     int retentionDays = 14;
 
+    // Fair Value Gap (FVG) detection
+    bool fvgDetectorEnabled = true;
+    double fvgMinGapPips = 1.5;
+    double fvgMinAtrMultiplier = 0.0;
+    int fvgMaxUnmitigatedPerTimeframe = 20;
+    int fvgMaxAgeBars = 100;
+
     std::vector<std::string> majors = {"USD", "EUR", "JPY", "GBP",
                                        "AUD", "CAD", "CHF", "NZD"};
     std::vector<std::string> subscribedPairs;

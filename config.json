@@ -59,5 +59,10 @@
     "VIX", "EURX", "JPYX", "USDX", "US30", "NAS100", "US500", "UK100", "AUS200",
     "EUSTX50", "FRA40", "GER40", "HK50", "JPN225", "SPA35", "US2000", "CN50", "SWI20",
     "XAUUSD", "XAGUSD", "SpotCrude", "SpotBrent", "NatGas"
-  ]
+  ],
+  "fvg_detector_enabled": true,
+  "fvg_min_gap_pips": 1.5,
+  "fvg_min_atr_multiplier": 0.0,
+  "fvg_max_unmitigated_per_timeframe": 20,
+  "fvg_max_age_bars": 100
 }

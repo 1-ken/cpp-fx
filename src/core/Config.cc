@@ -234,6 +234,22 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
         jstr(root, "notificationTimezone", c.notificationTimezone);
     c.retentionDays = jint(root, "retentionDays", c.retentionDays);
 
+    // ---- FVG detector ----
+    c.fvgDetectorEnabled = envBool(
+        "FVG_DETECTOR_ENABLED",
+        jbool(root, "fvg_detector_enabled",
+              jbool(root, "fvgDetectorEnabled", c.fvgDetectorEnabled)));
+    c.fvgMinGapPips =
+        jnum(root, "fvg_min_gap_pips", jnum(root, "fvgMinGapPips", c.fvgMinGapPips));
+    c.fvgMinAtrMultiplier =
+        jnum(root, "fvg_min_atr_multiplier",
+             jnum(root, "fvgMinAtrMultiplier", c.fvgMinAtrMultiplier));
+    c.fvgMaxUnmitigatedPerTimeframe =
+        jint(root, "fvg_max_unmitigated_per_timeframe",
+             jint(root, "fvgMaxUnmitigatedPerTimeframe", c.fvgMaxUnmitigatedPerTimeframe));
+    c.fvgMaxAgeBars =
+        jint(root, "fvg_max_age_bars", jint(root, "fvgMaxAgeBars", c.fvgMaxAgeBars));
+
     if (root.isMember("majors") && root["majors"].isArray()) {
         c.majors.clear();
         for (const auto &m : root["majors"]) {
