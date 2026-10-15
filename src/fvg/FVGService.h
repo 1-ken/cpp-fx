@@ -54,6 +54,7 @@ class FVGService {
                          double open, double high, double low, double close,
                          int64_t volume = 0);
     void feedClosedBar(const ClosedBar &bar);
+    void feedHistoricalBars(const std::vector<ClosedBar> &bars);
 
     // Direct access to registry for REST query
     const FVGRegistry &registry() const { return registry_; }

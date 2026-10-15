@@ -64,5 +64,7 @@
   "fvg_min_gap_pips": 1.5,
   "fvg_min_atr_multiplier": 0.0,
   "fvg_max_unmitigated_per_timeframe": 20,
-  "fvg_max_age_bars": 100
+  "fvg_max_age_bars": 100,
+  "fvg_scan_all_symbols": true,
+  "fvg_warmup_bars": 50
 }

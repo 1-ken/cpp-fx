@@ -27,6 +27,7 @@
 #include "ctrader/CTraderTokenStore.h"
 #include "ctrader/SymbolRegistry.h"
 #include "fvg/FVGService.h"
+#include "fvg/FVGWarmupCoordinator.h"
 #include "market/MarketHub.h"
 #include "market/PrevDayLevelProvider.h"
 #include "market/SymbolSubscriptionPlanner.h"
@@ -64,6 +65,7 @@ int main() {
     fvgCfg.maxUnmitigatedPerTimeframe = cfg.fvgMaxUnmitigatedPerTimeframe;
     fvgCfg.maxAgeBars = cfg.fvgMaxAgeBars;
     static fvg::FVGService fvgService(fvgCfg);
+    static fvg::FVGWarmupCoordinator fvgWarmup;
     fvgService.setBroadcastSink([](const Json::Value &frame) {
         controllers::WsObserveController::broadcastFvgAlert(frame);
     });
@@ -132,12 +134,12 @@ int main() {
     alertManager.setPrevDayLevelProvider(&prevDayLevels);
     alertManager.setCTraderClient(&ctrader);
     alertManager.setSymbolRegistry(&registry);
+    fvgWarmup.configure(&cfg, &ctrader, &registry, &fvgService);
 
     notificationQueue.configure(cfg, &notifier, redisPtr, notifyLoop);
     notificationQueue.startDlqRetryLoop();
 
     auto refreshSubscriptionsNow = [&]() {
-        if (cfg.ctrader.subscribeAllSymbols && cfg.subscribedPairs.empty()) return;
         if (!ctrader.isReady()) return;
         auto ids = subscriptionPlanner.computeSymbolIds();
         ctrader.refreshSpotSubscriptions(std::move(ids));
@@ -229,14 +231,19 @@ int main() {
 
     ctrader.setSymbolsCallback([&](std::vector<ctrader::SymbolInfo> symbols) {
         registry.update(symbols);
-        if (!cfg.ctrader.subscribeAllSymbols || !cfg.subscribedPairs.empty())
-            refreshSubscriptions();
+        refreshSubscriptions();
+        if (cfg.fvgDetectorEnabled) {
+            fvgWarmup.startWarmup();
+        }
     });
     ctrader.setStateCallback([&](bool ready) {
         candleMonitor.onConnectionReady(ready);
-        if (ready &&
-            (!cfg.ctrader.subscribeAllSymbols || !cfg.subscribedPairs.empty()))
+        if (ready) {
             refreshSubscriptions();
+            if (cfg.fvgDetectorEnabled) {
+                fvgWarmup.startWarmup();
+            }
+        }
     });
     ctrader.setSpotCallback([&](const ctrader::SpotUpdate &u) {
         hub.onSpot(u);
@@ -268,6 +275,7 @@ int main() {
     app.hub = &hub;
     app.alerts = &alertManager;
     app.fvgService = &fvgService;
+    app.fvgWarmup = &fvgWarmup;
     app.postgres = pgPtr;
     app.redis = redisPtr;
     app.notifier = &notifier;

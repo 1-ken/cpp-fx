@@ -56,11 +56,19 @@ void FVGService::feedClosedBar(const ClosedBar &bar) {
     enqueueBar(bar);
 }
 
+void FVGService::feedHistoricalBars(const std::vector<ClosedBar> &bars) {
+    if (!cfg_.enabled || bars.empty()) return;
+    for (auto b : bars) {
+        b.isWarmup = true;
+        enqueueBar(b);
+    }
+}
+
 void FVGService::enqueueBar(const ClosedBar &bar) {
     {
         std::lock_guard<std::mutex> lk(queueMu_);
         // Limit queue size to avoid unbounded memory if worker falls behind
-        if (queue_.size() < 10000) {
+        if (queue_.size() < 100000) {
             queue_.push(bar);
         } else {
             LOG_WARN << "FVGService queue full; dropping completed bar for " << bar.symbol;
@@ -96,17 +104,20 @@ void FVGService::processCompletedBar(const ClosedBar &bar) {
         if (registry_.registerZone(*formedZone)) {
             LOG_INFO << "FVG Formed: " << formedZone->id << " [" << formedZone->bottom
                      << " - " << formedZone->top << "] dir="
-                     << (formedZone->is_bullish ? "BULLISH" : "BEARISH");
+                     << (formedZone->is_bullish ? "BULLISH" : "BEARISH")
+                     << (bar.isWarmup ? " (warmup)" : "");
 
-            if (broadcastSink_) {
-                Json::Value payload(Json::objectValue);
-                payload["type"] = "FVG_ALERT";
-                payload["data"] = serializeZone(*formedZone, "FORMED");
-                broadcastSink_(payload);
-            }
+            if (!bar.isWarmup) {
+                if (broadcastSink_) {
+                    Json::Value payload(Json::objectValue);
+                    payload["type"] = "FVG_ALERT";
+                    payload["data"] = serializeZone(*formedZone, "FORMED");
+                    broadcastSink_(payload);
+                }
 
-            if (onZoneFormed_) {
-                onZoneFormed_(*formedZone);
+                if (onZoneFormed_) {
+                    onZoneFormed_(*formedZone);
+                }
             }
         }
     }
@@ -114,8 +125,8 @@ void FVGService::processCompletedBar(const ClosedBar &bar) {
     // 2. Mitigation check against existing active zones
     auto newlyMitigated = registry_.checkMitigation(bar);
     for (const auto &mz : newlyMitigated) {
-        LOG_INFO << "FVG Mitigated: " << mz.id;
-        if (broadcastSink_) {
+        LOG_INFO << "FVG Mitigated: " << mz.id << (bar.isWarmup ? " (warmup)" : "");
+        if (!bar.isWarmup && broadcastSink_) {
             Json::Value payload(Json::objectValue);
             payload["type"] = "FVG_ALERT";
             payload["data"] = serializeZone(mz, "MITIGATED");

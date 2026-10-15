@@ -32,8 +32,25 @@ bool SymbolSubscriptionPlanner::isMajorForexPair(
 }
 
 std::vector<int64_t> SymbolSubscriptionPlanner::computeSymbolIds() const {
+    if (cfg_.fvgDetectorEnabled && cfg_.fvgScanAllSymbols) {
+        auto ids = registry_.enabledIds();
+        if (!ids.empty()) {
+            if (cfg_.ctrader.maxSubscribedSymbols > 0 &&
+                ids.size() > static_cast<size_t>(cfg_.ctrader.maxSubscribedSymbols)) {
+                ids.resize(static_cast<size_t>(cfg_.ctrader.maxSubscribedSymbols));
+            }
+            LOG_INFO << "Universal spot subscriptions (FVG scan all symbols): "
+                     << ids.size() << " symbols";
+            return ids;
+        }
+    }
+
     if (hasExplicitPairList(cfg_)) {
-        const auto allowed = buildAllowedCanonicalSet(cfg_);
+        auto allowed = buildAllowedCanonicalSet(cfg_);
+        for (const auto &a : alerts_.getActiveAlerts()) {
+            std::string canon = util::canonicalPair(a.pair);
+            if (!canon.empty()) allowed.insert(canon);
+        }
         std::vector<int64_t> ids;
         ids.reserve(allowed.size());
         size_t resolved = 0;
@@ -49,7 +66,7 @@ std::vector<int64_t> SymbolSubscriptionPlanner::computeSymbolIds() const {
         std::sort(ids.begin(), ids.end());
         ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
         LOG_INFO << "Scoped spot subscriptions: " << ids.size() << " symbols ("
-                 << cfg_.subscribedPairs.size() << " pairs requested, " << resolved
+                 << allowed.size() << " pairs requested, " << resolved
                  << " resolved)";
         return ids;
     }

@@ -92,6 +92,8 @@ struct Config {
     double fvgMinAtrMultiplier = 0.0;
     int fvgMaxUnmitigatedPerTimeframe = 20;
     int fvgMaxAgeBars = 100;
+    bool fvgScanAllSymbols = true;
+    int fvgWarmupBars = 50;
 
     std::vector<std::string> majors = {"USD", "EUR", "JPY", "GBP",
                                        "AUD", "CAD", "CHF", "NZD"};

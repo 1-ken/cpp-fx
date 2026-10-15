@@ -23,6 +23,7 @@ class AlertManager;
 }
 namespace ctraderplus::fvg {
 class FVGService;
+class FVGWarmupCoordinator;
 }
 namespace ctraderplus::services {
 class PostgresService;
@@ -41,6 +42,7 @@ struct AppContext {
     market::MarketHub *hub = nullptr;
     alerts::AlertManager *alerts = nullptr;
     fvg::FVGService *fvgService = nullptr;
+    fvg::FVGWarmupCoordinator *fvgWarmup = nullptr;
     services::PostgresService *postgres = nullptr;  // may be null (degraded)
     services::RedisService *redis = nullptr;        // may be null (degraded)
     services::Notifier *notifier = nullptr;

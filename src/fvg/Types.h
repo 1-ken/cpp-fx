@@ -32,6 +32,7 @@ struct ClosedBar {
     double low = 0.0;
     double close = 0.0;
     int64_t volume = 0;
+    bool isWarmup = false;
 };
 
 struct FVGZone {

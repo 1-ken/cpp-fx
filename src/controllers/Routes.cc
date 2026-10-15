@@ -38,6 +38,7 @@
 #include "ctrader/CTraderClient.h"
 #include "ctrader/SymbolRegistry.h"
 #include "fvg/FVGService.h"
+#include "fvg/FVGWarmupCoordinator.h"
 #include "market/MarketHub.h"
 #include "market/SymbolSubscriptionPlanner.h"
 #include "services/PostgresService.h"
@@ -1989,6 +1990,12 @@ void activeFvgZones(const HttpRequestPtr &req,
         std::string timeframe = trimStr(req->getParameter("timeframe"));
         if (!symbol.empty()) {
             symbol = util::canonicalPair(symbol);
+            if (app.fvgWarmup && !app.fvgWarmup->isSymbolWarmed(symbol)) {
+                app.fvgWarmup->warmupSymbol(symbol);
+                if (app.refreshSubscriptions) {
+                    app.refreshSubscriptions();
+                }
+            }
         }
         auto zones = app.fvgService->registry().getActiveZones(symbol, timeframe);
         for (const auto &z : zones) {

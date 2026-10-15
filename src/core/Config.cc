@@ -249,6 +249,12 @@ void build(Config &c, const std::string &configPath, const std::string &envPath)
              jint(root, "fvgMaxUnmitigatedPerTimeframe", c.fvgMaxUnmitigatedPerTimeframe));
     c.fvgMaxAgeBars =
         jint(root, "fvg_max_age_bars", jint(root, "fvgMaxAgeBars", c.fvgMaxAgeBars));
+    c.fvgScanAllSymbols = envBool(
+        "FVG_SCAN_ALL_SYMBOLS",
+        jbool(root, "fvg_scan_all_symbols",
+              jbool(root, "fvgScanAllSymbols", c.fvgScanAllSymbols)));
+    c.fvgWarmupBars =
+        jint(root, "fvg_warmup_bars", jint(root, "fvgWarmupBars", c.fvgWarmupBars));
 
     if (root.isMember("majors") && root["majors"].isArray()) {
         c.majors.clear();

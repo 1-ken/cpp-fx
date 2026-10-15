@@ -24,6 +24,8 @@
 #include "fvg/FVGDetector.h"
 #include "fvg/FVGRegistry.h"
 #include "fvg/FVGService.h"
+#include "fvg/FVGWarmupCoordinator.h"
+#include "market/SymbolSubscriptionPlanner.h"
 
 using namespace ctraderplus;
 
@@ -1374,6 +1376,119 @@ static void testFvgAlerts() {
     CHECK(std::abs(fired[2].currentPrice - 1.0930) < 1e-5);
 }
 
+static void testSymbolSubscriptionPlannerUniversalFvg() {
+    core::Config cfg;
+    cfg.majors = {"USD", "EUR", "JPY", "GBP"};
+    cfg.ctrader.subscribeAllSymbols = false;
+    cfg.fvgDetectorEnabled = true;
+    cfg.fvgScanAllSymbols = true;
+
+    ctrader::SymbolRegistry reg;
+    std::vector<ctrader::SymbolInfo> syms = {
+        {1, "EURUSD", true, 1, 2, "EUR/USD"},
+        {2, "GBPJPY", true, 3, 4, "GBP/JPY"},
+        {3, "XAUUSD", true, 5, 2, "Gold"},
+        {4, "BTCUSD", true, 6, 2, "Bitcoin"},
+        {5, "DISABLED", false, 7, 2, "Disabled Pair"}
+    };
+    reg.update(syms);
+
+    alerts::AlertManager alerts;
+    market::SymbolSubscriptionPlanner planner(cfg, reg, alerts);
+
+    // 1. With fvgScanAllSymbols = true, all enabled broker pairs are subscribed even with 0 alerts!
+    auto ids = planner.computeSymbolIds();
+    CHECK(ids.size() == 4);
+    CHECK(std::find(ids.begin(), ids.end(), 1) != ids.end());
+    CHECK(std::find(ids.begin(), ids.end(), 2) != ids.end());
+    CHECK(std::find(ids.begin(), ids.end(), 3) != ids.end());
+    CHECK(std::find(ids.begin(), ids.end(), 4) != ids.end());
+    CHECK(std::find(ids.begin(), ids.end(), 5) == ids.end()); // Disabled symbol excluded
+
+    // 2. When fvgScanAllSymbols = false, only major forex pairs are subscribed when 0 alerts exist
+    cfg.fvgScanAllSymbols = false;
+    market::SymbolSubscriptionPlanner plannerScoped(cfg, reg, alerts);
+    auto scopedIds = plannerScoped.computeSymbolIds();
+    CHECK(scopedIds.size() == 2); // EURUSD and GBPJPY (majors)
+    CHECK(std::find(scopedIds.begin(), scopedIds.end(), 1) != scopedIds.end());
+    CHECK(std::find(scopedIds.begin(), scopedIds.end(), 2) != scopedIds.end());
+    CHECK(std::find(scopedIds.begin(), scopedIds.end(), 3) == scopedIds.end());
+    CHECK(std::find(scopedIds.begin(), scopedIds.end(), 4) == scopedIds.end());
+
+    // 3. When an alert is created on a non-major pair (e.g. BTCUSD), it is subscribed
+    alerts::Alert btcAlert;
+    btcAlert.id = "alert-btc";
+    btcAlert.pair = "BTCUSD";
+    btcAlert.alertType = "fvg";
+    btcAlert.status = "active";
+    alerts.cacheAlert(btcAlert);
+
+    auto withAlertIds = plannerScoped.computeSymbolIds();
+    CHECK(withAlertIds.size() == 3);
+    CHECK(std::find(withAlertIds.begin(), withAlertIds.end(), 1) != withAlertIds.end());
+    CHECK(std::find(withAlertIds.begin(), withAlertIds.end(), 2) != withAlertIds.end());
+    CHECK(std::find(withAlertIds.begin(), withAlertIds.end(), 4) != withAlertIds.end());
+    CHECK(std::find(withAlertIds.begin(), withAlertIds.end(), 3) == withAlertIds.end()); // XAUUSD still not subscribed
+}
+
+static void testFvgHistoricalWarmup() {
+    fvg::FVGService::Config cfg;
+    cfg.enabled = true;
+    cfg.minGapPips = 1.0;
+    cfg.minAtrMultiplier = 0.0;
+    cfg.maxUnmitigatedPerTimeframe = 20;
+    cfg.maxAgeBars = 100;
+
+    fvg::FVGService service(cfg);
+    std::vector<Json::Value> broadcasts;
+    service.setBroadcastSink([&](const Json::Value &msg) {
+        broadcasts.push_back(msg);
+    });
+    service.start();
+
+    // Prepare 4 historical bars forming a bullish FVG and 1 non-mitigating bar
+    // Bar 1: [1.0800 - 1.0820]
+    // Bar 2: [1.0820 - 1.0860] (displacement)
+    // Bar 3: [1.0840 - 1.0850] (Candle 3 Low: 1.0840 > Candle 1 High: 1.0820 -> Gap [1.0820 - 1.0840])
+    // Bar 4: [1.0845 - 1.0855] (Does not touch 1.0820 - remains active)
+    fvg::ClosedBar b1{"EURUSD", "M15", 900, 1.0805, 1.0820, 1.0800, 1.0815, 100, true};
+    fvg::ClosedBar b2{"EURUSD", "M15", 1800, 1.0820, 1.0860, 1.0818, 1.0855, 150, true};
+    fvg::ClosedBar b3{"EURUSD", "M15", 2700, 1.0845, 1.0850, 1.0840, 1.0848, 120, true};
+    fvg::ClosedBar b4{"EURUSD", "M15", 3600, 1.0848, 1.0855, 1.0845, 1.0850, 110, true};
+
+    std::vector<fvg::ClosedBar> warmupBars = {b1, b2, b3, b4};
+    service.feedHistoricalBars(warmupBars);
+
+    // Give worker thread a moment to process the queue
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Warmup bars must NOT broadcast to WebSocket!
+    CHECK(broadcasts.empty());
+
+    // But the active registry MUST have the unmitigated zone!
+    auto activeZones = service.registry().getActiveZones("EURUSD", "M15");
+    CHECK(activeZones.size() == 1);
+    CHECK(std::abs(activeZones[0].bottom - 1.0820) < 1e-5);
+    CHECK(std::abs(activeZones[0].top - 1.0840) < 1e-5);
+    CHECK(activeZones[0].is_bullish == true);
+
+    // Now feed a real-time (non-warmup) bar that mitigates the gap (Low <= 1.0820)
+    fvg::ClosedBar b5{"EURUSD", "M15", 4500, 1.0845, 1.0845, 1.0810, 1.0815, 200, false};
+    service.feedClosedBar(b5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Non-warmup bar SHOULD emit MITIGATED broadcast!
+    CHECK(!broadcasts.empty());
+    CHECK(broadcasts.back()["type"].asString() == "FVG_ALERT");
+    CHECK(broadcasts.back()["data"]["status"].asString() == "MITIGATED");
+
+    auto remaining = service.registry().getActiveZones("EURUSD", "M15");
+    CHECK(remaining.empty());
+
+    service.stop();
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -1405,6 +1520,8 @@ int main() {
     testBarAggregatorMtf();
     testFvgMitigationAndPruning();
     testFvgAlerts();
+    testSymbolSubscriptionPlannerUniversalFvg();
+    testFvgHistoricalWarmup();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;
