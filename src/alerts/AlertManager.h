@@ -151,6 +151,9 @@ class AlertManager {
     std::vector<Alert> getActiveAlerts() const;
     std::vector<Alert> getAllAlertsForUser(const std::string &userId) const;
     std::vector<Alert> getActiveAlertsForUser(const std::string &userId) const;
+    // True when `userId` owns an active FVG alert on `symbol` for `timeframe` (M15/15m both ok).
+    bool userHasActiveFvgAlert(const std::string &userId, const std::string &symbol,
+                               const std::string &timeframe) const;
     std::vector<Alert> getActiveAlertsSortedForUser(const std::string &userId) const;
     bool isAlertOwnedBy(const std::string &id, const std::string &userId) const;
 

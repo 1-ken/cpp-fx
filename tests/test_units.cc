@@ -1489,6 +1489,37 @@ static void testFvgHistoricalWarmup() {
     service.stop();
 }
 
+static void testUserHasActiveFvgAlertScoping() {
+    alerts::AlertManager mgr;
+    CHECK(!mgr.userHasActiveFvgAlert("user-1", "EURUSD", "M15"));  // no alerts -> nothing delivered
+
+    alerts::Alert a;
+    a.id = "own-fvg";
+    a.userId = "user-1";
+    a.pair = "EUR/USD";
+    a.alertType = "fvg";
+    a.interval = "15m";
+    a.status = "active";
+    a.createdAt = "2026-10-14T00:00:00Z";
+    mgr.cacheAlert(a);
+
+    CHECK(mgr.userHasActiveFvgAlert("user-1", "EURUSD", "M15"));   // owner, M15 == 15m
+    CHECK(mgr.userHasActiveFvgAlert("user-1", "EURUSD", "15m"));
+    CHECK(!mgr.userHasActiveFvgAlert("user-2", "EURUSD", "M15"));  // other user gets nothing
+    CHECK(!mgr.userHasActiveFvgAlert("user-1", "GBPUSD", "M15"));  // other pair
+    CHECK(!mgr.userHasActiveFvgAlert("user-1", "EURUSD", "H1"));   // other timeframe
+
+    alerts::Alert price;
+    price.id = "own-price";
+    price.userId = "user-3";
+    price.pair = "EURUSD";
+    price.alertType = "price";
+    price.status = "active";
+    price.createdAt = "2026-10-14T00:00:00Z";
+    mgr.cacheAlert(price);
+    CHECK(!mgr.userHasActiveFvgAlert("user-3", "EURUSD", "M15"));  // non-FVG alert does not count
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -1522,6 +1553,7 @@ int main() {
     testFvgAlerts();
     testSymbolSubscriptionPlannerUniversalFvg();
     testFvgHistoricalWarmup();
+    testUserHasActiveFvgAlertScoping();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

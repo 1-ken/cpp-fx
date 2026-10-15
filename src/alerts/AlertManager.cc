@@ -1107,6 +1107,22 @@ std::vector<Alert> AlertManager::getActiveAlertsForUser(const std::string &userI
     return out;
 }
 
+bool AlertManager::userHasActiveFvgAlert(const std::string &userId, const std::string &symbol,
+                                         const std::string &timeframe) const {
+    if (userId.empty()) return false;
+    const std::string canon = util::canonicalPair(symbol);
+    const std::string tf = normalizeTimeframe(timeframe);
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto &kv : alerts_) {
+        const Alert &a = kv.second;
+        if (a.status != "active" || a.alertType != "fvg" || a.userId != userId) continue;
+        if (util::canonicalPair(a.pair) != canon) continue;
+        if (a.interval && normalizeTimeframe(*a.interval) != tf) continue;
+        return true;
+    }
+    return false;
+}
+
 std::vector<Alert> AlertManager::getActiveAlertsSortedForUser(const std::string &userId) const {
     auto out = getActiveAlertsForUser(userId);
     std::sort(out.begin(), out.end(), [](const Alert &a, const Alert &b) {

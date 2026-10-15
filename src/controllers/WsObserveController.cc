@@ -452,6 +452,14 @@ void WsObserveController::pushTriggered(const std::string &userId, const Json::V
 }
 
 void WsObserveController::broadcastFvgAlert(const Json::Value &fvgAlertFrame) {
+    // FVG zone frames are NOT notifications; they are silent chart data. Deliver only to
+    // (a) chart streams for that pair, or (b) users who own an active FVG alert on it.
+    // Real notifications reach alert owners through the alert_triggered path.
+    const Json::Value &data = fvgAlertFrame["data"];
+    const std::string symbol = util::canonicalPair(data["symbol"].asString());
+    const std::string timeframe = data["timeframe"].asString();
+    if (symbol.empty()) return;
+
     std::string wire;
     try {
         wire = toJsonString(fvgAlertFrame);
@@ -459,14 +467,22 @@ void WsObserveController::broadcastFvgAlert(const Json::Value &fvgAlertFrame) {
         LOG_WARN << "fvg alert frame encode failed: " << e.what();
         return;
     }
-    std::vector<WebSocketConnectionPtr> targets;
+    auto &app = core::AppContext::instance();
+    std::vector<WebSocketConnectionPtr> candidates;
     {
         std::lock_guard<std::mutex> lk(connsMu_);
         for (const auto &conn : conns_) {
-            if (conn && conn->connected()) targets.push_back(conn);
+            if (conn && conn->connected() && conn->hasContext()) candidates.push_back(conn);
         }
     }
-    for (auto &conn : targets) {
+    for (auto &conn : candidates) {
+        auto ctx = conn->getContext<WsConnContext>();
+        if (!ctx) continue;
+        const bool onChart =
+            ctx->hasStreamParams && ctx->pairCanon && *ctx->pairCanon == symbol;
+        const bool ownsAlert = app.alerts &&
+                               app.alerts->userHasActiveFvgAlert(ctx->userId, symbol, timeframe);
+        if (!onChart && !ownsAlert) continue;
         try {
             conn->send(wire);
         } catch (const std::exception &e) {
