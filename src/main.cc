@@ -67,6 +67,9 @@ int main() {
     fvgService.setBroadcastSink([](const Json::Value &frame) {
         controllers::WsObserveController::broadcastFvgAlert(frame);
     });
+    fvgService.setOnZoneFormed([](const fvg::FVGZone &zone) {
+        alertManager.checkFvgAlerts(zone);
+    });
     if (cfg.fvgDetectorEnabled) {
         fvgService.start();
     }

@@ -28,6 +28,9 @@ namespace ctraderplus::ctrader {
 class CTraderClient;
 class SymbolRegistry;
 }
+namespace ctraderplus::fvg {
+struct FVGZone;
+}
 
 namespace ctraderplus::alerts {
 
@@ -133,6 +136,12 @@ class AlertManager {
                                std::optional<double> minSwingAtr = std::nullopt,
                                std::optional<double> breakK = std::nullopt,
                                std::optional<std::string> dependsOnAlertId = std::nullopt);
+    Alert createFvgAlert(const std::string &pair, const std::string &interval,
+                         const std::string &direction, const std::string &userId,
+                         const std::string &email, const std::vector<std::string> &channels,
+                         const std::string &phone, const std::string &customMessage,
+                         const std::string &expiresAt,
+                         std::optional<std::string> dependsOnAlertId = std::nullopt);
 
     void ingestStructureHistory(const std::string &pair, const std::string &interval,
                                 const std::vector<Json::Value> &candles);
@@ -155,6 +164,7 @@ class AlertManager {
                                                        double currentPrice);
     // candles: list of {pair, interval, timestamp(iso or epoch sec), close}
     std::vector<TriggeredAlert> checkCandleAlerts(const std::vector<Json::Value> &candles);
+    void checkFvgAlerts(const fvg::FVGZone &zone);
 
     // Expire active prev_day_level alerts whose create UTC day is before today.
     // Silent (no notification). Returns how many were expired.
@@ -227,6 +237,7 @@ class AlertManager {
     std::unordered_map<std::string, std::vector<std::string>> activePriceIndex_;
     std::unordered_map<std::string, std::vector<std::string>> activeCandleIndex_;
     std::unordered_map<std::string, std::vector<std::string>> activeDolIndex_;
+    std::unordered_map<std::string, std::vector<std::string>> activeFvgIndex_;
     std::unordered_map<std::string, uint64_t> userAlertsRevision_;
     std::unordered_map<std::string, bool> sweepLookbackPending_;
     std::unordered_map<std::string, StructureTrack> structureTracks_;

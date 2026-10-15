@@ -17,6 +17,7 @@
 #include "ctrader/SymbolRegistry.h"
 #include "market/MarketHub.h"
 #include "market/PrevDayLevelProvider.h"
+#include "fvg/Types.h"
 #include "market/StructureEngine.h"
 #include "services/PostgresService.h"
 #include "services/RedisService.h"
@@ -27,6 +28,19 @@
 namespace ctraderplus::alerts {
 
 namespace {
+std::string normalizeTimeframe(const std::string &tf) {
+    std::string s = tf;
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    if (s == "m1" || s == "1m") return "1m";
+    if (s == "m5" || s == "5m") return "5m";
+    if (s == "m15" || s == "15m") return "15m";
+    if (s == "m30" || s == "30m") return "30m";
+    if (s == "h1" || s == "1h") return "1h";
+    if (s == "h4" || s == "4h") return "4h";
+    if (s == "d1" || s == "1d") return "1d";
+    return s;
+}
+
 std::string newUuid() {
     // Lightweight UUID v4-ish generator (sufficient for alert ids).
     static thread_local std::mt19937_64 rng(
@@ -261,6 +275,7 @@ void AlertManager::rebuildIndexes() {
     activePriceIndex_.clear();
     activeCandleIndex_.clear();
     activeDolIndex_.clear();
+    activeFvgIndex_.clear();
     for (const auto &kv : alerts_) {
         const Alert &a = kv.second;
         if (a.status != "active") continue;
@@ -276,6 +291,9 @@ void AlertManager::rebuildIndexes() {
             std::string iv = *a.interval;
             std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
             activeCandleIndex_[candleIndexKey(key, iv)].push_back(a.id);
+        } else if (a.alertType == "fvg" && a.interval) {
+            std::string iv = normalizeTimeframe(*a.interval);
+            activeFvgIndex_[candleIndexKey(key, iv)].push_back(a.id);
         } else if (a.alertType == "sweep_confirm") {
             activeCandleIndex_[candleIndexKey(key, "5m")].push_back(a.id);
             activeCandleIndex_[candleIndexKey(key, "1h")].push_back(a.id);
@@ -701,6 +719,66 @@ Alert AlertManager::createStructureAlert(const std::string &pair, const std::str
         evLog += normalizedEvents[i];
     }
     LOG_INFO << "Created structure alert " << a.id << " " << a.pair << " " << iv << " " << evLog
+             << " " << dir << " status=" << a.status
+             << (a.dependsOnAlertId ? (" depends_on=" + *a.dependsOnAlertId) : "");
+    return a;
+}
+
+Alert AlertManager::createFvgAlert(const std::string &pair, const std::string &interval,
+                                   const std::string &direction, const std::string &userId,
+                                   const std::string &email, const std::vector<std::string> &channels,
+                                   const std::string &phone, const std::string &customMessage,
+                                   const std::string &expiresAt,
+                                   std::optional<std::string> dependsOnAlertId) {
+    if (!postgres_) throw std::runtime_error("Database unavailable");
+    std::string iv = normalizeTimeframe(interval);
+    if (intervalSeconds(iv) == 0)
+        throw std::invalid_argument("Invalid interval. Must be one of: 1m, 5m, 15m, 30m, 1h, 4h, 1d");
+
+    std::string dir = direction;
+    std::transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
+    if (dir != "bull" && dir != "bear" && dir != "any")
+        throw std::invalid_argument("direction must be bull, bear, or any");
+
+    Alert a;
+    a.id = newUuid();
+    a.userId = userId;
+    std::string canon = util::canonicalPair(pair);
+    a.pair = canon.empty() ? pair : canon;
+    a.alertType = "fvg";
+    a.interval = iv;
+    a.structureDirection = dir;
+    a.email = email;
+    a.channels = channels;
+    a.normalizeChannels();
+    a.phone = phone;
+    a.customMessage = customMessage;
+    a.expiresAt = expiresAt;
+    a.createdAt = util::nowIso8601();
+
+    std::optional<Alert> parentPatch;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        parentPatch = applyDependsOnLocked(a, userId, dependsOnAlertId);
+        if (parentPatch) alerts_[parentPatch->id] = *parentPatch;
+        alerts_[a.id] = a;
+        rebuildIndexes();
+    }
+    if (parentPatch && !persistAlertSync(*parentPatch)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.erase(a.id);
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
+    }
+    if (!persistAlertSync(a)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alerts_.erase(a.id);
+        rebuildIndexes();
+        throw std::runtime_error("Alert not persisted");
+    }
+    bumpUserRevision(a.userId);
+    notifySubscriptionChange();
+    LOG_INFO << "Created FVG alert " << a.id << " " << a.pair << " " << iv
              << " " << dir << " status=" << a.status
              << (a.dependsOnAlertId ? (" depends_on=" + *a.dependsOnAlertId) : "");
     return a;
@@ -2250,6 +2328,111 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
         }
     }
     return notified;
+}
+
+void AlertManager::checkFvgAlerts(const fvg::FVGZone &zone) {
+    std::string canonPair = util::canonicalPair(zone.symbol);
+    std::string tf = normalizeTimeframe(zone.timeframe);
+    std::string key = candleIndexKey(canonPair, tf);
+
+    struct PersistBatch {
+        Alert before;
+        Alert after;
+        bool isTrigger = false;
+    };
+    std::vector<PersistBatch> toPersist;
+    std::vector<TriggeredAlert> triggered;
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto idxIt = activeFvgIndex_.find(key);
+        if (idxIt == activeFvgIndex_.end()) return;
+
+        double midPrice = (zone.top + zone.bottom) / 2.0;
+
+        for (const auto &alertId : idxIt->second) {
+            auto it = alerts_.find(alertId);
+            if (it == alerts_.end()) continue;
+            Alert &a = it->second;
+            if (a.status != "active" || a.alertType != "fvg") continue;
+
+            if (isPastExpiry(a)) {
+                Alert before = a;
+                a.status = "expired";
+                toPersist.push_back({before, a, false});
+                LOG_INFO << "Expired fvg alert " << a.id << " " << a.pair << " (past expires_at)";
+                continue;
+            }
+
+            std::string dir = a.structureDirection.value_or("any");
+            std::transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
+            bool dirMatches = (dir == "any") ||
+                              (dir == "bull" && zone.is_bullish) ||
+                              (dir == "bear" && !zone.is_bullish);
+            if (!dirMatches) continue;
+
+            Alert before = a;
+            a.status = "triggered";
+            a.triggeredAt = util::nowIso8601();
+            a.lastCheckedPrice = midPrice;
+            a.closePrice = midPrice;
+            a.lastEvaluatedCandleTime = std::to_string(zone.formed_timestamp);
+
+            TriggeredAlert t;
+            t.alert = a;
+            t.currentPrice = midPrice;
+            t.alertTypeLabel = "fair_value_gap";
+            t.timeframe = tf;
+
+            triggered.push_back(t);
+            toPersist.push_back({before, a, true});
+
+            LOG_INFO << "Triggered fvg alert " << a.id << " " << a.pair
+                     << " channel=" << a.channel << " dir=" << (zone.is_bullish ? "BULL" : "BEAR")
+                     << " zone=[" << zone.bottom << " - " << zone.top << "]";
+
+            for (auto &armed : armDependentsLocked(a.id, std::to_string(zone.formed_timestamp))) {
+                toPersist.push_back({armed.first, armed.second, true});
+            }
+        }
+        if (!triggered.empty() || !toPersist.empty()) rebuildIndexes();
+    }
+
+    std::vector<TriggeredAlert> notified;
+    for (const auto &batch : toPersist) {
+        if (batch.isTrigger) {
+            std::vector<TriggeredAlert> mine;
+            for (const auto &t : triggered) {
+                if (t.alert.id == batch.after.id) mine.push_back(t);
+            }
+            if (!postgres_) {
+                bumpUserRevision(batch.after.userId);
+                notified.insert(notified.end(), mine.begin(), mine.end());
+                continue;
+            }
+            Alert before = batch.before;
+            Alert after = batch.after;
+            persistAlertThen(after, [this, before, after, mine](bool ok) {
+                if (!ok) {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    alerts_[after.id] = before;
+                    rebuildIndexes();
+                    LOG_ERROR << "Failed to persist triggered FVG alert " << after.id;
+                    return;
+                }
+                bumpUserRevision(after.userId);
+                if (!onTriggered_) return;
+                for (const auto &t : mine) onTriggered_(t);
+            });
+        } else {
+            persistAlert(batch.after);
+        }
+    }
+    if (!postgres_) {
+        for (const auto &t : notified) {
+            if (onTriggered_) onTriggered_(t);
+        }
+    }
 }
 
 int AlertManager::expireStalePrevDayAlerts() {

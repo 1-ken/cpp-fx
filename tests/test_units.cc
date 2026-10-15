@@ -1292,6 +1292,88 @@ static void testFvgMitigationAndPruning() {
     CHECK(active[1].id == "C");
 }
 
+static void testFvgAlerts() {
+    using namespace ctraderplus::fvg;
+    alerts::AlertManager mgr;
+    std::vector<alerts::TriggeredAlert> fired;
+    mgr.setTriggerHandler([&fired](const alerts::TriggeredAlert &t) {
+        fired.push_back(t);
+    });
+
+    alerts::Alert bullAlert;
+    bullAlert.id = "fvg-bull";
+    bullAlert.userId = "user-1";
+    bullAlert.pair = "EURUSD";
+    bullAlert.alertType = "fvg";
+    bullAlert.interval = "15m";
+    bullAlert.structureDirection = "bull";
+    bullAlert.status = "active";
+    bullAlert.createdAt = "2026-10-14T00:00:00Z";
+    mgr.cacheAlert(bullAlert);
+
+    alerts::Alert anyAlert;
+    anyAlert.id = "fvg-any";
+    anyAlert.userId = "user-2";
+    anyAlert.pair = "EURUSD";
+    anyAlert.alertType = "fvg";
+    anyAlert.interval = "15m";
+    anyAlert.structureDirection = "any";
+    anyAlert.status = "active";
+    anyAlert.createdAt = "2026-10-14T00:00:00Z";
+    mgr.cacheAlert(anyAlert);
+
+    alerts::Alert h1Alert;
+    h1Alert.id = "fvg-h1";
+    h1Alert.userId = "user-3";
+    h1Alert.pair = "EURUSD";
+    h1Alert.alertType = "fvg";
+    h1Alert.interval = "1h";
+    h1Alert.structureDirection = "any";
+    h1Alert.status = "active";
+    h1Alert.createdAt = "2026-10-14T00:00:00Z";
+    mgr.cacheAlert(h1Alert);
+
+    // 1. Bearish zone on M15: bullAlert should NOT fire; anyAlert SHOULD fire; h1Alert should NOT fire.
+    FVGZone bearZone{"EURUSD_M15_100", "EURUSD", "M15", 1.0900, 1.0880, false, 100, false, 0};
+    mgr.checkFvgAlerts(bearZone);
+
+    CHECK(fired.size() == 1);
+    CHECK(fired[0].alert.id == "fvg-any");
+    CHECK(fired[0].alertTypeLabel == "fair_value_gap");
+    CHECK(std::abs(fired[0].currentPrice - 1.0890) < 1e-5);
+    CHECK(fired[0].timeframe == "15m");
+
+    auto anyUpdated = mgr.getAlert("fvg-any");
+    CHECK(anyUpdated.has_value());
+    CHECK(anyUpdated->status == "triggered");
+
+    auto bullCheck = mgr.getAlert("fvg-bull");
+    CHECK(bullCheck.has_value());
+    CHECK(bullCheck->status == "active");
+
+    // 2. Bullish zone on M15: bullAlert SHOULD now fire!
+    FVGZone bullZone{"EURUSD_M15_200", "EURUSD", "M15", 1.0850, 1.0830, true, 200, false, 0};
+    mgr.checkFvgAlerts(bullZone);
+
+    CHECK(fired.size() == 2);
+    CHECK(fired[1].alert.id == "fvg-bull");
+    CHECK(fired[1].alertTypeLabel == "fair_value_gap");
+    CHECK(std::abs(fired[1].currentPrice - 1.0840) < 1e-5);
+
+    auto bullUpdated = mgr.getAlert("fvg-bull");
+    CHECK(bullUpdated.has_value());
+    CHECK(bullUpdated->status == "triggered");
+
+    // 3. Bullish zone on H1: h1Alert SHOULD fire!
+    FVGZone h1Zone{"EURUSD_H1_300", "EURUSD", "H1", 1.0950, 1.0910, true, 300, false, 0};
+    mgr.checkFvgAlerts(h1Zone);
+
+    CHECK(fired.size() == 3);
+    CHECK(fired[2].alert.id == "fvg-h1");
+    CHECK(fired[2].timeframe == "1h");
+    CHECK(std::abs(fired[2].currentPrice - 1.0930) < 1e-5);
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -1322,6 +1404,7 @@ int main() {
     testFvgDetection();
     testBarAggregatorMtf();
     testFvgMitigationAndPruning();
+    testFvgAlerts();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

@@ -22,6 +22,7 @@ namespace ctraderplus::fvg {
 class FVGService {
   public:
     using BroadcastSink = std::function<void(const Json::Value &)>;
+    using FvgZoneCallback = std::function<void(const FVGZone &)>;
 
     struct Config {
         bool enabled = true;
@@ -37,6 +38,10 @@ class FVGService {
 
     void setBroadcastSink(BroadcastSink sink) {
         broadcastSink_ = std::move(sink);
+    }
+
+    void setOnZoneFormed(FvgZoneCallback cb) {
+        onZoneFormed_ = std::move(cb);
     }
 
     void start();
@@ -73,6 +78,7 @@ class FVGService {
 
     std::thread workerThread_;
     BroadcastSink broadcastSink_;
+    FvgZoneCallback onZoneFormed_;
 };
 
 }  // namespace ctraderplus::fvg

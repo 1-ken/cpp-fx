@@ -104,6 +104,10 @@ void FVGService::processCompletedBar(const ClosedBar &bar) {
                 payload["data"] = serializeZone(*formedZone, "FORMED");
                 broadcastSink_(payload);
             }
+
+            if (onZoneFormed_) {
+                onZoneFormed_(*formedZone);
+            }
         }
     }
 

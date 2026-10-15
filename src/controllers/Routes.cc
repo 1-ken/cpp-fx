@@ -1573,6 +1573,70 @@ void createAlert(const HttpRequestPtr &req,
         }
         return;
     }
+    if (b.get("alert_type", "").asString() == "fvg") {
+        std::string pair = trimStr(b.get("pair", "").asString());
+        if (pair.empty()) {
+            cb(errResp("detail", "Pair name cannot be empty", 400));
+            return;
+        }
+        std::string parseErr;
+        auto channels = parseChannels(b, parseErr);
+        if (channels.empty()) {
+            cb(errResp("detail", parseErr.empty() ? "Invalid channels" : parseErr, 400));
+            return;
+        }
+        std::string email = b.get("email", "").asString();
+        std::string phone = b.get("phone", "").asString();
+        std::string customMessage = trimStr(b.get("custom_message", "").asString());
+        if (channelsRequireEmail(channels) && email.empty()) {
+            cb(errResp("detail", "Email is required for email alerts", 400));
+            return;
+        }
+        {
+            std::string phoneErr;
+            if (!prepareAlertPhone(phone, channels, phoneErr)) {
+                cb(errResp("detail", phoneErr, 400));
+                return;
+            }
+        }
+        if (channelsRequireCustomMessage(channels, customMessage)) {
+            cb(errResp("detail", "custom_message is required for SMS and call alerts", 400));
+            return;
+        }
+        std::string expiresErr;
+        auto expiresAt = requireExpiresAt(b, expiresErr);
+        if (!expiresAt) {
+            cb(errResp("detail", expiresErr, 400));
+            return;
+        }
+        if (rejectIfSubscriptionBlocksCreate(app, uid, channels, cb)) return;
+        std::string interval = b.get("interval", "15m").asString();
+        std::string structureDir = b.get("structure_direction", "any").asString();
+        std::optional<std::string> dependsOn = parseDependsOnAlertId(b);
+        try {
+            auto a = app.alerts->createFvgAlert(pair, interval, structureDir,
+                                                uid, email, channels, phone, customMessage,
+                                                *expiresAt, dependsOn);
+            core::logApiOutcome("alerts", "create", true, 200,
+                                "pair=" + pair + " type=fvg", uid);
+            Json::Value meta;
+            meta["pair"] = pair;
+            meta["alert_id"] = a.id;
+            meta["type"] = "fvg";
+            logActivityAsync(uid, "alert_create", clientIp(req), clientUserAgent(req), meta);
+            maybeSaveUserPhoneFromAlert(uid, phone, channels);
+            Json::Value v;
+            v["success"] = true;
+            v["alert"] = a.toJson();
+            cb(jsonResp(v));
+        } catch (const std::runtime_error &e) {
+            const std::string msg = e.what();
+            cb(errResp("detail", msg, msg == "Alert not persisted" || msg == "Database unavailable" ? 503 : 400));
+        } catch (const std::exception &e) {
+            cb(errResp("detail", e.what(), 400));
+        }
+        return;
+    }
     std::string pair = b.get("pair", "").asString();
     // trim
     auto trim = [](std::string s) {

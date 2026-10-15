@@ -210,6 +210,13 @@ void NotificationQueue::dispatchOneChannel(const alerts::TriggeredAlert &t,
                                                              : trig;
         cond = trigTxt + " " + refTxt + " @";
     }
+    if (a.alertType == "fvg" || a.alertType == "fair_value_gap") {
+        target = copy.currentPrice;
+        std::string dir = a.structureDirection.value_or("any");
+        if (dir == "bull") cond = "Bullish FVG formed @";
+        else if (dir == "bear") cond = "Bearish FVG formed @";
+        else cond = "FVG formed @";
+    }
     std::string triggeredAt = a.triggeredAt.value_or(util::nowIso8601());
 
     if (channel == "sound") {
