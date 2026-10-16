@@ -33,6 +33,12 @@ class FVGWarmupCoordinator {
     // Warm up a specific symbol on-demand (e.g. when viewed in UI or REST query)
     void warmupSymbol(const std::string &symbol, std::function<void()> onDone = nullptr);
 
+    // Warm up one symbol/timeframe pair (e.g. "EURUSD", "30m" or "M30") because an active FVG
+    // alert watches it. Queued ahead of bulk jobs so alerts are not stuck behind a scan-all
+    // warmup. Idempotent: a pair already queued or warmed is skipped, and a failed fetch is
+    // retried on the next call. Returns true when a new job was queued.
+    bool warmupSymbolTimeframe(const std::string &symbol, const std::string &timeframe);
+
     bool isSymbolWarmed(const std::string &symbol) const;
 
   private:

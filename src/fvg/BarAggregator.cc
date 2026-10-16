@@ -5,8 +5,17 @@
 namespace ctraderplus::fvg {
 
 namespace {
-const std::vector<std::string> kHigherTimeframes = {"M5", "M15", "H1", "H4", "D1"};
+const std::vector<std::string> kHigherTimeframes = {"M5", "M15", "M30", "H1", "H4", "D1"};
+
+// Floor `t` to the start of its bucket for buckets of `tfSec` seconds shifted by `offset`.
+// Uses floor division so values below the offset still land in the correct (earlier) bucket.
+int64_t bucketStartFor(int64_t t, int tfSec, int64_t offset) {
+    int64_t shifted = t - offset;
+    int64_t q = shifted / tfSec;
+    if (shifted % tfSec < 0) --q;
+    return q * tfSec + offset;
 }
+}  // namespace
 
 int timeframeToSeconds(const std::string &tf) {
     if (tf == "M1" || tf == "1m") return 60;
@@ -28,6 +37,19 @@ std::string secondsToTimeframe(int sec) {
         case 3600: return "H1";
         case 14400: return "H4";
         case 86400: return "D1";
+        default: return "";
+    }
+}
+
+std::string fvgTimeframeToInterval(const std::string &tf) {
+    switch (timeframeToSeconds(tf)) {
+        case 60: return "1m";
+        case 300: return "5m";
+        case 900: return "15m";
+        case 1800: return "30m";
+        case 3600: return "1h";
+        case 14400: return "4h";
+        case 86400: return "1d";
         default: return "";
     }
 }
@@ -140,12 +162,17 @@ void BarAggregator::process1mClosedBarLocked(const ClosedBar &m1Bar,
         const int tfSec = timeframeToSeconds(htf);
         if (tfSec <= 0) continue;
 
-        const int64_t htfBucket = (m1Bar.bucketStartSec / tfSec) * tfSec;
         const std::string key = m1Bar.symbol + ":" + htf;
+        int64_t offset = 0;
+        if (auto offIt = bucketOffsets_.find(key); offIt != bucketOffsets_.end()) {
+            offset = offIt->second;
+        }
+        const int64_t htfBucket = bucketStartFor(m1Bar.bucketStartSec, tfSec, offset);
         RunningBar &htfRunning = runningHtfBars_[key];
 
         if (htfRunning.valid && htfRunning.bucketStartSec != htfBucket) {
-            // Previous HTF bucket is complete!
+            // Previous HTF bucket is complete. If we only saw part of it, say so: the OHLC is
+            // incomplete and must not feed 3-bar detection.
             ClosedBar htfClosed;
             htfClosed.symbol = m1Bar.symbol;
             htfClosed.timeframe = htf;
@@ -155,15 +182,18 @@ void BarAggregator::process1mClosedBarLocked(const ClosedBar &m1Bar,
             htfClosed.low = htfRunning.low;
             htfClosed.close = htfRunning.close;
             htfClosed.volume = htfRunning.volume;
+            htfClosed.partial = htfRunning.partial;
             emitted.push_back(htfClosed);
 
-            // Start new HTF bucket
+            // Start new HTF bucket. Subsequent buckets are always taken as observed: a missing
+            // first minute (no ticks) or a market open mid-bucket is the broker's reality too.
             htfRunning.bucketStartSec = htfBucket;
             htfRunning.open = m1Bar.open;
             htfRunning.high = m1Bar.high;
             htfRunning.low = m1Bar.low;
             htfRunning.close = m1Bar.close;
             htfRunning.volume = m1Bar.volume;
+            htfRunning.partial = false;
         } else if (!htfRunning.valid) {
             htfRunning.bucketStartSec = htfBucket;
             htfRunning.open = m1Bar.open;
@@ -172,6 +202,8 @@ void BarAggregator::process1mClosedBarLocked(const ClosedBar &m1Bar,
             htfRunning.close = m1Bar.close;
             htfRunning.volume = m1Bar.volume;
             htfRunning.valid = true;
+            // First bucket ever observed for this key: complete only if we saw its first minute.
+            htfRunning.partial = (m1Bar.bucketStartSec != htfBucket);
         } else {
             // Merge 1m into running HTF bucket
             htfRunning.high = std::max(htfRunning.high, m1Bar.high);
@@ -180,6 +212,54 @@ void BarAggregator::process1mClosedBarLocked(const ClosedBar &m1Bar,
             htfRunning.volume += m1Bar.volume;
         }
     }
+}
+
+void BarAggregator::seedForming(const std::string &symbol, const std::string &timeframe,
+                                int64_t brokerBucketStartSec, double open, double high,
+                                double low, double close) {
+    const int tfSec = timeframeToSeconds(timeframe);
+    // M1 is built directly from ticks and has no higher-timeframe running bucket.
+    if (tfSec <= 60) return;
+    const std::string tf = secondsToTimeframe(tfSec);
+    const std::string key = symbol + ":" + tf;
+    const int64_t newOffset = ((brokerBucketStartSec % tfSec) + tfSec) % tfSec;
+
+    std::lock_guard<std::mutex> lk(mu_);
+    int64_t oldOffset = 0;
+    if (auto it = bucketOffsets_.find(key); it != bucketOffsets_.end()) oldOffset = it->second;
+    RunningBar &r = runningHtfBars_[key];
+
+    if (newOffset != oldOffset) {
+        // Bucket alignment changed: whatever was accumulated used the wrong boundaries.
+        bucketOffsets_[key] = newOffset;
+        r = RunningBar{};
+    }
+
+    auto applySeed = [&]() {
+        r.bucketStartSec = brokerBucketStartSec;
+        r.open = open;
+        r.high = high;
+        r.low = low;
+        r.close = close;
+        r.volume = 0;
+        r.valid = true;
+        r.partial = false;
+    };
+
+    if (!r.valid) {
+        applySeed();
+    } else if (r.bucketStartSec == brokerBucketStartSec) {
+        // Live ticks already merged into this bucket: the broker knows the true open and the
+        // full high/low range so far; keep the (newer) live close.
+        r.open = open;
+        r.high = std::max(r.high, high);
+        r.low = std::min(r.low, low);
+        r.partial = false;
+    } else if (r.bucketStartSec < brokerBucketStartSec) {
+        // Running bucket is older than the broker's forming bucket (stale): replace it.
+        applySeed();
+    }
+    // else: running bucket is already newer than the seed; ignore the seed.
 }
 
 std::vector<ClosedBar> BarAggregator::flushIncompleteBars() {
@@ -200,6 +280,7 @@ std::vector<ClosedBar> BarAggregator::flushIncompleteBars() {
             b.low = kv.second.low;
             b.close = kv.second.close;
             b.volume = kv.second.volume;
+            b.partial = kv.second.partial;
             out.push_back(b);
             kv.second.valid = false;
         }

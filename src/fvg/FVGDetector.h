@@ -43,6 +43,8 @@ class FVGDetector {
     const Options &options() const { return opt_; }
 
     void reset();
+    // Drop the bar history for one symbol/timeframe (bar continuity was broken).
+    void resetSeries(const std::string &symbol, const std::string &timeframe);
 
   private:
     struct SeriesState {

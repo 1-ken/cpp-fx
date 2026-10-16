@@ -64,6 +64,13 @@ void FVGService::feedHistoricalBars(const std::vector<ClosedBar> &bars) {
     }
 }
 
+void FVGService::seedFormingBar(const std::string &symbol, const std::string &timeframe,
+                                int64_t bucketStartSec, double open, double high, double low,
+                                double close) {
+    if (!cfg_.enabled) return;
+    aggregator_.seedForming(symbol, timeframe, bucketStartSec, open, high, low, close);
+}
+
 void FVGService::enqueueBar(const ClosedBar &bar) {
     {
         std::lock_guard<std::mutex> lk(queueMu_);
@@ -98,8 +105,14 @@ void FVGService::workerLoop() {
 }
 
 void FVGService::processCompletedBar(const ClosedBar &bar) {
-    // 1. Detection of new FVG on closed bar
-    auto formedZone = detector_.onClosedBar(bar);
+    // 1. Detection of new FVG on closed bar. A partial bucket has incomplete OHLC, so it must
+    // never take part in 3-bar detection; it only breaks bar continuity for this series.
+    std::optional<FVGZone> formedZone;
+    if (bar.partial) {
+        detector_.resetSeries(bar.symbol, bar.timeframe);
+    } else {
+        formedZone = detector_.onClosedBar(bar);
+    }
     if (formedZone) {
         if (registry_.registerZone(*formedZone)) {
             LOG_INFO << "FVG Formed: " << formedZone->id << " [" << formedZone->bottom

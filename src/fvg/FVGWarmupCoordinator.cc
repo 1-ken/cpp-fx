@@ -1,5 +1,6 @@
 #include "fvg/FVGWarmupCoordinator.h"
 
+#include <algorithm>
 #include <ctime>
 #include <trantor/utils/Logger.h>
 
@@ -80,7 +81,7 @@ void FVGWarmupCoordinator::startWarmup() {
         auto symId = registry_->resolveId(sym);
         if (!symId) continue;
         for (const auto &tf : kWarmupTimeframes) {
-            int period = util::intervalToTrendbarPeriod(tf);
+            int period = util::intervalToTrendbarPeriod(fvgTimeframeToInterval(tf));
             if (period == 0) continue;
             std::string key = sym + ":" + tf;
             std::lock_guard<std::mutex> lk(mu_);
@@ -114,7 +115,7 @@ void FVGWarmupCoordinator::warmupSymbol(const std::string &symbol,
         std::lock_guard<std::mutex> lk(mu_);
         for (size_t i = 0; i < kWarmupTimeframes.size(); ++i) {
             const auto &tf = kWarmupTimeframes[i];
-            int period = util::intervalToTrendbarPeriod(tf);
+            int period = util::intervalToTrendbarPeriod(fvgTimeframeToInterval(tf));
             if (period == 0) continue;
             std::string key = canon + ":" + tf;
             queuedKeys_.insert(key);
@@ -124,6 +125,35 @@ void FVGWarmupCoordinator::warmupSymbol(const std::string &symbol,
     }
 
     pumpQueue();
+}
+
+bool FVGWarmupCoordinator::warmupSymbolTimeframe(const std::string &symbol,
+                                                 const std::string &timeframe) {
+    if (!cfg_ || !cfg_->fvgDetectorEnabled || !ctrader_ || !ctrader_->isReady() || !registry_ ||
+        !fvgService_) {
+        return false;
+    }
+    const std::string tf = secondsToTimeframe(timeframeToSeconds(timeframe));
+    if (tf.empty()) return false;
+    const int period = util::intervalToTrendbarPeriod(fvgTimeframeToInterval(tf));
+    if (period == 0) return false;
+
+    const std::string canon = util::canonicalPair(symbol);
+    if (canon.empty()) return false;
+    auto symId = registry_->resolveId(canon);
+    if (!symId) return false;
+
+    const int barCount = cfg_->fvgWarmupBars > 0 ? cfg_->fvgWarmupBars : 50;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const std::string key = canon + ":" + tf;
+        if (queuedKeys_.count(key) > 0) return false;
+        queuedKeys_.insert(key);
+        // Front of the queue: alert-driven jobs must not wait behind a scan-all warmup.
+        queue_.push_front(WarmJob{*symId, canon, tf, period, barCount, nullptr});
+    }
+    pumpQueue();
+    return true;
 }
 
 void FVGWarmupCoordinator::pumpQueue() {
@@ -147,12 +177,22 @@ void FVGWarmupCoordinator::pumpQueue() {
                 if (res.ok && fvgService_) {
                     int tfSec = timeframeToSeconds(job.timeframe);
                     std::time_t now = std::time(nullptr);
+                    // Oldest first: the detector requires ascending bucket times.
+                    std::sort(res.bars.begin(), res.bars.end(),
+                              [](const ctrader::TrendbarData &a, const ctrader::TrendbarData &b) {
+                                  return a.utcTimestampMinutes < b.utcTimestampMinutes;
+                              });
                     std::vector<ClosedBar> closedBars;
                     closedBars.reserve(res.bars.size());
+                    const ctrader::TrendbarData *forming = nullptr;
                     for (const auto &tb : res.bars) {
                         std::time_t end = tb.utcTimestampMinutes * 60 + tfSec;
-                        // Only closed bars
-                        if (end > now) continue;
+                        // Only closed bars go to the detector; the one still forming seeds the
+                        // live aggregator so the current bucket is not built from a partial view.
+                        if (end > now) {
+                            forming = &tb;
+                            continue;
+                        }
 
                         ClosedBar cb;
                         cb.symbol = job.canon;
@@ -169,6 +209,12 @@ void FVGWarmupCoordinator::pumpQueue() {
                     if (!closedBars.empty()) {
                         fvgService_->feedHistoricalBars(closedBars);
                     }
+                    if (forming) {
+                        fvgService_->seedFormingBar(job.canon, job.timeframe,
+                                                    forming->utcTimestampMinutes * 60,
+                                                    forming->open, forming->high, forming->low,
+                                                    forming->close);
+                    }
                 }
 
                 if (job.onDone) {
@@ -182,6 +228,8 @@ void FVGWarmupCoordinator::pumpQueue() {
                     std::lock_guard<std::mutex> lk(mu_);
                     if (inFlight_ > 0) --inFlight_;
                     warmedSymbols_.insert(job.canon);
+                    // A failed fetch must not block future attempts for this pair.
+                    if (!res.ok) queuedKeys_.erase(job.canon + ":" + job.timeframe);
                 }
 
                 pumpQueue();

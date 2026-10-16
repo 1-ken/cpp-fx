@@ -33,6 +33,10 @@ struct ClosedBar {
     double close = 0.0;
     int64_t volume = 0;
     bool isWarmup = false;
+    // True when the aggregator only observed part of this bucket (process started mid-bucket
+    // and the broker forming bar could not seed it). Its OHLC is incomplete, so consumers must
+    // not run 3-bar detection on it; it only signals a break in the series.
+    bool partial = false;
 };
 
 struct FVGZone {

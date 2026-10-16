@@ -730,7 +730,6 @@ Alert AlertManager::createFvgAlert(const std::string &pair, const std::string &i
                                    const std::string &phone, const std::string &customMessage,
                                    const std::string &expiresAt,
                                    std::optional<std::string> dependsOnAlertId) {
-    if (!postgres_) throw std::runtime_error("Database unavailable");
     std::string iv = normalizeTimeframe(interval);
     if (intervalSeconds(iv) == 0)
         throw std::invalid_argument("Invalid interval. Must be one of: 1m, 5m, 15m, 30m, 1h, 4h, 1d");
@@ -739,6 +738,8 @@ Alert AlertManager::createFvgAlert(const std::string &pair, const std::string &i
     std::transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
     if (dir != "bull" && dir != "bear" && dir != "any")
         throw std::invalid_argument("direction must be bull, bear, or any");
+
+    if (!postgres_) throw std::runtime_error("Database unavailable");
 
     Alert a;
     a.id = newUuid();
@@ -1043,6 +1044,57 @@ std::vector<Alert> AlertManager::createHourSweepCisdAlerts(
     return built;
 }
 
+std::vector<Alert> AlertManager::createFvgAlerts(
+    const std::vector<std::string> &pairs, const std::string &interval,
+    const std::string &direction, const std::string &userId, const std::string &email,
+    const std::vector<std::string> &channels, const std::string &phone,
+    const std::string &customMessage, const std::string &expiresAt) {
+    std::string iv = normalizeTimeframe(interval);
+    if (intervalSeconds(iv) == 0)
+        throw std::invalid_argument("Invalid interval. Must be one of: 1m, 5m, 15m, 30m, 1h, 4h, 1d");
+
+    std::string dir = direction;
+    std::transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
+    if (dir != "bull" && dir != "bear" && dir != "any")
+        throw std::invalid_argument("direction must be bull, bear, or any");
+
+    const std::vector<std::string> unique = util::uniqueCanonicalPairs(pairs);
+    if (unique.empty()) throw std::invalid_argument("At least one pair is required");
+    if (static_cast<int>(unique.size()) > kMaxBatchPairs)
+        throw std::invalid_argument("Select at most " + std::to_string(kMaxBatchPairs) + " pairs");
+
+    if (!postgres_) throw std::runtime_error("Database unavailable");
+
+    const std::string createdAt = util::nowIso8601();
+    std::optional<std::string> batchId;
+    if (unique.size() > 1) batchId = newUuid();
+    std::vector<Alert> built;
+    built.reserve(unique.size());
+    for (const auto &pair : unique) {
+        Alert a;
+        a.id = newUuid();
+        a.userId = userId;
+        a.pair = pair;
+        a.alertType = "fvg";
+        a.interval = iv;
+        a.structureDirection = dir;
+        a.batchId = batchId;
+        a.email = email;
+        a.channels = channels;
+        a.normalizeChannels();
+        a.phone = phone;
+        a.customMessage = customMessage;
+        a.expiresAt = expiresAt;
+        a.createdAt = createdAt;
+        a.status = "active";
+        built.push_back(std::move(a));
+    }
+    commitCreatedAlerts(built);
+    LOG_INFO << "Created " << built.size() << " FVG alert(s) " << iv << " dir=" << dir
+             << (batchId ? (" batch=" + *batchId) : "");
+    return built;
+}
+
 void AlertManager::ingestStructureHistory(const std::string &pair, const std::string &interval,
                                           const std::vector<Json::Value> &candles) {
     std::string iv = interval;
@@ -1121,6 +1173,23 @@ bool AlertManager::userHasActiveFvgAlert(const std::string &userId, const std::s
         return true;
     }
     return false;
+}
+
+std::vector<std::pair<std::string, std::string>> AlertManager::activeFvgWatchList() const {
+    std::vector<std::pair<std::string, std::string>> out;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const auto &kv : alerts_) {
+            const Alert &a = kv.second;
+            if (a.status != "active" || a.alertType != "fvg" || !a.interval) continue;
+            const std::string canon = util::canonicalPair(a.pair);
+            if (canon.empty()) continue;
+            out.emplace_back(canon, normalizeTimeframe(*a.interval));
+        }
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
 }
 
 std::vector<Alert> AlertManager::getActiveAlertsSortedForUser(const std::string &userId) const {

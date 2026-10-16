@@ -1520,6 +1520,221 @@ static void testUserHasActiveFvgAlertScoping() {
     CHECK(!mgr.userHasActiveFvgAlert("user-3", "EURUSD", "M15"));  // non-FVG alert does not count
 }
 
+static void testFvgTimeframeMapping() {
+    using namespace ctraderplus::fvg;
+    // Warmup used to pass "M15" to a lookup that only knows "15m" and silently skipped it.
+    CHECK(fvgTimeframeToInterval("M15") == "15m");
+    CHECK(fvgTimeframeToInterval("15m") == "15m");
+    CHECK(fvgTimeframeToInterval("M30") == "30m");
+    CHECK(fvgTimeframeToInterval("H1") == "1h");
+    CHECK(fvgTimeframeToInterval("H4") == "4h");
+    CHECK(fvgTimeframeToInterval("D1") == "1d");
+    CHECK(fvgTimeframeToInterval("junk").empty());
+    for (const char *tf : {"M5", "M15", "M30", "H1", "H4", "D1"}) {
+        CHECK(util::intervalToTrendbarPeriod(fvgTimeframeToInterval(tf)) != 0);
+    }
+    // Unconfigured coordinator must refuse politely, never crash.
+    FVGWarmupCoordinator warm;
+    CHECK(!warm.warmupSymbolTimeframe("EURUSD", "30m"));
+}
+
+static void testBarAggregatorM30PartialSeedAndOffset() {
+    using namespace ctraderplus::fvg;
+    auto feed = [](BarAggregator &agg, int64_t from, int64_t to, double base) {
+        for (int64_t t = from; t <= to; t += 60) {
+            agg.onClosed1mBar("EURUSD", t, base, base + 0.0010, base - 0.0010, base + 0.0005, 1);
+        }
+    };
+    auto find = [](const std::vector<ClosedBar> &v, const char *tf, int64_t bucket) {
+        for (const auto &b : v) {
+            if (b.timeframe == tf && b.bucketStartSec == bucket) return &b;
+        }
+        return static_cast<const ClosedBar *>(nullptr);
+    };
+
+    {  // M30 is rolled up (it used to be missing, so 30m FVG alerts could never fire).
+        std::vector<ClosedBar> out;
+        BarAggregator agg([&](const ClosedBar &b) { out.push_back(b); });
+        feed(agg, 0, 1800, 1.0800);  // the minute at 1800 closes the first M30 bucket
+        auto *m30 = find(out, "M30", 0);
+        CHECK(m30 != nullptr);
+        if (m30) CHECK(!m30->partial);
+    }
+    {  // Starting mid-bucket without a seed: the first bucket is flagged partial.
+        std::vector<ClosedBar> out;
+        BarAggregator agg([&](const ClosedBar &b) { out.push_back(b); });
+        feed(agg, 420, 900, 1.0800);  // first observed minute is 7 min into the M15 bucket
+        auto *m15 = find(out, "M15", 0);
+        CHECK(m15 != nullptr);
+        if (m15) CHECK(m15->partial);
+        // The following bucket is complete and must NOT be flagged.
+        feed(agg, 960, 1800, 1.0800);
+        auto *next = find(out, "M15", 900);
+        CHECK(next != nullptr);
+        if (next) CHECK(!next->partial);
+    }
+    {  // Seeded from the broker's forming bar: full OHLC, not partial.
+        std::vector<ClosedBar> out;
+        BarAggregator agg([&](const ClosedBar &b) { out.push_back(b); });
+        agg.seedForming("EURUSD", "M15", 0, 1.0790, 1.0810, 1.0780, 1.0800);
+        feed(agg, 420, 900, 1.0800);
+        auto *m15 = find(out, "M15", 0);
+        CHECK(m15 != nullptr);
+        if (m15) {
+            CHECK(!m15->partial);
+            CHECK(std::abs(m15->open - 1.0790) < 1e-9);  // broker open, not the first live tick
+            CHECK(std::abs(m15->low - 1.0780) < 1e-9);   // broker low survives
+        }
+    }
+    {  // Broker D1 rolls at 22:00 UTC. Learned from the seed, live buckets follow it.
+        std::vector<ClosedBar> out;
+        BarAggregator agg([&](const ClosedBar &b) { out.push_back(b); });
+        const int64_t dayStart = 79200;  // 22:00 UTC
+        agg.seedForming("EURUSD", "D1", dayStart, 1.0800, 1.0900, 1.0700, 1.0850);
+        agg.onClosed1mBar("EURUSD", dayStart, 1.08, 1.09, 1.07, 1.085, 1);
+        // Crossing epoch midnight (86400) must not close the broker day.
+        agg.onClosed1mBar("EURUSD", 86400 + 60, 1.085, 1.086, 1.084, 1.085, 1);
+        CHECK(find(out, "D1", dayStart) == nullptr);
+        // The next 22:00 UTC does.
+        agg.onClosed1mBar("EURUSD", dayStart + 86400, 1.085, 1.086, 1.084, 1.085, 1);
+        auto *d1 = find(out, "D1", dayStart);
+        CHECK(d1 != nullptr);
+        if (d1) CHECK(!d1->partial);
+    }
+}
+
+static void testFvgDetectorIgnoresDuplicateAndStaleBars() {
+    using namespace ctraderplus::fvg;
+    FVGDetector det;
+    ClosedBar b1{"EURUSD", "M15", 1000, 1.0780, 1.0800, 1.0775, 1.0790, 100};
+    ClosedBar b2{"EURUSD", "M15", 1900, 1.0790, 1.0850, 1.0785, 1.0845, 250};
+    ClosedBar b3{"EURUSD", "M15", 2800, 1.0845, 1.0860, 1.0820, 1.0855, 120};
+    CHECK(!det.onClosedBar(b1).has_value());
+    CHECK(!det.onClosedBar(b2).has_value());
+    auto zone = det.onClosedBar(b3);
+    CHECK(zone.has_value());
+    // The same closing bar again (warmup overlapping live) must not form anything.
+    CHECK(!det.onClosedBar(b3).has_value());
+    // A stale, older bar must not slip into the window either.
+    CHECK(!det.onClosedBar(b1).has_value());
+    // A genuinely newer bar is still accepted.
+    ClosedBar b4{"EURUSD", "M15", 3700, 1.0855, 1.0870, 1.0850, 1.0860, 100};
+    CHECK(!det.onClosedBar(b4).has_value());  // no new gap, but it was processed without error
+}
+
+static void testFvgServicePartialBarBreaksSeries() {
+    fvg::FVGService::Config cfg;
+    cfg.enabled = true;
+    cfg.minGapPips = 1.0;
+    fvg::FVGService service(cfg);
+    service.start();
+
+    fvg::ClosedBar b1{"EURUSD", "M15", 900, 1.0780, 1.0800, 1.0775, 1.0790, 100};
+    fvg::ClosedBar b2{"EURUSD", "M15", 1800, 1.0790, 1.0850, 1.0785, 1.0845, 250};
+    // Incomplete bucket in the middle: must not take part in detection and must break the series.
+    fvg::ClosedBar p{"EURUSD", "M15", 2700, 1.0845, 1.0850, 1.0840, 1.0848, 10};
+    p.partial = true;
+    // Without the break, (b1, b2, b3) would form a bullish gap [1.0800 - 1.0820].
+    fvg::ClosedBar b3{"EURUSD", "M15", 3600, 1.0845, 1.0860, 1.0820, 1.0855, 120};
+    service.feedClosedBar(b1);
+    service.feedClosedBar(b2);
+    service.feedClosedBar(p);
+    service.feedClosedBar(b3);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    CHECK(service.registry().getActiveZones("EURUSD", "M15").empty());
+    service.stop();
+}
+
+static void testActiveFvgWatchList() {
+    alerts::AlertManager mgr;
+    CHECK(mgr.activeFvgWatchList().empty());
+    auto make = [&](const char *id, const char *pair, const char *type, const char *iv,
+                    const char *status) {
+        alerts::Alert a;
+        a.id = id;
+        a.userId = "u";
+        a.pair = pair;
+        a.alertType = type;
+        if (iv) a.interval = iv;
+        a.status = status;
+        a.createdAt = "2026-10-14T00:00:00Z";
+        mgr.cacheAlert(a);
+    };
+    make("f1", "EUR/USD", "fvg", "30m", "active");
+    make("f2", "EURUSD", "fvg", "M30", "active");   // same watch as f1 after normalization
+    make("f3", "GBPUSD", "fvg", "15m", "active");
+    make("f4", "USDJPY", "fvg", "1h", "triggered");  // not active
+    make("p1", "AUDUSD", "price", nullptr, "active");  // not an FVG alert
+    auto watch = mgr.activeFvgWatchList();
+    CHECK(watch.size() == 2);
+    if (watch.size() == 2) {
+        CHECK(watch[0].first == "EURUSD" && watch[0].second == "30m");
+        CHECK(watch[1].first == "GBPUSD" && watch[1].second == "15m");
+    }
+}
+
+static void testFvgBatchAlerts() {
+    alerts::AlertManager mgr;
+
+    // 1. Validation tests on createFvgAlerts
+    bool caughtInvalidIv = false;
+    try {
+        mgr.createFvgAlerts({"EURUSD"}, "invalid_iv", "any", "user-1", "", {"sound"}, "", "", "2026-10-20T00:00:00Z");
+    } catch (const std::invalid_argument &) {
+        caughtInvalidIv = true;
+    }
+    CHECK(caughtInvalidIv);
+
+    bool caughtInvalidDir = false;
+    try {
+        mgr.createFvgAlerts({"EURUSD"}, "15m", "up", "user-1", "", {"sound"}, "", "", "2026-10-20T00:00:00Z");
+    } catch (const std::invalid_argument &) {
+        caughtInvalidDir = true;
+    }
+    CHECK(caughtInvalidDir);
+
+    bool caughtEmptyPairs = false;
+    try {
+        mgr.createFvgAlerts({}, "15m", "bull", "user-1", "", {"sound"}, "", "", "2026-10-20T00:00:00Z");
+    } catch (const std::invalid_argument &) {
+        caughtEmptyPairs = true;
+    }
+    CHECK(caughtEmptyPairs);
+
+    // 2. Multi-pair alerts batch triggering
+    alerts::Alert a1;
+    a1.id = "fvg-batch-1";
+    a1.userId = "user-1";
+    a1.pair = "EURUSD";
+    a1.alertType = "fvg";
+    a1.interval = "15m";
+    a1.structureDirection = "bull";
+    a1.batchId = "batch-xyz";
+    a1.status = "active";
+    a1.createdAt = "2026-10-14T00:00:00Z";
+    mgr.cacheAlert(a1);
+
+    alerts::Alert a2;
+    a2.id = "fvg-batch-2";
+    a2.userId = "user-1";
+    a2.pair = "GBPUSD";
+    a2.alertType = "fvg";
+    a2.interval = "15m";
+    a2.structureDirection = "bull";
+    a2.batchId = "batch-xyz";
+    a2.status = "active";
+    a2.createdAt = "2026-10-14T00:00:00Z";
+    mgr.cacheAlert(a2);
+
+    fvg::FVGZone z1{"EURUSD_M15_200", "EURUSD", "M15", 1.0850, 1.0830, true, 200, false, 0};
+    mgr.checkFvgAlerts(z1);
+
+    auto updated1 = mgr.getAlert("fvg-batch-1");
+    auto updated2 = mgr.getAlert("fvg-batch-2");
+    CHECK(updated1.has_value() && updated1->status == "triggered");
+    CHECK(updated2.has_value() && updated2->status == "active");  // GBPUSD still active!
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -1554,6 +1769,12 @@ int main() {
     testSymbolSubscriptionPlannerUniversalFvg();
     testFvgHistoricalWarmup();
     testUserHasActiveFvgAlertScoping();
+    testFvgTimeframeMapping();
+    testBarAggregatorM30PartialSeedAndOffset();
+    testFvgDetectorIgnoresDuplicateAndStaleBars();
+    testFvgServicePartialBarBreaksSeries();
+    testActiveFvgWatchList();
+    testFvgBatchAlerts();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

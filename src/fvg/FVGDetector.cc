@@ -76,6 +76,12 @@ std::optional<FVGZone> FVGDetector::onClosedBar(const ClosedBar &bar) {
     const std::string key = bar.symbol + ":" + bar.timeframe;
     SeriesState &st = series_[key];
 
+    // Ignore duplicate or stale bars (for example warmup history overlapping live bars).
+    // Letting them in would corrupt the 3-bar window and could fabricate or hide a gap.
+    if (!st.bars.empty() && bar.bucketStartSec <= st.bars.back().bucketStartSec) {
+        return std::nullopt;
+    }
+
     // Calculate True Range for ATR
     if (!st.bars.empty()) {
         const auto &prev = st.bars.back();
@@ -113,6 +119,10 @@ std::optional<FVGZone> FVGDetector::onClosedBar(const ClosedBar &bar) {
 
 void FVGDetector::reset() {
     series_.clear();
+}
+
+void FVGDetector::resetSeries(const std::string &symbol, const std::string &timeframe) {
+    series_.erase(symbol + ":" + timeframe);
 }
 
 }  // namespace ctraderplus::fvg

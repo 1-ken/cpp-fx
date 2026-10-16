@@ -55,6 +55,11 @@ class FVGService {
                          int64_t volume = 0);
     void feedClosedBar(const ClosedBar &bar);
     void feedHistoricalBars(const std::vector<ClosedBar> &bars);
+    // Seed the live aggregator's forming higher-timeframe bucket from the broker's forming bar
+    // (see BarAggregator::seedForming). Safe to call from any thread.
+    void seedFormingBar(const std::string &symbol, const std::string &timeframe,
+                        int64_t bucketStartSec, double open, double high, double low,
+                        double close);
 
     // Direct access to registry for REST query
     const FVGRegistry &registry() const { return registry_; }

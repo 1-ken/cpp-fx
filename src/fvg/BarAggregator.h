@@ -36,6 +36,15 @@ class BarAggregator {
     // Flush any pending incomplete bars (e.g., during shutdown or testing)
     std::vector<ClosedBar> flushIncompleteBars();
 
+    // Seed the currently forming higher-timeframe bucket with the broker's own forming bar
+    // (open/high/low/close so far). This gives continuity after a restart mid-bucket and also
+    // teaches the aggregator the broker's bucket alignment for this symbol/timeframe (for
+    // example the D1 rollover at 22:00 UTC) so live buckets line up with broker candles.
+    // `timeframe` is "M5", "M15", "M30", "H1", "H4" or "D1". Unsupported values are ignored.
+    void seedForming(const std::string &symbol, const std::string &timeframe,
+                     int64_t brokerBucketStartSec, double open, double high, double low,
+                     double close);
+
   private:
     struct RunningBar {
         int64_t bucketStartSec = -1;
@@ -45,6 +54,9 @@ class BarAggregator {
         double close = 0.0;
         int64_t volume = 0;
         bool valid = false;
+        // First observed minute was not the first minute of the bucket and no broker seed
+        // arrived: OHLC is incomplete, so the bar is reported as `partial` when it closes.
+        bool partial = false;
     };
 
     void process1mClosedBarLocked(const ClosedBar &m1Bar, std::vector<ClosedBar> &emitted);
@@ -57,9 +69,16 @@ class BarAggregator {
 
     // Key: symbol + ":" + timeframe -> running higher-TF aggregated bar
     std::map<std::string, RunningBar> runningHtfBars_;
+
+    // Key: symbol + ":" + timeframe -> seconds the broker's buckets are shifted from epoch
+    // alignment. Absent means 0 (pure epoch alignment, the original behaviour).
+    std::map<std::string, int64_t> bucketOffsets_;
 };
 
 int timeframeToSeconds(const std::string &tf);
 std::string secondsToTimeframe(int sec);
+// "M15"/"15m" -> "15m", "H4"/"4h" -> "4h", ... Empty string when unsupported. Used to look up
+// the cTrader trendbar period, which only understands the lowercase interval form.
+std::string fvgTimeframeToInterval(const std::string &tf);
 
 }  // namespace ctraderplus::fvg

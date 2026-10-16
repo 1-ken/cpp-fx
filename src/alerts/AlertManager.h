@@ -142,6 +142,16 @@ class AlertManager {
                          const std::string &phone, const std::string &customMessage,
                          const std::string &expiresAt,
                          std::optional<std::string> dependsOnAlertId = std::nullopt);
+    // fvg: one independent alert per pair, same timeframe/direction, shared batch id when there
+    // is more than one pair. Saves all of them or none. Input is validated before the database
+    // is touched, so bad input always fails with std::invalid_argument.
+    std::vector<Alert> createFvgAlerts(const std::vector<std::string> &pairs,
+                                       const std::string &interval, const std::string &direction,
+                                       const std::string &userId, const std::string &email,
+                                       const std::vector<std::string> &channels,
+                                       const std::string &phone,
+                                       const std::string &customMessage,
+                                       const std::string &expiresAt);
 
     void ingestStructureHistory(const std::string &pair, const std::string &interval,
                                 const std::vector<Json::Value> &candles);
@@ -154,6 +164,8 @@ class AlertManager {
     // True when `userId` owns an active FVG alert on `symbol` for `timeframe` (M15/15m both ok).
     bool userHasActiveFvgAlert(const std::string &userId, const std::string &symbol,
                                const std::string &timeframe) const;
+    // Distinct (canonical pair, interval like "30m") watched by active FVG alerts.
+    std::vector<std::pair<std::string, std::string>> activeFvgWatchList() const;
     std::vector<Alert> getActiveAlertsSortedForUser(const std::string &userId) const;
     bool isAlertOwnedBy(const std::string &id, const std::string &userId) const;
 

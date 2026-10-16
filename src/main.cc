@@ -252,9 +252,8 @@ int main() {
             std::string canon = registry.canonicalForId(u.symbolId);
             if (!canon.empty()) {
                 double price = 0.0;
-                if (u.hasBid && u.hasAsk) {
-                    price = (u.bid + u.ask) / 2.0;
-                } else if (u.hasBid) {
+                // Prefer bid: cTrader trendbars (warmup and chart candles) are bid-based.
+                if (u.hasBid) {
                     price = u.bid;
                 } else if (u.hasAsk) {
                     price = u.ask;
@@ -379,6 +378,13 @@ int main() {
         workerLoop->runEvery(5.0, [&]() {
             if (ctrader.isReady() && util::isForexMarketOpen())
                 candleMonitor.syncSubscriptions();
+        });
+        // Give every active FVG alert history on exactly the timeframe it watches.
+        workerLoop->runEvery(15.0, [&]() {
+            if (!cfg.fvgDetectorEnabled || !ctrader.isReady()) return;
+            for (const auto &watch : alertManager.activeFvgWatchList()) {
+                fvgWarmup.warmupSymbolTimeframe(watch.first, watch.second);
+            }
         });
         workerLoop->runEvery(20.0, [&]() {
             if (!ctrader.isReady()) return;
