@@ -727,13 +727,16 @@ void PostgresService::updateUserPhone(const std::string &userId, const std::stri
     }
     if (normalized.size() > 32) normalized = normalized.substr(0, 32);
     if (forceUpdate) {
-        client_->execSqlSync("UPDATE users SET phone = $2 WHERE user_id = $1", userId,
-                             normalized);
+        client_->execSqlSync(
+            "INSERT INTO users (user_id, phone, created_at) VALUES ($1, $2, NOW()) "
+            "ON CONFLICT (user_id) DO UPDATE SET phone = EXCLUDED.phone",
+            userId, normalized);
         return;
     }
     client_->execSqlSync(
-        "UPDATE users SET phone = $2 WHERE user_id = $1 "
-        "AND (phone IS NULL OR TRIM(phone) = '')",
+        "INSERT INTO users (user_id, phone, created_at) VALUES ($1, $2, NOW()) "
+        "ON CONFLICT (user_id) DO UPDATE SET phone = EXCLUDED.phone "
+        "WHERE users.phone IS NULL OR TRIM(users.phone) = ''",
         userId, normalized);
 }
 
