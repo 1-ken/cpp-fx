@@ -18,7 +18,7 @@ struct Alert {
     std::string pair;
     std::string status = "active";  // active, waiting, triggered, disabled, expired
     std::string createdAt;
-    std::string alertType = "price";  // price | candle_close | prev_day_level | market_structure | structure_session | sweep_confirm | hour_sweep_cisd
+    std::string alertType = "price";  // price | candle_close | prev_day_level | market_structure | structure_session | sweep_confirm | hour_sweep_cisd | fvg | candle2_closure
     std::string channel = "email";    // primary / legacy single channel
     std::vector<std::string> channels;  // email | sms | call | sound
     std::string email;

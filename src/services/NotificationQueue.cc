@@ -217,6 +217,13 @@ void NotificationQueue::dispatchOneChannel(const alerts::TriggeredAlert &t,
         else if (dir == "bear") cond = "Bearish FVG formed @";
         else cond = "FVG formed @";
     }
+    if (a.alertType == "candle2_closure") {
+        target = copy.currentPrice;
+        std::string dir = a.pendingDir.value_or(a.structureDirection.value_or("any"));
+        if (dir == "bull") cond = "Bullish Candle 2 reversal closure @";
+        else if (dir == "bear") cond = "Bearish Candle 2 reversal closure @";
+        else cond = "Candle 2 reversal closure @";
+    }
     std::string triggeredAt = a.triggeredAt.value_or(util::nowIso8601());
 
     if (channel == "sound") {

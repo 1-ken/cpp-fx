@@ -1735,6 +1735,94 @@ static void testFvgBatchAlerts() {
     CHECK(updated2.has_value() && updated2->status == "active");  // GBPUSD still active!
 }
 
+static void testCandle2ClosureAlerts() {
+    alerts::AlertManager mgr;
+
+    // 1. Validation tests on createCandle2ClosureAlerts
+    bool caughtInvalidIv = false;
+    try {
+        mgr.createCandle2ClosureAlerts({"EURUSD"}, "invalid_iv", "any", "user-1", "", {"sound"}, "", "", "2026-10-20T00:00:00Z");
+    } catch (const std::invalid_argument &) {
+        caughtInvalidIv = true;
+    }
+    CHECK(caughtInvalidIv);
+
+    bool caughtInvalidDir = false;
+    try {
+        mgr.createCandle2ClosureAlerts({"EURUSD"}, "15m", "up", "user-1", "", {"sound"}, "", "", "2026-10-20T00:00:00Z");
+    } catch (const std::invalid_argument &) {
+        caughtInvalidDir = true;
+    }
+    CHECK(caughtInvalidDir);
+
+    bool caughtEmptyPairs = false;
+    try {
+        mgr.createCandle2ClosureAlerts({}, "15m", "bull", "user-1", "", {"sound"}, "", "", "2026-10-20T00:00:00Z");
+    } catch (const std::invalid_argument &) {
+        caughtEmptyPairs = true;
+    }
+    CHECK(caughtEmptyPairs);
+
+    // 2. Setup alerts (bullish, bearish, and any)
+    alerts::Alert bullAlert;
+    bullAlert.id = "c2-bull";
+    bullAlert.userId = "user-1";
+    bullAlert.pair = "EURUSD";
+    bullAlert.alertType = "candle2_closure";
+    bullAlert.interval = "15m";
+    bullAlert.structureDirection = "bull";
+    bullAlert.status = "active";
+    bullAlert.createdAt = "2026-06-03T21:00:00Z";
+    mgr.cacheAlert(bullAlert);
+
+    alerts::Alert bearAlert;
+    bearAlert.id = "c2-bear";
+    bearAlert.userId = "user-1";
+    bearAlert.pair = "EURUSD";
+    bearAlert.alertType = "candle2_closure";
+    bearAlert.interval = "15m";
+    bearAlert.structureDirection = "bear";
+    bearAlert.status = "active";
+    bearAlert.createdAt = "2026-06-03T21:00:00Z";
+    mgr.cacheAlert(bearAlert);
+
+    // Case A: Feed Candle 1: range [1.0900, 1.1000]
+    std::vector<Json::Value> batch1 = {
+        testCandle("EURUSD", "15m", "2026-06-03T21:15:00", 1.0950, 1.1000, 1.0900, 1.0980)
+    };
+    mgr.checkCandleAlerts(batch1);
+
+    // After 1 candle, neither should trigger
+    auto bAfter1 = mgr.getAlert("c2-bull");
+    CHECK(bAfter1.has_value() && bAfter1->status == "active" && !bAfter1->triggeredAt.has_value());
+
+    // Case B: Feed Candle 2 with Bullish Reversal:
+    // sweeps low (l = 1.0880 < 1.0900), does not sweep high (h = 1.0960 <= 1.1000), closes inside (c = 1.0920 > 1.0900)
+    std::vector<Json::Value> batch2 = {
+        testCandle("EURUSD", "15m", "2026-06-03T21:30:00", 1.0940, 1.0960, 1.0880, 1.0920)
+    };
+    mgr.checkCandleAlerts(batch2);
+
+    auto bAfter2 = mgr.getAlert("c2-bull");
+    auto bearAfter2 = mgr.getAlert("c2-bear");
+    CHECK(bAfter2.has_value());
+    CHECK(bAfter2->status == "active");  // Repeating lifecycle!
+    CHECK(bAfter2->triggeredAt.has_value());
+    CHECK(bearAfter2.has_value() && !bearAfter2->triggeredAt.has_value()); // bear did not trigger
+
+    // Case C: Feed Candle 3 with Bearish Reversal relative to Candle 2 (range [1.0880, 1.0960]):
+    // sweeps high (h = 1.0990 > 1.0960), does not sweep low (l = 1.0900 > 1.0880), closes inside (c = 1.0930 < 1.0960)
+    std::vector<Json::Value> batch3 = {
+        testCandle("EURUSD", "15m", "2026-06-03T21:45:00", 1.0930, 1.0990, 1.0900, 1.0930)
+    };
+    mgr.checkCandleAlerts(batch3);
+
+    auto bearAfter3 = mgr.getAlert("c2-bear");
+    CHECK(bearAfter3.has_value());
+    CHECK(bearAfter3->status == "active");
+    CHECK(bearAfter3->triggeredAt.has_value());
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -1775,6 +1863,7 @@ int main() {
     testFvgServicePartialBarBreaksSeries();
     testActiveFvgWatchList();
     testFvgBatchAlerts();
+    testCandle2ClosureAlerts();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

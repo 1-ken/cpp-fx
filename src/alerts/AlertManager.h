@@ -152,6 +152,11 @@ class AlertManager {
                                        const std::string &phone,
                                        const std::string &customMessage,
                                        const std::string &expiresAt);
+    std::vector<Alert> createCandle2ClosureAlerts(
+        const std::vector<std::string> &pairs, const std::string &interval,
+        const std::string &direction, const std::string &userId, const std::string &email,
+        const std::vector<std::string> &channels, const std::string &phone,
+        const std::string &customMessage, const std::string &expiresAt);
 
     void ingestStructureHistory(const std::string &pair, const std::string &interval,
                                 const std::vector<Json::Value> &candles);
@@ -232,6 +237,10 @@ class AlertManager {
     SessionStepResult evalHourSweepCisdLocked(Alert &a, const Json::Value &candle,
                                               const std::string &candleTsStr,
                                               StructureTrack &track);
+    SessionStepResult evalCandle2ClosureLocked(Alert &a, const std::string &interval,
+                                               const Json::Value &candle,
+                                               const std::string &candleTsStr,
+                                               StructureTrack &track);
     // Caller holds mu_. Mutates a when the session day rolls or a step matches.
     SessionStepResult evalStructureSessionLocked(Alert &a, const std::string &interval,
                                                  const Json::Value &candle,

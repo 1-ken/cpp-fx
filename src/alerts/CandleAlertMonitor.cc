@@ -77,6 +77,8 @@ CandleAlertMonitor::requiredSubscriptions() const {
             intervals.push_back(*a.interval);
         } else if (a.alertType == "market_structure" && a.interval) {
             intervals.push_back(*a.interval);
+        } else if (a.alertType == "candle2_closure" && a.interval) {
+            intervals.push_back(*a.interval);
         } else if (a.alertType == "sweep_confirm" || a.alertType == "hour_sweep_cisd") {
             intervals.push_back("5m");
             intervals.push_back("1h");

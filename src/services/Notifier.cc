@@ -38,6 +38,7 @@ std::string upperTypeLabel(const std::string &alertType) {
     if (alertType == "prev_day_level") return "DRAW ON LIQUIDITY";
     if (alertType == "candle_close") return "CANDLE CLOSE";
     if (alertType == "fvg" || alertType == "fair_value_gap") return "FAIR VALUE GAP";
+    if (alertType == "candle2_closure") return "CANDLE 2 CLOSURE";
     std::string label = alertType.empty() ? "price" : alertType;
     std::transform(label.begin(), label.end(), label.begin(),
                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });

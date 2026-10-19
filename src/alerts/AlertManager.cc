@@ -300,6 +300,9 @@ void AlertManager::rebuildIndexes() {
         } else if (a.alertType == "hour_sweep_cisd") {
             activeCandleIndex_[candleIndexKey(key, "5m")].push_back(a.id);
             activeCandleIndex_[candleIndexKey(key, "1h")].push_back(a.id);
+        } else if (a.alertType == "candle2_closure" && a.interval) {
+            std::string iv = normalizeTimeframe(*a.interval);
+            activeCandleIndex_[candleIndexKey(key, iv)].push_back(a.id);
         } else if (a.alertType == "structure_session") {
             for (const auto &raw : a.intervals) {
                 std::string iv = raw;
@@ -1091,6 +1094,57 @@ std::vector<Alert> AlertManager::createFvgAlerts(
     }
     commitCreatedAlerts(built);
     LOG_INFO << "Created " << built.size() << " FVG alert(s) " << iv << " dir=" << dir
+             << (batchId ? (" batch=" + *batchId) : "");
+    return built;
+}
+
+std::vector<Alert> AlertManager::createCandle2ClosureAlerts(
+    const std::vector<std::string> &pairs, const std::string &interval,
+    const std::string &direction, const std::string &userId, const std::string &email,
+    const std::vector<std::string> &channels, const std::string &phone,
+    const std::string &customMessage, const std::string &expiresAt) {
+    std::string iv = normalizeTimeframe(interval);
+    if (intervalSeconds(iv) == 0)
+        throw std::invalid_argument("Invalid interval. Must be one of: 1m, 5m, 15m, 30m, 1h, 4h, 1d");
+
+    std::string dir = direction;
+    std::transform(dir.begin(), dir.end(), dir.begin(), ::tolower);
+    if (dir != "bull" && dir != "bear" && dir != "any")
+        throw std::invalid_argument("direction must be bull, bear, or any");
+
+    const std::vector<std::string> unique = util::uniqueCanonicalPairs(pairs);
+    if (unique.empty()) throw std::invalid_argument("At least one pair is required");
+    if (static_cast<int>(unique.size()) > kMaxBatchPairs)
+        throw std::invalid_argument("Select at most " + std::to_string(kMaxBatchPairs) + " pairs");
+
+    if (!postgres_) throw std::runtime_error("Database unavailable");
+
+    const std::string createdAt = util::nowIso8601();
+    std::optional<std::string> batchId;
+    if (unique.size() > 1) batchId = newUuid();
+    std::vector<Alert> built;
+    built.reserve(unique.size());
+    for (const auto &pair : unique) {
+        Alert a;
+        a.id = newUuid();
+        a.userId = userId;
+        a.pair = pair;
+        a.alertType = "candle2_closure";
+        a.interval = iv;
+        a.structureDirection = dir;
+        a.batchId = batchId;
+        a.email = email;
+        a.channels = channels;
+        a.normalizeChannels();
+        a.phone = phone;
+        a.customMessage = customMessage;
+        a.expiresAt = expiresAt;
+        a.createdAt = createdAt;
+        a.status = "active";
+        built.push_back(std::move(a));
+    }
+    commitCreatedAlerts(built);
+    LOG_INFO << "Created " << built.size() << " candle2_closure alert(s) " << iv << " dir=" << dir
              << (batchId ? (" batch=" + *batchId) : "");
     return built;
 }
@@ -1987,6 +2041,64 @@ AlertManager::SessionStepResult AlertManager::evalHourSweepCisdLocked(
     return SessionStepResult::Unchanged;
 }
 
+AlertManager::SessionStepResult AlertManager::evalCandle2ClosureLocked(
+    Alert &a, const std::string &interval, const Json::Value &candle,
+    const std::string &candleTsStr, StructureTrack &track) {
+    if (a.lastEvaluatedCandleTime && *a.lastEvaluatedCandleTime == candleTsStr)
+        return SessionStepResult::Unchanged;
+    auto candleStart = parseCandleTs(candle["timestamp"]);
+    const int ivSec = intervalSeconds(interval);
+    auto createdAt = util::parseIso8601(a.createdAt);
+    if (candleStart && ivSec > 0 && createdAt && *candleStart + ivSec <= *createdAt) {
+        a.lastEvaluatedCandleTime = candleTsStr;
+        return SessionStepResult::Updated;
+    }
+    a.lastEvaluatedCandleTime = candleTsStr;
+    if (track.candles.size() < 2) return SessionStepResult::Updated;
+
+    int c2Idx = -1;
+    for (int i = static_cast<int>(track.candles.size()) - 1; i >= 0; --i) {
+        if (track.candles[static_cast<size_t>(i)].timestamp == candleTsStr) {
+            c2Idx = i;
+            break;
+        }
+    }
+    if (c2Idx < 1) return SessionStepResult::Updated;
+
+    const auto &c1 = track.candles[static_cast<size_t>(c2Idx - 1)];
+    const auto &c2 = track.candles[static_cast<size_t>(c2Idx)];
+
+    if (c1.high <= 0 || c1.low <= 0 || c2.high <= 0 || c2.low <= 0)
+        return SessionStepResult::Updated;
+
+    const bool sweptHigh = c2.high > c1.high;
+    const bool sweptLow = c2.low < c1.low;
+
+    // Fractal Model Candle 2 closure is always a single-sided reversal closure:
+    // Bullish: c2 sweeps c1.low, does not sweep c1.high, and closes back inside [c1.low, c1.high]
+    const bool bullClosure = sweptLow && !sweptHigh && c2.close > c1.low && c2.close <= c1.high;
+    // Bearish: c2 sweeps c1.high, does not sweep c1.low, and closes back inside [c1.low, c1.high]
+    const bool bearClosure = sweptHigh && !sweptLow && c2.close < c1.high && c2.close >= c1.low;
+
+    const std::string want = a.structureDirection.value_or("any");
+    const bool matchBull = (want == "any" || want == "bull") && bullClosure;
+    const bool matchBear = (want == "any" || want == "bear") && bearClosure;
+
+    if (!matchBull && !matchBear) return SessionStepResult::Updated;
+
+    const bool isBear = matchBear;
+    const double triggerPrice = c2.close;
+    a.pendingDir = isBear ? "bear" : "bull";
+    a.pendingSweepLevel = isBear ? c1.high : c1.low;
+    if (candleStart && ivSec > 0)
+        a.triggeredAt = util::toIso8601(*candleStart + ivSec);
+    else
+        a.triggeredAt = util::nowIso8601();
+    a.lastCheckedPrice = triggerPrice;
+    a.closePrice = triggerPrice;
+    return SessionStepResult::Triggered;
+}
+
 AlertManager::SessionStepResult AlertManager::evalStructureSessionLocked(
     Alert &a, const std::string &interval, const Json::Value &candle,
     const std::string &candleTsStr, StructureTrack &track) {
@@ -2197,12 +2309,43 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
             bar.close = candle.get("close", 0.0).asDouble();
             appendStructureCandle(track, std::move(bar));
             auto idxItStruct = activeCandleIndex_.find(trackKey);
-            if (idxItStruct != activeCandleIndex_.end() && track.candles.size() >= 5) {
+            if (idxItStruct != activeCandleIndex_.end() && track.candles.size() >= 2) {
                 auto candleStart = parseCandleTs(tsVal);
                 for (const auto &alertId : idxItStruct->second) {
                     auto it = alerts_.find(alertId);
                     if (it == alerts_.end()) continue;
                     Alert &a = it->second;
+                    if (a.status == "active" && a.alertType == "candle2_closure") {
+                        if (isPastExpiry(a)) {
+                            Alert before = a;
+                            a.status = "expired";
+                            toPersist.push_back({before, a, true, true});
+                            LOG_INFO << "Expired candle2_closure alert " << a.id << " " << a.pair
+                                     << " (past expires_at)";
+                            continue;
+                        }
+                        std::string iv = normalizeTimeframe(a.interval.value_or(""));
+                        if (iv != k.interval) continue;
+                        Alert before = a;
+                        const auto step =
+                            evalCandle2ClosureLocked(a, k.interval, candle, candleTsStr, track);
+                        if (step == SessionStepResult::Unchanged) continue;
+                        if (step == SessionStepResult::Triggered) {
+                            TriggeredAlert t;
+                            t.alert = a;
+                            t.currentPrice = candle.get("close", 0.0).asDouble();
+                            t.alertTypeLabel = "candle2_closure";
+                            t.timeframe = k.interval;
+                            triggered.push_back(t);
+                            toPersist.push_back({before, a, true, true});
+                            LOG_INFO << "Triggered candle2_closure alert " << a.id << " " << a.pair
+                                     << " " << k.interval << " close=" << t.currentPrice;
+                        } else {
+                            toPersist.push_back({before, a, false, true});
+                        }
+                        continue;
+                    }
+                    if (track.candles.size() < 5) continue;
                     if (a.status == "active" && a.alertType == "sweep_confirm") {
                         if (k.interval != "5m") continue;
                         if (isPastExpiry(a)) {
