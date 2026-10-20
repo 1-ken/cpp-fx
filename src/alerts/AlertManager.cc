@@ -245,6 +245,14 @@ std::string structureOptKey(const market::StructureOptions &opt) {
 
 void AlertManager::appendStructureCandle(StructureTrack &track, market::StructureCandle bar) {
     if (!track.candles.empty() && track.candles.back().timestamp == bar.timestamp) return;
+    if (!track.candles.empty()) {
+        for (const auto &c : track.candles) {
+            if (c.timestamp == bar.timestamp) return;
+        }
+        auto backTs = util::parseIso8601(track.candles.back().timestamp);
+        auto newTs = util::parseIso8601(bar.timestamp);
+        if (backTs && newTs && *newTs <= *backTs) return;
+    }
     track.candles.push_back(std::move(bar));
     if (track.candles.size() > kStructureWindow) {
         track.candles.erase(track.candles.begin(),
@@ -1151,13 +1159,18 @@ std::vector<Alert> AlertManager::createCandle2ClosureAlerts(
 
 void AlertManager::ingestStructureHistory(const std::string &pair, const std::string &interval,
                                           const std::vector<Json::Value> &candles) {
-    std::string iv = interval;
-    std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+    std::string iv = normalizeTimeframe(interval);
+    if (iv.empty()) {
+        iv = interval;
+        std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+    }
     std::string key = candleIndexKey(util::canonicalPair(pair), iv);
     std::lock_guard<std::mutex> lk(mu_);
     auto &track = structureTracks_[key];
+    std::vector<market::StructureCandle> existing = std::move(track.candles);
     track.candles.clear();
     track.engines.clear();
+
     for (const auto &c : candles) {
         market::StructureCandle bar;
         bar.timestamp = c.get("timestamp", "").asString();
@@ -1165,13 +1178,53 @@ void AlertManager::ingestStructureHistory(const std::string &pair, const std::st
         bar.high = c.get("high", 0.0).asDouble();
         bar.low = c.get("low", 0.0).asDouble();
         bar.close = c.get("close", 0.0).asDouble();
-        if (!bar.timestamp.empty()) track.candles.push_back(std::move(bar));
+        if (bar.timestamp.empty()) continue;
+        if (!track.candles.empty() && track.candles.back().timestamp == bar.timestamp) {
+            track.candles.back() = std::move(bar);
+        } else {
+            track.candles.push_back(std::move(bar));
+        }
     }
+
+    // Preserve any existing live candles that closed after the warmup window.
+    std::optional<std::time_t> lastIngestedTs =
+        track.candles.empty() ? std::nullopt : util::parseIso8601(track.candles.back().timestamp);
+    for (auto &ex : existing) {
+        if (ex.timestamp.empty()) continue;
+        bool alreadyPresent = false;
+        for (const auto &cur : track.candles) {
+            if (cur.timestamp == ex.timestamp) {
+                alreadyPresent = true;
+                break;
+            }
+        }
+        if (alreadyPresent) continue;
+        auto exTs = util::parseIso8601(ex.timestamp);
+        if (lastIngestedTs && exTs && *exTs > *lastIngestedTs) {
+            track.candles.push_back(std::move(ex));
+        } else if (!lastIngestedTs && track.candles.empty()) {
+            track.candles.push_back(std::move(ex));
+        }
+    }
+
     if (track.candles.size() > 512) {
         track.candles.erase(track.candles.begin(),
                             track.candles.begin() +
                                 static_cast<std::ptrdiff_t>(track.candles.size() - 512));
     }
+}
+
+std::size_t AlertManager::structureTrackSize(const std::string &pair,
+                                             const std::string &interval) const {
+    std::string iv = normalizeTimeframe(interval);
+    if (iv.empty()) {
+        iv = interval;
+        std::transform(iv.begin(), iv.end(), iv.begin(), ::tolower);
+    }
+    std::string key = candleIndexKey(util::canonicalPair(pair), iv);
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = structureTracks_.find(key);
+    return it == structureTracks_.end() ? 0 : it->second.candles.size();
 }
 
 std::optional<Alert> AlertManager::getAlert(const std::string &id) const {

@@ -44,7 +44,9 @@ class CandleAlertMonitor {
     void onConnectionReady(bool ready);
     void onSpot(const ctrader::SpotUpdate &update);
     void syncSubscriptions();
+    void flushClosedBars(std::time_t nowSec = 0);
     void pollFallback();
+    void seedFormingBar(int64_t symbolId, int period, const ctrader::TrendbarData &bar);
 
   private:
     struct SubKey {
@@ -62,6 +64,8 @@ class CandleAlertMonitor {
 
     struct BarTrack {
         int64_t openMinutes = 0;
+        int64_t lastEmittedOpenMinutes = 0;
+        int64_t offsetSec = 0;
         ctrader::TrendbarData bar{};
     };
 
@@ -79,12 +83,16 @@ class CandleAlertMonitor {
     std::unordered_set<SubKey, SubKeyHash> requiredSubscriptions() const;
     void enqueueWarm(WarmJob job);
     void pumpWarm();
+    void applyWarmupBars(const SubKey &key, const std::string &canon, const std::string &iv,
+                         const std::vector<ctrader::TrendbarData> &bars);
     void evaluateCandles(const std::vector<Json::Value> &candles);
     void dispatchTriggered(const std::vector<TriggeredAlert> &triggered);
     void processLiveTrendbar(int64_t symbolId, const ctrader::TrendbarData &tb);
+    void processSpotTick(int64_t symbolId, double price, int64_t tickSec);
     std::optional<Json::Value> candleJsonFromBar(const std::string &canon,
-                                                   const std::string &interval,
-                                                   const ctrader::TrendbarData &bar) const;
+                                                 const std::string &interval,
+                                                 const ctrader::TrendbarData &bar,
+                                                 bool requireWallClockClosed = false) const;
 
     const core::Config *cfg_ = nullptr;
     ctrader::CTraderClient *ctrader_ = nullptr;

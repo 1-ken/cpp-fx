@@ -1818,6 +1818,9 @@ void createAlert(const HttpRequestPtr &req,
             if (app.refreshSubscriptions) {
                 app.refreshSubscriptions();
             }
+            if (app.syncCandleSubscriptions) {
+                app.syncCandleSubscriptions();
+            }
             Json::Value v;
             v["success"] = true;
             v["alerts"] = created;

@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "alerts/AlertEventLedger.h"
+#include "alerts/CandleAlertMonitor.h"
 #include "alerts/ChannelDispatch.h"
 #include "alerts/AlertManager.h"
 #include "core/Config.h"
@@ -1823,6 +1824,102 @@ static void testCandle2ClosureAlerts() {
     CHECK(bearAfter3->triggeredAt.has_value());
 }
 
+static void testCandle2ZeroLagMonitor() {
+    core::Config cfg;
+    ctrader::SymbolRegistry reg;
+    reg.update({{1, "EURUSD", true, 1, 2, "EUR/USD"}});
+
+    alerts::AlertManager mgr;
+    int bullFires = 0;
+    int bearFires = 0;
+    mgr.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
+        if (t.alert.id == "c2-zero-bull") ++bullFires;
+        if (t.alert.id == "c2-zero-bear") ++bearFires;
+    });
+
+    // 1. Setup active bull & bear candle2_closure alerts (created at 21:15:00Z)
+    alerts::Alert bullAlert;
+    bullAlert.id = "c2-zero-bull";
+    bullAlert.userId = "user-1";
+    bullAlert.pair = "EURUSD";
+    bullAlert.alertType = "candle2_closure";
+    bullAlert.interval = "15m";
+    bullAlert.structureDirection = "bull";
+    bullAlert.status = "active";
+    bullAlert.createdAt = "2026-06-03T21:15:00Z";
+    mgr.cacheAlert(bullAlert);
+
+    alerts::Alert bearAlert;
+    bearAlert.id = "c2-zero-bear";
+    bearAlert.userId = "user-1";
+    bearAlert.pair = "EURUSD";
+    bearAlert.alertType = "candle2_closure";
+    bearAlert.interval = "15m";
+    bearAlert.structureDirection = "bear";
+    bearAlert.status = "active";
+    bearAlert.createdAt = "2026-06-03T21:15:00Z";
+    mgr.cacheAlert(bearAlert);
+
+    // 2. Verify ingestStructureHistory preserves newer live candles when warmup finishes late
+    mgr.checkCandleAlerts({
+        testCandle("EURUSD", "15m", "2026-06-03T21:00:00+00:00", 1.0950, 1.1000, 1.0900, 1.0920)
+    });
+    CHECK(mgr.structureTrackSize("EURUSD", "15m") == 1);
+
+    mgr.ingestStructureHistory("EURUSD", "15m", {
+        testCandle("EURUSD", "15m", "2026-06-03T20:30:00+00:00", 1.0930, 1.0970, 1.0910, 1.0940),
+        testCandle("EURUSD", "15m", "2026-06-03T20:45:00+00:00", 1.0940, 1.0980, 1.0920, 1.0950),
+    });
+    // Both warmup bars + the newer live 21:00 bar must be preserved in chronological order!
+    CHECK(mgr.structureTrackSize("EURUSD", "15m") == 3);
+
+    alerts::CandleAlertMonitor monitor;
+    monitor.configure(&cfg, nullptr, &reg, &mgr, {});
+    monitor.syncSubscriptions();
+
+    const std::time_t t2115 = *util::parseIso8601("2026-06-03T21:15:00Z");
+    const std::time_t t2130 = *util::parseIso8601("2026-06-03T21:30:00Z");
+    const std::time_t t2145 = *util::parseIso8601("2026-06-03T21:45:00Z");
+
+    auto makeSpot = [](double bid, std::time_t sec) {
+        ctrader::SpotUpdate u;
+        u.symbolId = 1;
+        u.hasBid = true;
+        u.bid = bid;
+        u.timestampMs = static_cast<int64_t>(sec) * 1000;
+        return u;
+    };
+
+    // Feed live spot ticks for 21:15..21:30 bucket (sweeps c1.low = 1.0900 down to 1.0880, closes inside at 1.0935)
+    monitor.onSpot(makeSpot(1.0920, t2115 + 2));
+    monitor.onSpot(makeSpot(1.0880, t2115 + 120));
+    monitor.onSpot(makeSpot(1.0960, t2115 + 400));
+    monitor.onSpot(makeSpot(1.0935, t2115 + 899));
+    CHECK(bullFires == 0);
+
+    // First spot tick of the 21:30 bucket arrives -> immediately synthesizes and evaluates closed 21:15 candle!
+    monitor.onSpot(makeSpot(1.0935, t2130));
+    CHECK(bullFires == 1);
+    CHECK(bearFires == 0);
+
+    // 3. Test 1s boundary timer flush (no-tick protection) for the 21:30..21:45 bucket:
+    // Previous bar (21:15) had range [1.0880, 1.0960].
+    // Feed spot ticks in 21:30 bucket that sweep high (1.0990 > 1.0960) and close inside (1.0930).
+    monitor.onSpot(makeSpot(1.0990, t2130 + 60));
+    monitor.onSpot(makeSpot(1.0900, t2130 + 300));
+    monitor.onSpot(makeSpot(1.0930, t2130 + 890));
+    CHECK(bearFires == 0);
+
+    // At exact 21:45:00 boundary, before any new spot tick arrives, boundary timer flushes closed bars:
+    monitor.flushClosedBars(t2145);
+    CHECK(bearFires == 1);
+
+    // Subsequent late ticks or repeated flush for the same boundary must NOT double-fire:
+    monitor.flushClosedBars(t2145 + 1);
+    monitor.onSpot(makeSpot(1.0932, t2145 + 2));
+    CHECK(bearFires == 1);
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -1864,6 +1961,7 @@ int main() {
     testActiveFvgWatchList();
     testFvgBatchAlerts();
     testCandle2ClosureAlerts();
+    testCandle2ZeroLagMonitor();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

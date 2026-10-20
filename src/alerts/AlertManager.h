@@ -160,6 +160,7 @@ class AlertManager {
 
     void ingestStructureHistory(const std::string &pair, const std::string &interval,
                                 const std::vector<Json::Value> &candles);
+    std::size_t structureTrackSize(const std::string &pair, const std::string &interval) const;
 
     std::optional<Alert> getAlert(const std::string &id) const;
     std::vector<Alert> getAllAlerts() const;

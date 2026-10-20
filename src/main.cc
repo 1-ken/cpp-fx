@@ -143,9 +143,27 @@ int main() {
         if (!ctrader.isReady()) return;
         auto ids = subscriptionPlanner.computeSymbolIds();
         ctrader.refreshSpotSubscriptions(std::move(ids));
+        if (util::isForexMarketOpen()) {
+            candleMonitor.syncSubscriptions();
+        }
     };
     static std::atomic<bool> subscriptionRefreshPending{false};
-    auto refreshSubscriptions = [&]() { subscriptionRefreshPending.store(true); };
+    auto refreshSubscriptions = [&]() {
+        if (!subscriptionRefreshPending.exchange(true)) {
+            workerLoop->queueInLoop([&]() {
+                if (subscriptionRefreshPending.exchange(false)) {
+                    refreshSubscriptionsNow();
+                }
+            });
+        }
+    };
+    auto syncCandleSubscriptions = [&]() {
+        workerLoop->queueInLoop([&]() {
+            if (ctrader.isReady() && util::isForexMarketOpen()) {
+                candleMonitor.syncSubscriptions();
+            }
+        });
+    };
     workerLoop->runEvery(0.5, [&]() {
         if (subscriptionRefreshPending.exchange(false)) refreshSubscriptionsNow();
     });
@@ -281,6 +299,7 @@ int main() {
     app.dbExec = dbExec;
     app.subscriptionPlanner = &subscriptionPlanner;
     app.refreshSubscriptions = refreshSubscriptions;
+    app.syncCandleSubscriptions = syncCandleSubscriptions;
     app.startTime = std::chrono::steady_clock::now();
 
     if (pgPtr) {
@@ -375,6 +394,9 @@ int main() {
         if (cfg.pollFallbackEnabled) {
             workerLoop->runEvery(pollInterval, [&]() { candleMonitor.pollFallback(); });
         }
+        evalLoop->runEvery(1.0, [&]() {
+            candleMonitor.flushClosedBars(std::time(nullptr));
+        });
         workerLoop->runEvery(5.0, [&]() {
             if (ctrader.isReady() && util::isForexMarketOpen())
                 candleMonitor.syncSubscriptions();

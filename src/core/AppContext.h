@@ -58,6 +58,7 @@ struct AppContext {
 
     market::SymbolSubscriptionPlanner *subscriptionPlanner = nullptr;
     std::function<void()> refreshSubscriptions;
+    std::function<void()> syncCandleSubscriptions;
 
     std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
 
