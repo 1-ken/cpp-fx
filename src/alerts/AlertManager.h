@@ -15,6 +15,7 @@
 
 #include "alerts/Alert.h"
 #include "market/StructureEngine.h"
+#include "services/PostgresService.h"
 
 namespace ctraderplus::services {
 class PostgresService;
@@ -175,6 +176,12 @@ class AlertManager {
     std::vector<Alert> getActiveAlertsSortedForUser(const std::string &userId) const;
     bool isAlertOwnedBy(const std::string &id, const std::string &userId) const;
 
+    // Delivery settings & pause / quiet hours gating
+    void setUserDeliverySettings(const std::string &userId,
+                                 const services::UserAlertDeliverySettings &settings);
+    services::UserAlertDeliverySettings getUserDeliverySettings(const std::string &userId) const;
+    bool isUserDeliveryAllowed(const std::string &userId, std::time_t nowUtc = 0) const;
+
     bool deleteAlert(const std::string &id, const std::optional<std::string> &userId);
     std::optional<Alert> updateAlert(const std::string &id, const Json::Value &updates,
                                      const std::optional<std::string> &userId);
@@ -256,9 +263,11 @@ class AlertManager {
     bool finalizeSweepLookbackTrigger(const std::string &alertId, double touchPrice,
                                       const std::string &touchedAtIso);
     void clearSweepLookbackPending(const std::string &alertId);
+    bool isUserDeliveryAllowedLocked(const std::string &userId, std::time_t nowUtc) const;
 
     mutable std::mutex mu_;
     std::unordered_map<std::string, Alert> alerts_;
+    std::unordered_map<std::string, services::UserAlertDeliverySettings> userDeliveryPrefs_;
     std::unordered_map<std::string, std::vector<std::string>> activePriceIndex_;
     std::unordered_map<std::string, std::vector<std::string>> activeCandleIndex_;
     std::unordered_map<std::string, std::vector<std::string>> activeDolIndex_;

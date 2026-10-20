@@ -28,6 +28,17 @@ struct StreamMetricRow {
     std::string streamStatus;
 };
 
+struct UserAlertDeliverySettings {
+    std::string userId;
+    bool alertsPaused = false;
+    std::optional<std::time_t> alertsPausedUntil;
+    bool scheduleEnabled = false;
+    int startMinute = 480;                      // 08:00 (0..1439)
+    int endMinute = 1320;                       // 22:00 (0..1439)
+    std::vector<int> daysOfWeek{1, 2, 3, 4, 5}; // 0=Sun .. 6=Sat
+    int tzOffsetMinutes = 180;                  // UTC+3 default (-840..840)
+};
+
 struct UserStateRow {
     std::string userId;
     std::time_t firstSeenAt = 0;
@@ -37,6 +48,7 @@ struct UserStateRow {
     std::string subscriptionTier = "none";
     std::optional<std::time_t> paywallDismissedAt;
     bool pricingIntroRequired = false;
+    UserAlertDeliverySettings deliverySettings;
 };
 
 struct DailyUsageRow {
@@ -115,6 +127,16 @@ class PostgresService {
     void updateUserPhone(const std::string &userId, const std::string &phone, bool forceUpdate);
     bool isActiveMarketer(const std::string &code);
     bool claimReferral(const std::string &userId, const std::string &marketerCode);
+
+    // Alert delivery preferences
+    UserAlertDeliverySettings getUserDeliverySettings(const std::string &userId);
+    UserAlertDeliverySettings updateUserDeliverySettings(const std::string &userId,
+                                                          const UserAlertDeliverySettings &settings);
+    std::vector<UserAlertDeliverySettings> listAllUserDeliverySettings() const;
+    static Json::Value deliverySettingsToJson(const UserAlertDeliverySettings &s,
+                                              std::time_t nowUtc = 0);
+    static std::string daysOfWeekToString(const std::vector<int> &days);
+    static std::vector<int> parseDaysOfWeek(const std::string &csv);
 
     // Favorites
     std::vector<std::string> listFavorites(const std::string &userId);

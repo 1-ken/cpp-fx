@@ -436,6 +436,7 @@ UserStateRow PostgresService::getOrCreateUserState(const std::string &userId) {
 UserStateRow PostgresService::getUserStateFull(const std::string &userId) {
     UserStateRow row;
     row.userId = userId;
+    row.deliverySettings.userId = userId;
     if (!client_) return row;
     try {
         client_->execSqlSync(
@@ -453,7 +454,15 @@ UserStateRow PostgresService::getUserStateFull(const std::string &userId) {
             "COALESCE(subscription_tier, 'none') AS subscription_tier, "
             "COALESCE(pricing_intro_required, FALSE) AS pricing_intro_required, "
             "EXTRACT(EPOCH FROM paywall_dismissed_at)::bigint AS pd, "
-            "paywall_dismissed_at IS NULL AS pd_null "
+            "paywall_dismissed_at IS NULL AS pd_null, "
+            "COALESCE(alerts_paused, FALSE) AS alerts_paused, "
+            "EXTRACT(EPOCH FROM alerts_paused_until)::bigint AS apu, "
+            "alerts_paused_until IS NULL AS apu_null, "
+            "COALESCE(delivery_schedule_enabled, FALSE) AS delivery_schedule_enabled, "
+            "COALESCE(delivery_start_minute, 480) AS delivery_start_minute, "
+            "COALESCE(delivery_end_minute, 1320) AS delivery_end_minute, "
+            "COALESCE(delivery_days, '1,2,3,4,5') AS delivery_days, "
+            "COALESCE(delivery_tz_offset_min, 180) AS delivery_tz_offset_min "
             "FROM user_states WHERE user_id=$1",
             userId);
         if (r.size() > 0) {
@@ -470,6 +479,17 @@ UserStateRow PostgresService::getUserStateFull(const std::string &userId) {
             row.pricingIntroRequired = rr["pricing_intro_required"].as<bool>();
             if (!rr["pd_null"].as<bool>())
                 row.paywallDismissedAt = static_cast<std::time_t>(rr["pd"].as<long long>());
+
+            row.deliverySettings.alertsPaused = rr["alerts_paused"].as<bool>();
+            if (!rr["apu_null"].as<bool>()) {
+                row.deliverySettings.alertsPausedUntil =
+                    static_cast<std::time_t>(rr["apu"].as<long long>());
+            }
+            row.deliverySettings.scheduleEnabled = rr["delivery_schedule_enabled"].as<bool>();
+            row.deliverySettings.startMinute = rr["delivery_start_minute"].as<int>();
+            row.deliverySettings.endMinute = rr["delivery_end_minute"].as<int>();
+            row.deliverySettings.daysOfWeek = parseDaysOfWeek(rr["delivery_days"].as<std::string>());
+            row.deliverySettings.tzOffsetMinutes = rr["delivery_tz_offset_min"].as<int>();
         }
     } catch (const std::exception &e) {
         LOG_ERROR << "getUserStateFull failed: " << e.what();
@@ -765,6 +785,171 @@ bool PostgresService::claimReferral(const std::string &userId, const std::string
         LOG_ERROR << "claimReferral failed: " << e.what();
         return false;
     }
+}
+
+std::string PostgresService::daysOfWeekToString(const std::vector<int> &days) {
+    if (days.empty()) return "";
+    std::string out;
+    for (size_t i = 0; i < days.size(); ++i) {
+        if (i > 0) out += ",";
+        out += std::to_string(days[i]);
+    }
+    return out;
+}
+
+std::vector<int> PostgresService::parseDaysOfWeek(const std::string &csv) {
+    std::vector<int> out;
+    if (csv.empty()) return out;
+    size_t start = 0;
+    while (start < csv.size()) {
+        size_t comma = csv.find(',', start);
+        std::string token =
+            csv.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        while (!token.empty() && std::isspace(token.front())) token.erase(token.begin());
+        while (!token.empty() && std::isspace(token.back())) token.pop_back();
+        if (!token.empty()) {
+            try {
+                int d = std::stoi(token);
+                if (d >= 0 && d <= 6) {
+                    if (std::find(out.begin(), out.end(), d) == out.end()) {
+                        out.push_back(d);
+                    }
+                }
+            } catch (...) {
+            }
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+Json::Value PostgresService::deliverySettingsToJson(const UserAlertDeliverySettings &s,
+                                                    std::time_t nowUtc) {
+    if (nowUtc == 0) nowUtc = std::time(nullptr);
+    Json::Value v(Json::objectValue);
+    v["userId"] = s.userId;
+    bool effectivelyPaused = s.alertsPaused;
+    if (s.alertsPaused && s.alertsPausedUntil.has_value()) {
+        if (nowUtc >= *s.alertsPausedUntil) {
+            effectivelyPaused = false;
+        }
+    }
+    v["alertsPaused"] = s.alertsPaused;
+    v["effectivelyPaused"] = effectivelyPaused;
+    if (s.alertsPausedUntil.has_value()) {
+        v["alertsPausedUntil"] = util::toIso8601(*s.alertsPausedUntil);
+        v["alertsPausedUntilEpoch"] = static_cast<Json::Int64>(*s.alertsPausedUntil);
+    } else {
+        v["alertsPausedUntil"] = Json::nullValue;
+        v["alertsPausedUntilEpoch"] = Json::nullValue;
+    }
+    v["scheduleEnabled"] = s.scheduleEnabled;
+    v["startMinute"] = s.startMinute;
+    v["endMinute"] = s.endMinute;
+
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", s.startMinute / 60, s.startMinute % 60);
+    v["startTime"] = std::string(buf);
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", s.endMinute / 60, s.endMinute % 60);
+    v["endTime"] = std::string(buf);
+
+    Json::Value daysArr(Json::arrayValue);
+    for (int d : s.daysOfWeek) {
+        daysArr.append(d);
+    }
+    v["daysOfWeek"] = daysArr;
+    v["tzOffsetMinutes"] = s.tzOffsetMinutes;
+
+    return v;
+}
+
+UserAlertDeliverySettings PostgresService::getUserDeliverySettings(const std::string &userId) {
+    return getUserStateFull(userId).deliverySettings;
+}
+
+UserAlertDeliverySettings PostgresService::updateUserDeliverySettings(
+    const std::string &userId, const UserAlertDeliverySettings &s) {
+    if (!client_) return s;
+    std::string daysCsv = daysOfWeekToString(s.daysOfWeek);
+    int startMin = std::clamp(s.startMinute, 0, 1439);
+    int endMin = std::clamp(s.endMinute, 0, 1439);
+    int tzOffset = std::clamp(s.tzOffsetMinutes, -840, 840);
+    try {
+        if (s.alertsPausedUntil.has_value()) {
+            client_->execSqlSync(
+                "INSERT INTO user_states(user_id, alerts_paused, alerts_paused_until, "
+                "delivery_schedule_enabled, delivery_start_minute, delivery_end_minute, "
+                "delivery_days, delivery_tz_offset_min) "
+                "VALUES($1, $2, TO_TIMESTAMP($3), $4, $5, $6, $7, $8) "
+                "ON CONFLICT (user_id) DO UPDATE SET "
+                "alerts_paused = EXCLUDED.alerts_paused, "
+                "alerts_paused_until = EXCLUDED.alerts_paused_until, "
+                "delivery_schedule_enabled = EXCLUDED.delivery_schedule_enabled, "
+                "delivery_start_minute = EXCLUDED.delivery_start_minute, "
+                "delivery_end_minute = EXCLUDED.delivery_end_minute, "
+                "delivery_days = EXCLUDED.delivery_days, "
+                "delivery_tz_offset_min = EXCLUDED.delivery_tz_offset_min",
+                userId, s.alertsPaused, static_cast<long long>(*s.alertsPausedUntil),
+                s.scheduleEnabled, startMin, endMin, daysCsv, tzOffset);
+        } else {
+            client_->execSqlSync(
+                "INSERT INTO user_states(user_id, alerts_paused, alerts_paused_until, "
+                "delivery_schedule_enabled, delivery_start_minute, delivery_end_minute, "
+                "delivery_days, delivery_tz_offset_min) "
+                "VALUES($1, $2, NULL, $3, $4, $5, $6, $7) "
+                "ON CONFLICT (user_id) DO UPDATE SET "
+                "alerts_paused = EXCLUDED.alerts_paused, "
+                "alerts_paused_until = NULL, "
+                "delivery_schedule_enabled = EXCLUDED.delivery_schedule_enabled, "
+                "delivery_start_minute = EXCLUDED.delivery_start_minute, "
+                "delivery_end_minute = EXCLUDED.delivery_end_minute, "
+                "delivery_days = EXCLUDED.delivery_days, "
+                "delivery_tz_offset_min = EXCLUDED.delivery_tz_offset_min",
+                userId, s.alertsPaused,
+                s.scheduleEnabled, startMin, endMin, daysCsv, tzOffset);
+        }
+    } catch (const std::exception &e) {
+        LOG_ERROR << "updateUserDeliverySettings failed: " << e.what();
+        throw;
+    }
+    return getUserDeliverySettings(userId);
+}
+
+std::vector<UserAlertDeliverySettings> PostgresService::listAllUserDeliverySettings() const {
+    std::vector<UserAlertDeliverySettings> list;
+    if (!client_) return list;
+    try {
+        auto r = client_->execSqlSync(
+            "SELECT user_id, "
+            "COALESCE(alerts_paused, FALSE) AS alerts_paused, "
+            "EXTRACT(EPOCH FROM alerts_paused_until)::bigint AS apu, "
+            "alerts_paused_until IS NULL AS apu_null, "
+            "COALESCE(delivery_schedule_enabled, FALSE) AS delivery_schedule_enabled, "
+            "COALESCE(delivery_start_minute, 480) AS delivery_start_minute, "
+            "COALESCE(delivery_end_minute, 1320) AS delivery_end_minute, "
+            "COALESCE(delivery_days, '1,2,3,4,5') AS delivery_days, "
+            "COALESCE(delivery_tz_offset_min, 180) AS delivery_tz_offset_min "
+            "FROM user_states");
+        for (const auto &rr : r) {
+            UserAlertDeliverySettings s;
+            s.userId = rr["user_id"].as<std::string>();
+            s.alertsPaused = rr["alerts_paused"].as<bool>();
+            if (!rr["apu_null"].as<bool>()) {
+                s.alertsPausedUntil = static_cast<std::time_t>(rr["apu"].as<long long>());
+            }
+            s.scheduleEnabled = rr["delivery_schedule_enabled"].as<bool>();
+            s.startMinute = rr["delivery_start_minute"].as<int>();
+            s.endMinute = rr["delivery_end_minute"].as<int>();
+            s.daysOfWeek = parseDaysOfWeek(rr["delivery_days"].as<std::string>());
+            s.tzOffsetMinutes = rr["delivery_tz_offset_min"].as<int>();
+            list.push_back(std::move(s));
+        }
+    } catch (const std::exception &e) {
+        LOG_ERROR << "listAllUserDeliverySettings failed: " << e.what();
+    }
+    return list;
 }
 
 std::vector<std::string> PostgresService::listFavorites(const std::string &userId) {

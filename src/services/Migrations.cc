@@ -13,7 +13,7 @@ namespace ctraderplus::services {
 
 namespace {
 
-constexpr int kSchemaReconcileVersion = 9;
+constexpr int kSchemaReconcileVersion = 10;
 
 bool columnExists(const DbClientPtr &client, const std::string &table,
                   const std::string &column) {
@@ -274,6 +274,20 @@ void reconcileApplicationSchema(const DbClientPtr &client) {
     client->execSqlSync(
         "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS pricing_intro_required "
         "BOOLEAN NOT NULL DEFAULT FALSE");
+    client->execSqlSync(
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS alerts_paused BOOLEAN NOT NULL DEFAULT FALSE");
+    client->execSqlSync(
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS alerts_paused_until TIMESTAMPTZ");
+    client->execSqlSync(
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS delivery_schedule_enabled BOOLEAN NOT NULL DEFAULT FALSE");
+    client->execSqlSync(
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS delivery_start_minute INT NOT NULL DEFAULT 480");
+    client->execSqlSync(
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS delivery_end_minute INT NOT NULL DEFAULT 1320");
+    client->execSqlSync(
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS delivery_days VARCHAR(32) NOT NULL DEFAULT '1,2,3,4,5'");
+    client->execSqlSync(
+        "ALTER TABLE user_states ADD COLUMN IF NOT EXISTS delivery_tz_offset_min INT NOT NULL DEFAULT 180");
 
     client->execSqlSync(
         "CREATE TABLE IF NOT EXISTS user_daily_usage ("
@@ -375,6 +389,13 @@ void validateApplicationSchema(const DbClientPtr &client) {
     if (!columnExists(client, "user_states", "pricing_intro_required")) {
         throw std::runtime_error(
             "Schema validation failed: user_states.pricing_intro_required missing");
+    }
+    if (!columnExists(client, "user_states", "alerts_paused")) {
+        throw std::runtime_error("Schema validation failed: user_states.alerts_paused missing");
+    }
+    if (!columnExists(client, "user_states", "delivery_schedule_enabled")) {
+        throw std::runtime_error(
+            "Schema validation failed: user_states.delivery_schedule_enabled missing");
     }
     if (!tableExists(client, "user_feedback")) {
         throw std::runtime_error("Schema validation failed: user_feedback table missing");

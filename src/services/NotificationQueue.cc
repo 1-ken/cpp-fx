@@ -1,4 +1,5 @@
 #include "services/NotificationQueue.h"
+#include "alerts/AlertManager.h"
 #include "alerts/ChannelDispatch.h"
 
 #include <algorithm>
@@ -427,6 +428,12 @@ void NotificationQueue::ackIdem(const std::string &idem) {
 
 void NotificationQueue::enqueue(alerts::TriggeredAlert triggered) {
     if (!loop_ || !notifier_) return;
+    auto &app = core::AppContext::instance();
+    if (app.alerts && !app.alerts->isUserDeliveryAllowed(triggered.alert.userId)) {
+        LOG_INFO << "[NotificationQueue] skipping delivery for user " << triggered.alert.userId
+                 << " (alerts paused or outside delivery schedule)";
+        return;
+    }
     const std::string idem = idempotencyKey(triggered.alert);
     Job job;
     std::string callNote;

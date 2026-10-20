@@ -179,13 +179,19 @@ void AlertManager::loadAlerts() {
     if (!postgres_) {
         std::lock_guard<std::mutex> lk(mu_);
         alerts_.clear();
+        userDeliveryPrefs_.clear();
         rebuildIndexes();
         LOG_WARN << "AlertManager started without PostgreSQL; alert cache cleared";
         return;
     }
     auto rows = postgres_->listAlerts();
+    auto deliveryPrefs = postgres_->listAllUserDeliverySettings();
     std::lock_guard<std::mutex> lk(mu_);
     alerts_.clear();
+    userDeliveryPrefs_.clear();
+    for (auto &p : deliveryPrefs) {
+        userDeliveryPrefs_[p.userId] = std::move(p);
+    }
     for (auto &row : rows) {
         Alert a = Alert::fromJson(row);
         std::string canon = util::canonicalPair(a.pair);
@@ -232,6 +238,92 @@ void AlertManager::cacheAlert(Alert alert) {
     std::lock_guard<std::mutex> lk(mu_);
     alerts_[alert.id] = std::move(alert);
     rebuildIndexes();
+}
+
+void AlertManager::setUserDeliverySettings(const std::string &userId,
+                                          const services::UserAlertDeliverySettings &settings) {
+    if (userId.empty()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    userDeliveryPrefs_[userId] = settings;
+    ++userAlertsRevision_[userId];
+}
+
+services::UserAlertDeliverySettings AlertManager::getUserDeliverySettings(
+    const std::string &userId) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = userDeliveryPrefs_.find(userId);
+    if (it != userDeliveryPrefs_.end()) return it->second;
+    services::UserAlertDeliverySettings def;
+    def.userId = userId;
+    return def;
+}
+
+bool AlertManager::isUserDeliveryAllowed(const std::string &userId, std::time_t nowUtc) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return isUserDeliveryAllowedLocked(userId, nowUtc);
+}
+
+bool AlertManager::isUserDeliveryAllowedLocked(const std::string &userId, std::time_t nowUtc) const {
+    if (userId.empty()) return true;
+    if (nowUtc == 0) nowUtc = std::time(nullptr);
+
+    auto it = userDeliveryPrefs_.find(userId);
+    if (it == userDeliveryPrefs_.end()) return true;
+
+    const auto &p = it->second;
+
+    // 1. Pause check
+    if (p.alertsPaused) {
+        if (!p.alertsPausedUntil.has_value()) {
+            return false; // Paused indefinitely ("Until I resume")
+        }
+        if (nowUtc < *p.alertsPausedUntil) {
+            return false; // Paused until specified time
+        }
+        // Timed pause has expired, fall through to schedule check
+    }
+
+    // 2. Schedule check
+    if (p.scheduleEnabled) {
+        std::time_t localEpoch = nowUtc + static_cast<std::time_t>(p.tzOffsetMinutes) * 60;
+        std::tm localTm;
+#if defined(_WIN32)
+        gmtime_s(&localTm, &localEpoch);
+#else
+        gmtime_r(&localEpoch, &localTm);
+#endif
+        int dayOfWeek = localTm.tm_wday; // 0=Sunday .. 6=Saturday
+        int minuteOfDay = localTm.tm_hour * 60 + localTm.tm_min;
+
+        if (!p.daysOfWeek.empty()) {
+            bool dayAllowed = false;
+            for (int d : p.daysOfWeek) {
+                if (d == dayOfWeek) {
+                    dayAllowed = true;
+                    break;
+                }
+            }
+            if (!dayAllowed) return false;
+        }
+
+        int startMin = p.startMinute;
+        int endMin = p.endMinute;
+        if (startMin == endMin) {
+            return true;
+        } else if (startMin < endMin) {
+            // e.g. 08:00 (480) to 22:00 (1320)
+            if (minuteOfDay < startMin || minuteOfDay >= endMin) {
+                return false;
+            }
+        } else {
+            // overnight window, e.g. 22:00 (1320) to 06:00 (360)
+            if (minuteOfDay < startMin && minuteOfDay >= endMin) {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 namespace {
@@ -1568,6 +1660,9 @@ std::optional<TriggeredAlert> AlertManager::tryTriggerPriceAlert(const std::stri
             } else if (!met) {
                 return std::nullopt;
             } else {
+                if (!isUserDeliveryAllowedLocked(a.userId, std::time(nullptr))) {
+                    return std::nullopt;
+                }
                 previous = a;
                 triggerAlert(a, currentPrice);
                 TriggeredAlert t;
@@ -1647,6 +1742,7 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                     continue;
                 }
                 if (!met) continue;
+                if (!isUserDeliveryAllowedLocked(a.userId, std::time(nullptr))) continue;
                 Alert before = a;
                 triggerAlert(a, current);
                 TriggeredAlert t;
@@ -1694,6 +1790,7 @@ std::vector<TriggeredAlert> AlertManager::checkPriceAlerts(
                         continue;
                     }
                     if (!met) continue;
+                    if (!isUserDeliveryAllowedLocked(a.userId, std::time(nullptr))) continue;
                     Alert before = a;
                     triggerAlert(a, current);
                     TriggeredAlert t;
@@ -2259,6 +2356,7 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
     std::vector<PersistBatch> toPersist;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        const std::time_t nowUtc = std::time(nullptr);
         for (const auto &entry : lookup) {
             const Key &k = entry.first;
             const Json::Value &candle = entry.second;
@@ -2328,6 +2426,12 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                 }
             }
             if (should) {
+                if (!isUserDeliveryAllowedLocked(a.userId, nowUtc)) {
+                    Alert before = a;
+                    a.lastEvaluatedCandleTime = candleTsStr;
+                    toPersist.push_back({before, a, false});
+                    continue;
+                }
                 Alert before = a;
                 a.status = "triggered";
                 a.triggeredAt = util::nowIso8601();
@@ -2384,6 +2488,13 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                             evalCandle2ClosureLocked(a, k.interval, candle, candleTsStr, track);
                         if (step == SessionStepResult::Unchanged) continue;
                         if (step == SessionStepResult::Triggered) {
+                            if (!isUserDeliveryAllowedLocked(a.userId, nowUtc)) {
+                                a.triggeredAt = before.triggeredAt;
+                                a.pendingDir = before.pendingDir;
+                                a.pendingSweepLevel = before.pendingSweepLevel;
+                                toPersist.push_back({before, a, false, true});
+                                continue;
+                            }
                             TriggeredAlert t;
                             t.alert = a;
                             t.currentPrice = candle.get("close", 0.0).asDouble();
@@ -2414,6 +2525,13 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                             evalSweepConfirmLocked(a, candle, candleTsStr, track);
                         if (step == SessionStepResult::Unchanged) continue;
                         if (step == SessionStepResult::Triggered) {
+                            if (!isUserDeliveryAllowedLocked(a.userId, nowUtc)) {
+                                a.triggeredAt = before.triggeredAt;
+                                a.pendingDir = before.pendingDir;
+                                a.pendingSweepLevel = before.pendingSweepLevel;
+                                toPersist.push_back({before, a, false, true});
+                                continue;
+                            }
                             TriggeredAlert t;
                             t.alert = a;
                             t.currentPrice = candle.get("close", 0.0).asDouble();
@@ -2442,6 +2560,13 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                         const auto step = evalHourSweepCisdLocked(a, candle, candleTsStr, track);
                         if (step == SessionStepResult::Unchanged) continue;
                         if (step == SessionStepResult::Triggered) {
+                            if (!isUserDeliveryAllowedLocked(a.userId, nowUtc)) {
+                                a.triggeredAt = before.triggeredAt;
+                                a.pendingDir = before.pendingDir;
+                                a.pendingSweepLevel = before.pendingSweepLevel;
+                                toPersist.push_back({before, a, false, true});
+                                continue;
+                            }
                             TriggeredAlert t;
                             t.alert = a;
                             t.currentPrice = candle.get("close", 0.0).asDouble();
@@ -2471,6 +2596,13 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                         if (step == SessionStepResult::Unchanged) continue;
                         const double close = candle.get("close", 0.0).asDouble();
                         if (step == SessionStepResult::Triggered) {
+                            if (!isUserDeliveryAllowedLocked(a.userId, nowUtc)) {
+                                a.triggeredAt = before.triggeredAt;
+                                a.pendingDir = before.pendingDir;
+                                a.pendingSweepLevel = before.pendingSweepLevel;
+                                toPersist.push_back({before, a, false, true});
+                                continue;
+                            }
                             TriggeredAlert t;
                             t.alert = a;
                             t.currentPrice = close;
@@ -2530,6 +2662,12 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                         break;
                     }
                     if (!should) {
+                        Alert before = a;
+                        a.lastEvaluatedCandleTime = candleTsStr;
+                        toPersist.push_back({before, a, false});
+                        continue;
+                    }
+                    if (!isUserDeliveryAllowedLocked(a.userId, nowUtc)) {
                         Alert before = a;
                         a.lastEvaluatedCandleTime = candleTsStr;
                         toPersist.push_back({before, a, false});
@@ -2651,6 +2789,7 @@ void AlertManager::checkFvgAlerts(const fvg::FVGZone &zone) {
                               (dir == "bull" && zone.is_bullish) ||
                               (dir == "bear" && !zone.is_bullish);
             if (!dirMatches) continue;
+            if (!isUserDeliveryAllowedLocked(a.userId, std::time(nullptr))) continue;
 
             Alert before = a;
             a.status = "triggered";
@@ -2981,6 +3120,9 @@ bool AlertManager::finalizeSweepLookbackTrigger(const std::string &alertId, doub
             rebuildIndexes();
             result = std::nullopt;
         } else {
+            if (!isUserDeliveryAllowedLocked(a.userId, std::time(nullptr))) {
+                return false;
+            }
             previous = a;
             triggerAlert(a, touchPrice, touchedAtIso);
             TriggeredAlert t;

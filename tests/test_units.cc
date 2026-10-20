@@ -1920,6 +1920,172 @@ static void testCandle2ZeroLagMonitor() {
     CHECK(bearFires == 1);
 }
 
+static void testUserAlertDeliveryPauseAndSchedule() {
+    alerts::AlertManager mgr;
+    std::vector<alerts::TriggeredAlert> fired;
+    mgr.setTriggerHandler([&](const alerts::TriggeredAlert &t) {
+        fired.push_back(t);
+    });
+
+    const std::string uid = "usr-delivery-test";
+
+    // 1. Create a price alert for user
+    alerts::Alert pa;
+    pa.id = "p-pause-test";
+    pa.userId = uid;
+    pa.pair = "EURUSD";
+    pa.alertType = "price";
+    pa.status = "active";
+    pa.condition = "above";
+    pa.targetPrice = 1.1000;
+    mgr.cacheAlert(pa);
+
+    // Initial state: delivery allowed -> price hits 1.1050 -> fires
+    market::FlatPair p1;
+    p1.pair = "EURUSD";
+    p1.hasPrice = true;
+    p1.price = 1.1050;
+    auto res = mgr.checkPriceAlerts({p1});
+    CHECK(res.size() == 1);
+    CHECK(res[0].alert.id == "p-pause-test");
+
+    // Re-arm price alert
+    pa.status = "active";
+    mgr.cacheAlert(pa);
+
+    // 2. Pause alerts indefinitely
+    services::UserAlertDeliverySettings s1;
+    s1.userId = uid;
+    s1.alertsPaused = true;
+    s1.alertsPausedUntil = std::nullopt;
+    mgr.setUserDeliverySettings(uid, s1);
+
+    CHECK(!mgr.isUserDeliveryAllowed(uid, std::time(nullptr)));
+
+    res = mgr.checkPriceAlerts({p1});
+    CHECK(res.empty());
+    auto aCheck = mgr.getAlert("p-pause-test");
+    CHECK(aCheck.has_value() && aCheck->status == "active"); // Kept armed!
+
+    // 3. Timed pause: paused until T = 2000
+    services::UserAlertDeliverySettings s2;
+    s2.userId = uid;
+    s2.alertsPaused = true;
+    s2.alertsPausedUntil = 2000;
+    mgr.setUserDeliverySettings(uid, s2);
+
+    CHECK(!mgr.isUserDeliveryAllowed(uid, 1500)); // before 2000 -> not allowed
+    CHECK(mgr.isUserDeliveryAllowed(uid, 2000));  // at 2000 -> allowed
+    CHECK(mgr.isUserDeliveryAllowed(uid, 2500));  // after 2000 -> allowed
+
+    // 4. Delivery schedule: Monday-Friday (1,2,3,4,5), 08:00 (480) to 22:00 (1320), UTC+3 (180 mins)
+    services::UserAlertDeliverySettings s3;
+    s3.userId = uid;
+    s3.alertsPaused = false;
+    s3.scheduleEnabled = true;
+    s3.startMinute = 480;  // 08:00
+    s3.endMinute = 1320;   // 22:00
+    s3.daysOfWeek = {1, 2, 3, 4, 5};
+    s3.tzOffsetMinutes = 180; // UTC+3
+    mgr.setUserDeliverySettings(uid, s3);
+
+    // Wednesday (2026-06-03)
+    // 08:00 UTC+3 is 05:00 UTC. 2026-06-03 05:00:00 UTC = 1780462800 epoch.
+    std::time_t wed0800LocalInUtc = 1780462800; // local 08:00 -> allowed
+    CHECK(mgr.isUserDeliveryAllowed(uid, wed0800LocalInUtc));
+
+    // Local 12:00 (minute 720, Wednesday) -> allowed
+    std::time_t wed1200LocalInUtc = wed0800LocalInUtc + 4 * 3600;
+    CHECK(mgr.isUserDeliveryAllowed(uid, wed1200LocalInUtc));
+
+    // Local 07:59 (minute 479, Wednesday) -> outside window (starts at 08:00) -> not allowed
+    std::time_t wed0759LocalInUtc = wed0800LocalInUtc - 60;
+    CHECK(!mgr.isUserDeliveryAllowed(uid, wed0759LocalInUtc));
+
+    // Local 22:01 (minute 1321, Wednesday) -> outside window (ends at 22:00) -> not allowed
+    std::time_t wed2201LocalInUtc = wed0800LocalInUtc + 14 * 3600 + 60;
+    CHECK(!mgr.isUserDeliveryAllowed(uid, wed2201LocalInUtc));
+
+    // Sunday (2026-06-07) at 12:00 local -> Sunday is day 0, not in {1,2,3,4,5} -> not allowed
+    std::time_t sun1200LocalInUtc = wed1200LocalInUtc + 4 * 86400;
+    CHECK(!mgr.isUserDeliveryAllowed(uid, sun1200LocalInUtc));
+
+    // Overnight window check: 22:00 (1320) to 06:00 (360)
+    services::UserAlertDeliverySettings s4;
+    s4.userId = uid;
+    s4.alertsPaused = false;
+    s4.scheduleEnabled = true;
+    s4.startMinute = 1320; // 22:00
+    s4.endMinute = 360;    // 06:00
+    s4.daysOfWeek = {1, 2, 3, 4, 5};
+    s4.tzOffsetMinutes = 0; // UTC
+    mgr.setUserDeliverySettings(uid, s4);
+
+    // Wednesday 23:30 (minute 1410) -> allowed
+    std::tm tWedNight{};
+    tWedNight.tm_year = 2026 - 1900;
+    tWedNight.tm_mon = 5; // June
+    tWedNight.tm_mday = 3; // Wednesday
+    tWedNight.tm_hour = 23;
+    tWedNight.tm_min = 30;
+    std::time_t wedNightUtc = timegm(&tWedNight);
+    CHECK(mgr.isUserDeliveryAllowed(uid, wedNightUtc));
+
+    // Wednesday 12:00 (minute 720) -> not allowed (outside overnight window)
+    tWedNight.tm_hour = 12;
+    tWedNight.tm_min = 0;
+    std::time_t wedNoonUtc = timegm(&tWedNight);
+    CHECK(!mgr.isUserDeliveryAllowed(uid, wedNoonUtc));
+
+    // 5. Candle alert gating: candle2_closure alert under paused settings
+    alerts::Alert c2;
+    c2.id = "c2-paused-user";
+    c2.userId = uid;
+    c2.pair = "EURUSD";
+    c2.alertType = "candle2_closure";
+    c2.interval = "15m";
+    c2.status = "active";
+    c2.createdAt = "2026-06-03T21:00:00Z";
+    mgr.cacheAlert(c2);
+
+    // Pause user
+    services::UserAlertDeliverySettings sPause;
+    sPause.userId = uid;
+    sPause.alertsPaused = true;
+    mgr.setUserDeliverySettings(uid, sPause);
+
+    // Seed c1
+    std::vector<Json::Value> c1 = {
+        testCandle("EURUSD", "15m", "2026-06-03T21:15:00", 1.0950, 1.1000, 1.0900, 1.0960)
+    };
+    mgr.checkCandleAlerts(c1);
+
+    // Feed c2 (bullish reversal) while paused
+    std::vector<Json::Value> c2Candle = {
+        testCandle("EURUSD", "15m", "2026-06-03T21:30:00", 1.0940, 1.0960, 1.0880, 1.0920)
+    };
+    mgr.checkCandleAlerts(c2Candle);
+
+    auto c2After = mgr.getAlert("c2-paused-user");
+    CHECK(c2After.has_value());
+    CHECK(c2After->status == "active");
+    CHECK(!c2After->triggeredAt.has_value()); // Did NOT fire!
+
+    // Resume user
+    sPause.alertsPaused = false;
+    mgr.setUserDeliverySettings(uid, sPause);
+
+    // Feed c3 (bearish reversal against c2) now that user is active
+    std::vector<Json::Value> c3Candle = {
+        testCandle("EURUSD", "15m", "2026-06-03T21:45:00", 1.0930, 1.0990, 1.0900, 1.0930)
+    };
+    mgr.checkCandleAlerts(c3Candle);
+
+    auto c2AfterResume = mgr.getAlert("c2-paused-user");
+    CHECK(c2AfterResume.has_value());
+    CHECK(c2AfterResume->triggeredAt.has_value()); // Fired on resumption!
+}
+
 int main() {
     testPairNormalizer();
     testIntervals();
@@ -1962,6 +2128,7 @@ int main() {
     testFvgBatchAlerts();
     testCandle2ClosureAlerts();
     testCandle2ZeroLagMonitor();
+    testUserAlertDeliveryPauseAndSchedule();
     if (g_failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

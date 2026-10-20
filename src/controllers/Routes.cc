@@ -481,7 +481,9 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
     }
 
     auto buildBootstrap = [&app, uid](bool firstTime, std::optional<std::time_t> completedAt,
-                                      const std::optional<std::string> &phone) {
+                                      const std::optional<std::string> &phone,
+                                      const std::optional<services::UserAlertDeliverySettings> &deliverySettings =
+                                          std::nullopt) {
         Json::Value v;
         v["userId"] = uid;
         v["isFirstTimeUser"] = firstTime;
@@ -495,12 +497,20 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
         } else {
             v["phone"] = Json::Value::null;
         }
+        if (deliverySettings) {
+            v["alertDelivery"] =
+                services::PostgresService::deliverySettingsToJson(*deliverySettings);
+        } else {
+            services::UserAlertDeliverySettings def;
+            def.userId = uid;
+            v["alertDelivery"] = services::PostgresService::deliverySettingsToJson(def);
+        }
         appendSubscriptionToBootstrap(v, app.postgres, uid);
         return v;
     };
 
     if (!app.postgres || !app.postgres->available()) {
-        cb(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt)));
+        cb(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt, std::nullopt)));
         return;
     }
 
@@ -527,7 +537,7 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
     auto task = [&app, uid, buildBootstrap, finish]() {
         try {
             if (!app.postgres || !app.postgres->available()) {
-                finish(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt)));
+                finish(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt, std::nullopt)));
                 return;
             }
             auto st = app.postgres->getOrCreateUserState(uid);
@@ -535,10 +545,10 @@ void me(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> 
             auto phone = app.postgres->getUserPhone(uid);
             core::logApiOutcome("user", "me", true, 200,
                                 firstTime ? "first_time" : "returning", uid);
-            finish(jsonResp(buildBootstrap(firstTime, st.onboardingCompletedAt, phone)));
+            finish(jsonResp(buildBootstrap(firstTime, st.onboardingCompletedAt, phone, st.deliverySettings)));
         } catch (const std::exception &e) {
             core::logApiOutcome("user", "me", false, 500, e.what(), uid);
-            finish(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt)));
+            finish(jsonResp(buildBootstrap(true, std::nullopt, std::nullopt, std::nullopt)));
         }
     };
 
@@ -630,6 +640,184 @@ void updateUserPhone(const HttpRequestPtr &req,
                 } catch (const std::exception &e) {
                     core::logApiOutcome("user", "update_phone", false, 500, e.what(), uid);
                     (*cbPtr)(errResp("detail", "Failed to save phone", 500));
+                }
+            })) {
+            (*cbPtr)(errResp("detail", "Database not ready", 503));
+        }
+    });
+}
+
+void getUserAlertDelivery(const HttpRequestPtr &req,
+                          std::function<void(const HttpResponsePtr &)> &&cb) {
+    auto &app = AppContext::instance();
+    std::string uid;
+    if (!authOrReject(req, cb, uid)) return;
+    if (!core::isDbReadyForAuth()) {
+        cb(errResp("detail", "Database not ready", 503));
+        return;
+    }
+
+    auto cbPtr = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    core::runOnDbWorker([cbPtr, uid, &app]() {
+        if (!core::withPostgres([&](services::PostgresService &pg) {
+                try {
+                    auto settings = pg.getUserDeliverySettings(uid);
+                    if (app.alerts) {
+                        app.alerts->setUserDeliverySettings(uid, settings);
+                    }
+                    Json::Value v;
+                    v["success"] = true;
+                    v["alertDelivery"] =
+                        services::PostgresService::deliverySettingsToJson(settings);
+                    (*cbPtr)(jsonResp(v));
+                } catch (const std::exception &e) {
+                    LOG_ERROR << "getUserAlertDelivery failed: " << e.what();
+                    (*cbPtr)(errResp("detail", "Failed to retrieve alert delivery settings", 500));
+                }
+            })) {
+            (*cbPtr)(errResp("detail", "Database not ready", 503));
+        }
+    });
+}
+
+void updateUserAlertDelivery(const HttpRequestPtr &req,
+                             std::function<void(const HttpResponsePtr &)> &&cb) {
+    auto &app = AppContext::instance();
+    std::string uid;
+    if (!authOrReject(req, cb, uid)) return;
+    if (!core::isDbReadyForAuth()) {
+        cb(errResp("detail", "Database not ready", 503));
+        return;
+    }
+
+    auto body = req->getJsonObject();
+    if (!body) {
+        cb(errResp("detail", "JSON body required", 400));
+        return;
+    }
+
+    auto cbPtr = std::make_shared<std::function<void(const HttpResponsePtr &)>>(std::move(cb));
+    core::runOnDbWorker([cbPtr, uid, body, &app]() {
+        if (!core::withPostgres([&](services::PostgresService &pg) {
+                try {
+                    auto cur = pg.getUserDeliverySettings(uid);
+                    const std::time_t nowUtc = std::time(nullptr);
+
+                    // 1. Paused
+                    if (body->isMember("alertsPaused") && (*body)["alertsPaused"].isBool()) {
+                        cur.alertsPaused = (*body)["alertsPaused"].asBool();
+                    } else if (body->isMember("paused") && (*body)["paused"].isBool()) {
+                        cur.alertsPaused = (*body)["paused"].asBool();
+                    }
+
+                    // 2. Pause duration or paused until
+                    if (body->isMember("pauseDurationMinutes") &&
+                        (*body)["pauseDurationMinutes"].isInt()) {
+                        int mins = (*body)["pauseDurationMinutes"].asInt();
+                        if (mins > 0) {
+                            cur.alertsPaused = true;
+                            cur.alertsPausedUntil = nowUtc + static_cast<std::time_t>(mins * 60);
+                        } else {
+                            cur.alertsPausedUntil = std::nullopt;
+                        }
+                    } else if (body->isMember("alertsPausedUntil")) {
+                        const auto &apu = (*body)["alertsPausedUntil"];
+                        if (apu.isNull() || (apu.isString() && apu.asString().empty())) {
+                            cur.alertsPausedUntil = std::nullopt;
+                        } else if (apu.isString()) {
+                            cur.alertsPausedUntil = util::parseIso8601(apu.asString());
+                        } else if (apu.isInt64()) {
+                            cur.alertsPausedUntil = static_cast<std::time_t>(apu.asInt64());
+                        }
+                    } else if (body->isMember("pausedUntil")) {
+                        const auto &apu = (*body)["pausedUntil"];
+                        if (apu.isNull() || (apu.isString() && apu.asString().empty())) {
+                            cur.alertsPausedUntil = std::nullopt;
+                        } else if (apu.isString()) {
+                            cur.alertsPausedUntil = util::parseIso8601(apu.asString());
+                        } else if (apu.isInt64()) {
+                            cur.alertsPausedUntil = static_cast<std::time_t>(apu.asInt64());
+                        }
+                    }
+
+                    // If user explicitly unpaused, clear pausedUntil
+                    if (!cur.alertsPaused) {
+                        cur.alertsPausedUntil = std::nullopt;
+                    }
+
+                    // 3. Schedule enabled
+                    if (body->isMember("scheduleEnabled") &&
+                        (*body)["scheduleEnabled"].isBool()) {
+                        cur.scheduleEnabled = (*body)["scheduleEnabled"].asBool();
+                    }
+
+                    // 4. Start / End time
+                    auto parseMinute = [](const Json::Value &v, int fallback) -> int {
+                        if (v.isInt()) return std::clamp(v.asInt(), 0, 1439);
+                        if (v.isString()) {
+                            std::string s = v.asString();
+                            size_t colon = s.find(':');
+                            if (colon != std::string::npos) {
+                                try {
+                                    int h = std::stoi(s.substr(0, colon));
+                                    int m = std::stoi(s.substr(colon + 1));
+                                    return std::clamp(h * 60 + m, 0, 1439);
+                                } catch (...) {
+                                }
+                            }
+                        }
+                        return fallback;
+                    };
+
+                    if (body->isMember("startTime")) {
+                        cur.startMinute = parseMinute((*body)["startTime"], cur.startMinute);
+                    } else if (body->isMember("startMinute")) {
+                        cur.startMinute = parseMinute((*body)["startMinute"], cur.startMinute);
+                    }
+
+                    if (body->isMember("endTime")) {
+                        cur.endMinute = parseMinute((*body)["endTime"], cur.endMinute);
+                    } else if (body->isMember("endMinute")) {
+                        cur.endMinute = parseMinute((*body)["endMinute"], cur.endMinute);
+                    }
+
+                    // 5. Days of week
+                    if (body->isMember("daysOfWeek") && (*body)["daysOfWeek"].isArray()) {
+                        std::vector<int> days;
+                        for (const auto &d : (*body)["daysOfWeek"]) {
+                            if (d.isInt()) {
+                                int dayNum = d.asInt();
+                                if (dayNum >= 0 && dayNum <= 6) {
+                                    if (std::find(days.begin(), days.end(), dayNum) == days.end()) {
+                                        days.push_back(dayNum);
+                                    }
+                                }
+                            }
+                        }
+                        std::sort(days.begin(), days.end());
+                        cur.daysOfWeek = std::move(days);
+                    }
+
+                    // 6. Timezone offset
+                    if (body->isMember("tzOffsetMinutes") &&
+                        (*body)["tzOffsetMinutes"].isInt()) {
+                        cur.tzOffsetMinutes =
+                            std::clamp((*body)["tzOffsetMinutes"].asInt(), -840, 840);
+                    }
+
+                    auto saved = pg.updateUserDeliverySettings(uid, cur);
+                    if (app.alerts) {
+                        app.alerts->setUserDeliverySettings(uid, saved);
+                    }
+
+                    Json::Value v;
+                    v["success"] = true;
+                    v["alertDelivery"] =
+                        services::PostgresService::deliverySettingsToJson(saved);
+                    (*cbPtr)(jsonResp(v));
+                } catch (const std::exception &e) {
+                    LOG_ERROR << "updateUserAlertDelivery failed: " << e.what();
+                    (*cbPtr)(errResp("detail", "Failed to save alert delivery settings", 500));
                 }
             })) {
             (*cbPtr)(errResp("detail", "Database not ready", 503));
@@ -2224,6 +2412,8 @@ void registerRoutes() {
     fw.registerHandler("/api/fvg/active", &activeFvgZones, {Get});
     fw.registerHandler("/me", &me, {Get});
     fw.registerHandler("/user/phone", &updateUserPhone, {Post});
+    fw.registerHandler("/user/alert-delivery", &getUserAlertDelivery, {Get});
+    fw.registerHandler("/user/alert-delivery", &updateUserAlertDelivery, {Post});
     fw.registerHandler("/onboarding/complete", &onboardingComplete, {Post});
     fw.registerHandler("/feedback", &submitFeedback, {Post});
     fw.registerHandler("/tour/complete", &tourComplete, {Post});
