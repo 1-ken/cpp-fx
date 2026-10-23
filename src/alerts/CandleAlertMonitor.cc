@@ -95,8 +95,11 @@ CandleAlertMonitor::requiredSubscriptions() const {
             intervals.push_back(*a.interval);
         } else if (a.alertType == "candle2_closure" && a.interval) {
             intervals.push_back(*a.interval);
-        } else if (a.alertType == "sweep_confirm" || a.alertType == "hour_sweep_cisd") {
+        } else if (a.alertType == "sweep_confirm") {
             intervals.push_back("5m");
+            intervals.push_back("1h");
+        } else if (a.alertType == "hour_sweep_cisd") {
+            intervals.push_back("1m");
             intervals.push_back("1h");
         } else if (a.alertType == "structure_session") {
             intervals = a.intervals;
@@ -546,8 +549,11 @@ void CandleAlertMonitor::pollFallback() {
             intervals.push_back(*a.interval);
         } else if (a.alertType == "candle2_closure" && a.interval) {
             intervals.push_back(*a.interval);
-        } else if (a.alertType == "sweep_confirm" || a.alertType == "hour_sweep_cisd") {
+        } else if (a.alertType == "sweep_confirm") {
             intervals.push_back("5m");
+            intervals.push_back("1h");
+        } else if (a.alertType == "hour_sweep_cisd") {
+            intervals.push_back("1m");
             intervals.push_back("1h");
         } else if (a.alertType == "structure_session") {
             intervals = a.intervals;

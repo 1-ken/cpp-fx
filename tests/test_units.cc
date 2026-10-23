@@ -1009,7 +1009,7 @@ static alerts::Alert makeHourSweepAlert(const std::string &id, const std::string
     a.alertType = "hour_sweep_cisd";
     a.status = "active";
     a.createdAt = "2026-06-03T20:00:00";
-    a.interval = "5m";
+    a.interval = "1m";
     a.structureEvents = {"cisd"};
     a.structureDirection = dir;
     a.channels = {"sound"};
@@ -1033,8 +1033,9 @@ struct HourBar {
 
 static Json::Value hourBar(int index, HourBar b, bool mirror, const char *pair = "EURUSD") {
     if (mirror) b = {200 - b.o, 200 - b.l, 200 - b.h, 200 - b.c};
-    const std::string ts = barTime(index);
-    return testCandle(pair, "5m", ts.c_str(), b.o, b.h, b.l, b.c);
+    auto start = util::parseIso8601("2026-06-03T22:00:00");
+    const std::string ts = util::toIso8601(*start + static_cast<std::time_t>(index) * 60);
+    return testCandle(pair, "1m", ts.c_str(), b.o, b.h, b.l, b.c);
 }
 
 static void testHourSweepCisd() {
@@ -1131,9 +1132,22 @@ static void testHourSweepCisd() {
         late.setTriggerHandler([&](const alerts::TriggeredAlert &) { ++fires; });
         for (int i = 0; i < 6; ++i) late.checkCandleAlerts({hourBar(i, setup[i], false)});
         CHECK(late.getAlert("hs-late")->pendingDir.has_value());
-        late.checkCandleAlerts({hourBar(12, {105, 106, 100, 101}, false)});  // 23:00 candle
+        late.checkCandleAlerts({hourBar(60, {105, 106, 100, 101}, false)});  // 23:00 candle
         CHECK(fires == 0);
         CHECK(!late.getAlert("hs-late")->pendingDir);
+    }
+
+    // 5m candles no longer drive this alert.
+    {
+        alerts::AlertManager five;
+        five.cacheAlert(makeHourSweepAlert("hs-5m", "any"));
+        seedPrevHour(five);
+        for (int i = 0; i < 6; ++i) {
+            auto c = hourBar(i, setup[i], false);
+            c["interval"] = "5m";
+            five.checkCandleAlerts({c});
+        }
+        CHECK(!five.getAlert("hs-5m")->pendingDir);
     }
 
     // No previous 1h candle: nothing arms.
@@ -1163,7 +1177,7 @@ static void testHourSweepCisd() {
         seedPrevHour(restarted);
         std::vector<Json::Value> prior;
         for (int i = 0; i < 6; ++i) prior.push_back(hourBar(i, setup[i], false));
-        restarted.ingestStructureHistory("EURUSD", "5m", prior);
+        restarted.ingestStructureHistory("EURUSD", "1m", prior);
         CHECK(fires == 0);
         restarted.checkCandleAlerts({hourBar(6, {110, 110.5, 104, 105}, false)});
         restarted.checkCandleAlerts({hourBar(7, {105, 106, 100, 101}, false)});

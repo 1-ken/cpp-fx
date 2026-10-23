@@ -28,6 +28,7 @@
 namespace ctraderplus::alerts {
 
 namespace {
+constexpr const char *kHourSweepCisdInterval = "1m";
 std::string normalizeTimeframe(const std::string &tf) {
     std::string s = tf;
     std::transform(s.begin(), s.end(), s.begin(), ::tolower);
@@ -398,7 +399,7 @@ void AlertManager::rebuildIndexes() {
             activeCandleIndex_[candleIndexKey(key, "5m")].push_back(a.id);
             activeCandleIndex_[candleIndexKey(key, "1h")].push_back(a.id);
         } else if (a.alertType == "hour_sweep_cisd") {
-            activeCandleIndex_[candleIndexKey(key, "5m")].push_back(a.id);
+            activeCandleIndex_[candleIndexKey(key, kHourSweepCisdInterval)].push_back(a.id);
             activeCandleIndex_[candleIndexKey(key, "1h")].push_back(a.id);
         } else if (a.alertType == "candle2_closure" && a.interval) {
             std::string iv = normalizeTimeframe(*a.interval);
@@ -1127,7 +1128,7 @@ std::vector<Alert> AlertManager::createHourSweepCisdAlerts(
         a.userId = userId;
         a.pair = pair;
         a.alertType = "hour_sweep_cisd";
-        a.interval = "5m";
+        a.interval = kHourSweepCisdInterval;
         a.structureEvents = {"cisd"};
         a.structureDirection = dir;
         a.batchId = batchId;
@@ -2088,8 +2089,8 @@ AlertManager::SessionStepResult AlertManager::evalSweepConfirmLocked(
     return SessionStepResult::Unchanged;
 }
 
-// hour_sweep_cisd: inside the forming 1h candle, a 5m candle trades at or beyond the
-// previous closed 1h high (bear) or low (bull), then a 5m close crosses the open of the
+// hour_sweep_cisd: inside the forming 1h candle, a 1m candle trades at or beyond the
+// previous closed 1h high (bear) or low (bull), then a 1m close crosses the open of the
 // candle run that pushed into the level (CISD). Wick, touch, and close beyond all arm it.
 // Each side arms once per hour and the pending state ends with the hour.
 AlertManager::SessionStepResult AlertManager::evalHourSweepCisdLocked(
@@ -2097,7 +2098,7 @@ AlertManager::SessionStepResult AlertManager::evalHourSweepCisdLocked(
     if (a.lastEvaluatedCandleTime && *a.lastEvaluatedCandleTime == candleTsStr)
         return SessionStepResult::Unchanged;
     auto candleStart = parseCandleTs(candle["timestamp"]);
-    const int ivSec = intervalSeconds("5m");
+    const int ivSec = intervalSeconds(kHourSweepCisdInterval);
     auto createdAt = util::parseIso8601(a.createdAt);
     if (candleStart && createdAt && *candleStart + ivSec <= *createdAt) {
         a.lastEvaluatedCandleTime = candleTsStr;
@@ -2547,7 +2548,7 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                         continue;
                     }
                     if (a.status == "active" && a.alertType == "hour_sweep_cisd") {
-                        if (k.interval != "5m") continue;
+                        if (k.interval != kHourSweepCisdInterval) continue;
                         if (isPastExpiry(a)) {
                             Alert before = a;
                             a.status = "expired";
@@ -2571,7 +2572,7 @@ std::vector<TriggeredAlert> AlertManager::checkCandleAlerts(
                             t.alert = a;
                             t.currentPrice = candle.get("close", 0.0).asDouble();
                             t.alertTypeLabel = "hour_sweep_cisd";
-                            t.timeframe = "5m";
+                            t.timeframe = kHourSweepCisdInterval;
                             triggered.push_back(t);
                             toPersist.push_back({before, a, true, true});
                             LOG_INFO << "Triggered hour_sweep_cisd alert " << a.id << " " << a.pair

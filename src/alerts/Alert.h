@@ -68,7 +68,7 @@ struct Alert {
     std::optional<double> pendingSweepLevel;
     std::optional<double> pendingRunOpen;
     int pendingBars = 0;
-    // hour_sweep_cisd reuses these: pendingSweepAt and swept*At hold the 1h open time
+    // hour_sweep_cisd (1m) reuses these: pendingSweepAt and swept*At hold the 1h open time
     // (ISO) of the forming hour, pendingSweepLevel the previous 1h high/low.
     std::optional<std::string> sweptHighAt;
     std::optional<std::string> sweptLowAt;
